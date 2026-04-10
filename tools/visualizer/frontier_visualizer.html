@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SLAMborghini — Frontier Detector Visualizer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: 'Courier New', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px;
+    gap: 20px;
+    min-height: 100vh;
+  }
+  h1 { color: #00d4ff; font-size: 1.2rem; letter-spacing: 2px; }
+  h2 { color: #888; font-size: 0.8rem; font-weight: normal; letter-spacing: 1px; }
+
+  .layout { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; justify-content: center; }
+
+  canvas {
+    border: 1px solid #333;
+    image-rendering: pixelated;
+    cursor: crosshair;
+  }
+
+  .panel {
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 6px;
+    padding: 16px;
+    width: 280px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .panel h3 { color: #00d4ff; font-size: 0.85rem; border-bottom: 1px solid #0f3460; padding-bottom: 6px; }
+
+  .legend-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.78rem;
+  }
+  .swatch {
+    width: 16px; height: 16px;
+    border: 1px solid #444;
+    flex-shrink: 0;
+    border-radius: 2px;
+  }
+
+  .stats { font-size: 0.78rem; line-height: 1.8; color: #aaa; }
+  .stats span { color: #00d4ff; }
+
+  .controls { display: flex; flex-direction: column; gap: 8px; }
+  button {
+    background: #0f3460;
+    color: #e0e0e0;
+    border: 1px solid #00d4ff44;
+    border-radius: 4px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.82rem;
+    transition: background 0.15s;
+  }
+  button:hover { background: #1a5276; }
+  button:disabled { opacity: 0.4; cursor: default; }
+
+  .speed-row { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; }
+  input[type=range] { flex: 1; accent-color: #00d4ff; }
+
+  .log {
+    background: #0d1117;
+    border: 1px solid #222;
+    border-radius: 4px;
+    padding: 8px;
+    font-size: 0.72rem;
+    line-height: 1.6;
+    max-height: 140px;
+    overflow-y: auto;
+    color: #7ec8e3;
+  }
+
+  .phase-indicator {
+    font-size: 0.78rem;
+    padding: 4px 10px;
+    border-radius: 12px;
+    text-align: center;
+    background: #0f3460;
+    border: 1px solid #00d4ff44;
+    color: #00d4ff;
+  }
+</style>
+</head>
+<body>
+
+<h1>SLAMBORGHINI 2026 — Frontier Detector Visualizer</h1>
+<h2>Issue #33 · WFD BFS from Robot Pose · Mock Room Simulation</h2>
+
+<div class="layout">
+  <canvas id="cv"></canvas>
+
+  <div class="panel">
+    <h3>Legend</h3>
+    <div class="legend-row"><div class="swatch" style="background:#2c2c4a"></div>Unknown cell</div>
+    <div class="legend-row"><div class="swatch" style="background:#c0c8d0; border-color:#888"></div>Wall (occupied)</div>
+    <div class="legend-row"><div class="swatch" style="background:#2d6a4f"></div>Free cell</div>
+    <div class="legend-row"><div class="swatch" style="background:#1a3a2a; border:1px solid #52b788"></div>BFS visited</div>
+    <div class="legend-row"><div class="swatch" style="background:#f4a261"></div>Frontier seed</div>
+    <div class="legend-row"><div class="swatch" style="background:#e76f51"></div>Selected target</div>
+    <div class="legend-row"><div class="swatch" style="background:#4361ee; border-radius:50%"></div>Robot position</div>
+
+    <h3>Simulation</h3>
+    <div id="phase" class="phase-indicator">READY</div>
+    <div class="controls">
+      <button id="btnRun">▶ Run WFD BFS</button>
+      <button id="btnStep" disabled>⏭ Step</button>
+      <button id="btnReset">↺ Reset</button>
+    </div>
+    <div class="speed-row">
+      Speed: <input type="range" id="speed" min="1" max="10" value="5"> <span id="speedVal">5</span>
+    </div>
+
+    <h3>Stats</h3>
+    <div class="stats" id="stats">
+      BFS cells visited: <span id="sVisited">0</span><br>
+      Frontier seeds:    <span id="sFSeeds">0</span><br>
+      Clusters found:    <span id="sClusters">0</span><br>
+      Best target:       <span id="sTarget">—</span><br>
+      Best score:        <span id="sScore">—</span>
+    </div>
+
+    <h3>Log</h3>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════
+ * MOCK MAP — mirrors mock_quadtree.c exactly
+ * 30 x 20 cells, 50 mm/cell
+ * ═══════════════════════════════════════════════════════════════ */
+const GW = 30, GH = 20;
+const RES = 50;           /* mm per cell */
+const ROBOT_IX = 15, ROBOT_IY = 10;
+const FREE_RADIUS = 6;
+
+/* Occupancy values */
+const OCC_OCCUPIED = 255;
+const OCC_FREE     = 20;
+const OCC_UNKNOWN  = 128;
+
+/* WFD thresholds (matching frontier_detector.c) */
+const OCC_FREE_MAX   = 50;
+const OCC_UNK_MIN    = 77;
+const OCC_UNK_MAX    = 178;
+const MIN_CLUSTER    = 3;
+
+function buildGrid() {
+  const g = new Uint8Array(GW * GH).fill(OCC_UNKNOWN);
+  const at = (ix, iy) => iy * GW + ix;
+  /* perimeter walls */
+  for (let x = 0; x < GW; x++) { g[at(x,0)] = OCC_OCCUPIED; g[at(x,GH-1)] = OCC_OCCUPIED; }
+  for (let y = 0; y < GH; y++) { g[at(0,y)] = OCC_OCCUPIED; g[at(GW-1,y)] = OCC_OCCUPIED; }
+  /* free disk */
+  for (let dy = -FREE_RADIUS; dy <= FREE_RADIUS; dy++) {
+    for (let dx = -FREE_RADIUS; dx <= FREE_RADIUS; dx++) {
+      if (dx*dx + dy*dy > FREE_RADIUS*FREE_RADIUS) continue;
+      const ix = ROBOT_IX + dx, iy = ROBOT_IY + dy;
+      if (ix < 1 || iy < 1 || ix >= GW-1 || iy >= GH-1) continue;
+      g[at(ix, iy)] = OCC_FREE;
+    }
+  }
+  return g;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * CANVAS SETUP
+ * ═══════════════════════════════════════════════════════════════ */
+const CELL = 28;   /* pixels per cell */
+const cv   = document.getElementById('cv');
+cv.width   = GW * CELL;
+cv.height  = GH * CELL;
+const ctx  = cv.getContext('2d');
+
+/* ═══════════════════════════════════════════════════════════════
+ * RENDER
+ * ═══════════════════════════════════════════════════════════════ */
+function cellColor(occ) {
+  if (occ >= 179)              return '#c0c8d0';   /* wall     */
+  if (occ <= OCC_FREE_MAX)     return '#2d6a4f';   /* free     */
+  return '#2c2c4a';                                 /* unknown  */
+}
+
+function render(grid, visited, frontierSeeds, clusters, bestTarget, robotCell) {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+
+  /* Base map */
+  for (let iy = 0; iy < GH; iy++) {
+    for (let ix = 0; ix < GW; ix++) {
+      ctx.fillStyle = cellColor(grid[iy * GW + ix]);
+      ctx.fillRect(ix * CELL, iy * CELL, CELL, CELL);
+    }
+  }
+
+  /* BFS visited overlay */
+  if (visited) {
+    ctx.fillStyle = '#1a3a2a';
+    for (const [ix, iy] of visited) {
+      if (grid[iy * GW + ix] <= OCC_FREE_MAX)
+        ctx.fillRect(ix * CELL + 1, iy * CELL + 1, CELL - 2, CELL - 2);
+    }
+  }
+
+  /* Frontier seeds */
+  if (frontierSeeds) {
+    ctx.fillStyle = '#f4a261';
+    for (const [ix, iy] of frontierSeeds) {
+      ctx.fillRect(ix * CELL + 2, iy * CELL + 2, CELL - 4, CELL - 4);
+    }
+  }
+
+  /* Cluster centroids (smaller dot) */
+  if (clusters) {
+    ctx.fillStyle = '#ff006e88';
+    for (const cl of clusters) {
+      ctx.beginPath();
+      ctx.arc(cl.tix * CELL + CELL/2, cl.tiy * CELL + CELL/2, CELL/3, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  /* Grid lines */
+  ctx.strokeStyle = '#ffffff08';
+  ctx.lineWidth = 0.5;
+  for (let ix = 0; ix <= GW; ix++) { ctx.beginPath(); ctx.moveTo(ix*CELL,0); ctx.lineTo(ix*CELL,GH*CELL); ctx.stroke(); }
+  for (let iy = 0; iy <= GH; iy++) { ctx.beginPath(); ctx.moveTo(0,iy*CELL); ctx.lineTo(GW*CELL,iy*CELL); ctx.stroke(); }
+
+  /* Best target */
+  if (bestTarget) {
+    const bx = bestTarget.tix * CELL + CELL/2;
+    const by = bestTarget.tiy * CELL + CELL/2;
+    ctx.fillStyle = '#e76f51';
+    ctx.beginPath();
+    ctx.arc(bx, by, CELL/2 - 1, 0, Math.PI*2);
+    ctx.fill();
+
+    /* Arrow from robot to target */
+    const rx = robotCell.ix * CELL + CELL/2;
+    const ry = robotCell.iy * CELL + CELL/2;
+    ctx.strokeStyle = '#e76f51cc';
+    ctx.lineWidth   = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(bx, by); ctx.stroke();
+    ctx.setLineDash([]);
+    /* Arrowhead */
+    const ang  = Math.atan2(by - ry, bx - rx);
+    const hlen = 8;
+    ctx.fillStyle = '#e76f51';
+    ctx.beginPath();
+    ctx.moveTo(bx, by);
+    ctx.lineTo(bx - hlen * Math.cos(ang - 0.4), by - hlen * Math.sin(ang - 0.4));
+    ctx.lineTo(bx - hlen * Math.cos(ang + 0.4), by - hlen * Math.sin(ang + 0.4));
+    ctx.closePath(); ctx.fill();
+  }
+
+  /* Robot dot */
+  const rx = robotCell.ix * CELL + CELL/2;
+  const ry = robotCell.iy * CELL + CELL/2;
+  ctx.fillStyle = '#4361ee';
+  ctx.beginPath();
+  ctx.arc(rx, ry, CELL/2 - 2, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = `${CELL*0.5}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('R', rx, ry);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * WFD BFS — mirrors frontier_detector.c logic in JS
+ * ═══════════════════════════════════════════════════════════════ */
+function isFree(grid, ix, iy)    { return grid[iy*GW+ix] <= OCC_FREE_MAX; }
+function isUnknown(grid, ix, iy) { const v = grid[iy*GW+ix]; return v >= OCC_UNK_MIN && v <= OCC_UNK_MAX; }
+function inBounds(ix, iy)        { return ix >= 0 && iy >= 0 && ix < GW && iy < GH; }
+
+const K4 = [[1,0],[-1,0],[0,1],[0,-1]];
+const K8 = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+
+function isFrontierCell(grid, ix, iy) {
+  if (!isFree(grid, ix, iy)) return false;
+  for (const [dx,dy] of K4) {
+    const nx = ix+dx, ny = iy+dy;
+    if (!inBounds(nx, ny)) continue;
+    if (isUnknown(grid, nx, ny)) return true;
+  }
+  return false;
+}
+
+function isSafeCell(grid, ix, iy) {
+  for (const [dx,dy] of K8) {
+    const nx = ix+dx, ny = iy+dy;
+    if (!inBounds(nx, ny)) continue;
+    if (!isFree(grid, nx, ny)) return false;
+  }
+  return true;
+}
+
+function safetySpiralJS(grid, ix, iy) {
+  if (isSafeCell(grid, ix, iy)) return [ix, iy];
+  for (let r = 1; r <= 5; r++) {
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+        const nx = ix+dx, ny = iy+dy;
+        if (!inBounds(nx, ny)) continue;
+        if (!isFree(grid, nx, ny)) continue;
+        if (isSafeCell(grid, nx, ny)) return [nx, ny];
+      }
+    }
+  }
+  return [ix, iy];
+}
+
+function clusterFrontier(grid, sx, sy, clustered) {
+  const cells = [];
+  const lq = [[sx, sy]];
+  const key = (x,y) => y*GW+x;
+  clustered.add(key(sx, sy));
+  let head = 0;
+  while (head < lq.length && cells.length < 128) {
+    const [cx, cy] = lq[head++];
+    cells.push([cx, cy]);
+    for (const [dx,dy] of K4) {
+      const nx = cx+dx, ny = cy+dy;
+      if (!inBounds(nx, ny)) continue;
+      if (clustered.has(key(nx, ny))) continue;
+      if (!isFrontierCell(grid, nx, ny)) continue;
+      lq.push([nx, ny]);
+      clustered.add(key(nx, ny));
+    }
+  }
+  return cells;
+}
+
+function nearestToCentroid(cells) {
+  let sx = 0, sy = 0;
+  for (const [x,y] of cells) { sx += x; sy += y; }
+  const cx = sx / cells.length, cy = sy / cells.length;
+  let best = Infinity, bi = 0;
+  for (let i = 0; i < cells.length; i++) {
+    const dx = cells[i][0] - cx, dy = cells[i][1] - cy;
+    const d = dx*dx + dy*dy;
+    if (d < best) { best = d; bi = i; }
+  }
+  return cells[bi];
+}
+
+/* Full WFD — returns step-by-step animation frames */
+function runWFD(grid, robotIx, robotIy) {
+  const steps      = [];   /* animation frames */
+  const visited    = new Set();
+  const clustered  = new Set();
+  const queue      = [[robotIx, robotIy]];
+  const key        = (x,y) => y*GW+x;
+  const allVisited = [];
+  const frontierSeeds = [];
+  const clusters   = [];
+
+  visited.add(key(robotIx, robotIy));
+
+  while (queue.length > 0) {
+    const [cx, cy] = queue.shift();
+    allVisited.push([cx, cy]);
+
+    if (isFrontierCell(grid, cx, cy) && !clustered.has(key(cx, cy))) {
+      const cells = clusterFrontier(grid, cx, cy, clustered);
+      if (cells.length >= MIN_CLUSTER) {
+        for (const c of cells) frontierSeeds.push(c);
+        const [tix, tiy] = nearestToCentroid(cells);
+        const [six, siy] = safetySpiralJS(grid, tix, tiy);
+        clusters.push({ cells, tix: six, tiy: siy, size: cells.length });
+        steps.push({
+          visited: allVisited.slice(),
+          frontierSeeds: frontierSeeds.slice(),
+          clusters: clusters.map(c => ({...c}))
+        });
+        break;   /* early exit — nearest valid cluster found, BFS stops */
+      }
+    }
+
+    if (clusters.length > 0) break;   /* break already pushed final frame above */
+
+    steps.push({
+      visited: allVisited.slice(),
+      frontierSeeds: frontierSeeds.slice(),
+      clusters: clusters.map(c => ({...c}))
+    });
+
+    for (const [dx,dy] of K4) {
+      const nx = cx+dx, ny = cy+dy;
+      if (!inBounds(nx, ny)) continue;
+      if (visited.has(key(nx, ny))) continue;
+      if (!isFree(grid, nx, ny)) continue;
+      visited.add(key(nx, ny));
+      queue.push([nx, ny]);
+    }
+  }
+
+  /* Select best */
+  let bestCluster = null, bestScore = -1;
+  const rx = robotIx, ry = robotIy;
+  for (const cl of clusters) {
+    const dx = cl.tix - rx, dy = cl.tiy - ry;
+    const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+    const score = cl.size / dist;
+    if (score > bestScore) { bestScore = score; bestCluster = cl; }
+  }
+
+  return { steps, clusters, bestCluster, bestScore, totalVisited: allVisited.length };
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * APP STATE
+ * ═══════════════════════════════════════════════════════════════ */
+let grid       = buildGrid();
+let wfdResult  = null;
+let stepIdx    = 0;
+let animTimer  = null;
+const robotCell = { ix: ROBOT_IX, iy: ROBOT_IY };
+
+function logMsg(msg) {
+  const el = document.getElementById('log');
+  el.innerHTML += msg + '<br>';
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateStats(step) {
+  document.getElementById('sVisited').textContent  = step.visited.length;
+  document.getElementById('sFSeeds').textContent   = step.frontierSeeds.length;
+  document.getElementById('sClusters').textContent = step.clusters.length;
+  if (wfdResult && wfdResult.bestCluster) {
+    const b = wfdResult.bestCluster;
+    document.getElementById('sTarget').textContent =
+      `(${b.tix * RES + RES/2} mm, ${b.tiy * RES + RES/2} mm)`;
+    document.getElementById('sScore').textContent =
+      wfdResult.bestScore.toFixed(2);
+  }
+}
+
+function setPhase(text) {
+  document.getElementById('phase').textContent = text;
+}
+
+function resetAll() {
+  clearInterval(animTimer);
+  animTimer  = null;
+  grid       = buildGrid();
+  wfdResult  = null;
+  stepIdx    = 0;
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('sVisited').textContent  = '0';
+  document.getElementById('sFSeeds').textContent   = '0';
+  document.getElementById('sClusters').textContent = '0';
+  document.getElementById('sTarget').textContent   = '—';
+  document.getElementById('sScore').textContent    = '—';
+  document.getElementById('btnStep').disabled = true;
+  document.getElementById('btnRun').disabled  = false;
+  setPhase('READY');
+  render(grid, null, null, null, null, robotCell);
+}
+
+function getDelay() {
+  const v = parseInt(document.getElementById('speed').value);
+  return Math.max(10, 220 - v * 20);
+}
+
+function stepForward() {
+  if (!wfdResult || stepIdx >= wfdResult.steps.length) return false;
+  const s = wfdResult.steps[stepIdx++];
+  const best = (stepIdx >= wfdResult.steps.length) ? wfdResult.bestCluster : null;
+  render(grid, s.visited, s.frontierSeeds, s.clusters, best, robotCell);
+  updateStats(s);
+
+  if (stepIdx >= wfdResult.steps.length) {
+    setPhase('DONE');
+    if (wfdResult.bestCluster) {
+      const b = wfdResult.bestCluster;
+      logMsg(`✓ Best target: cell (${b.tix}, ${b.tiy}) → `
+           + `(${b.tix*RES+RES/2} mm, ${b.tiy*RES+RES/2} mm)`);
+      logMsg(`  Cluster size: ${b.size} cells, score: ${wfdResult.bestScore.toFixed(2)}`);
+    } else {
+      logMsg('⚠ No valid frontier found');
+    }
+    clearInterval(animTimer);
+    animTimer = null;
+    document.getElementById('btnStep').disabled = true;
+    return false;
+  }
+  return true;
+}
+
+/* ── Buttons ── */
+document.getElementById('btnRun').addEventListener('click', () => {
+  if (animTimer) return;
+  document.getElementById('btnRun').disabled  = false;
+  document.getElementById('btnStep').disabled = false;
+
+  wfdResult = runWFD(grid, ROBOT_IX, ROBOT_IY);
+  stepIdx   = 0;
+  logMsg(`WFD BFS started from robot cell (${ROBOT_IX}, ${ROBOT_IY})`);
+  logMsg(`Map: ${GW}×${GH} cells, ${GW*RES}×${GH*RES} mm`);
+  setPhase('RUNNING');
+
+  animTimer = setInterval(() => {
+    if (!stepForward()) clearInterval(animTimer);
+  }, getDelay());
+});
+
+document.getElementById('btnStep').addEventListener('click', () => {
+  if (!wfdResult) {
+    wfdResult = runWFD(grid, ROBOT_IX, ROBOT_IY);
+    stepIdx   = 0;
+    logMsg(`Step mode started from (${ROBOT_IX}, ${ROBOT_IY})`);
+    setPhase('STEPPING');
+    document.getElementById('btnRun').disabled = true;
+  }
+  clearInterval(animTimer);
+  animTimer = null;
+  stepForward();
+});
+
+document.getElementById('btnReset').addEventListener('click', resetAll);
+
+document.getElementById('speed').addEventListener('input', function() {
+  document.getElementById('speedVal').textContent = this.value;
+});
+
+/* Initial render */
+render(grid, null, null, null, null, robotCell);
+logMsg('Mock map loaded — 30×20 cells at 50 mm/cell');
+logMsg(`Robot at (${ROBOT_IX}, ${ROBOT_IY}) = (${ROBOT_IX*RES+RES/2} mm, ${ROBOT_IY*RES+RES/2} mm)`);
+logMsg('Press ▶ to run WFD BFS or ⏭ to step through.');
+</script>
+</body>
+</html>

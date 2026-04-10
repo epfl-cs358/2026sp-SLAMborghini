@@ -1,0 +1,21 @@
+# C build artifacts
+*.o
+*.elf
+*.bin
+*.hex
+build/
+
+# ESP-IDF specific
+sdkconfig.old
+.cache/
+managed_components/
+
+# macOS
+.DS_Store
+
+# VSCode
+.vscode/
+
+# Editor swap files
+*.swp
+*~

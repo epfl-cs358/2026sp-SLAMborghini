@@ -1,0 +1,386 @@
+/**
+ * frontier_detector.c
+ * Module: Frontier-based exploration detector.
+ * Board: ESP32-S3
+ *
+ * Strategy: Wavefront Frontier Detection (WFD)
+ *
+ *   1. BFS outward from the robot's cell through free cells only.
+ *      (Free cells are the only cells that can contain frontiers, so we
+ *       never waste time scanning unknown or occupied regions.)
+ *
+ *   2. Each free cell popped from the queue is tested: if it has at least
+ *      one 4-connected unknown neighbour it is a frontier seed.
+ *
+ *   3. Each new seed triggers a 4-connected flood-fill (cluster_frontier)
+ *      that collects the full connected frontier region into s_cbuf[].
+ *
+ *   4. Target point: compute the cluster centroid, then find the cluster
+ *      cell closest to it. This is always an actual free cell — unlike a
+ *      raw centroid that can land inside an obstacle.
+ *      (Topiwala et al. WFD — use median/nearest-to-centroid, not raw centroid.)
+ *
+ *   5. Safety spiral: if any 8-connected neighbour of the target cell is
+ *      not free, step outward ring by ring until a fully-safe cell is found.
+ *      (Adapted from SLAMaleykoum mission_planner.cpp — proven on hardware.)
+ *
+ *   6. Clusters smaller than MIN_CLUSTER_SIZE are discarded (scan noise).
+ *
+ * Complexity: O(F) where F = reachable free cells — far cheaper than the
+ * O(R^2) bounding-box scan used in SLAMaleykoum, especially at startup
+ * when the free bubble is small.
+ *
+ * Memory: all buffers are static — no heap allocation, safe on ESP32-S3.
+ *
+ * Reference: Topiwala, Maini, Bhatt — "Frontier Based Exploration for
+ *            Autonomous Robot" (WFD variant).
+ */
+
+#include "frontier_detector.h"
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+
+/* ── Occupancy thresholds (matching quadtree_map conventions) ─────────────
+ *   0  – 50  : free
+ *   77 – 178 : unknown  (~128 centre)
+ *   179 – 255: occupied
+ * The gap 51-76 is treated as "transitioning" — we never expand through it.
+ * ──────────────────────────────────────────────────────────────────────── */
+#define OCC_FREE_MAX     50u
+#define OCC_UNK_MIN      77u
+#define OCC_UNK_MAX     178u
+
+/* ── Tuning constants ────────────────────────────────────────────────────── */
+#define MIN_CLUSTER_SIZE   3    /* discard clusters with fewer cells (noise) */
+#define BFS_QUEUE_CAP   2048    /* WFD BFS ring-buffer capacity              */
+#define CLUSTER_CAP      128    /* max cells collected per frontier cluster  */
+#define SPIRAL_STEPS       5    /* safety spiral max search radius (cells)   */
+
+/* ── Grid dimension limits  (10 000 mm / 50 mm = 200 cells per axis) ─────── */
+#define MAX_GRID_W  200
+#define MAX_GRID_H  200
+#define VISITED_BYTES  ((MAX_GRID_W * MAX_GRID_H + 7) / 8)   /* 5000 bytes */
+
+/* ── Internal cell coordinate (int16 keeps the queue at 4 bytes/entry) ────── */
+typedef struct { int16_t ix; int16_t iy; } cell_t;
+
+/* ── Static buffers — allocated once in BSS, cleared per call ──────────────
+ *   s_vis  : WFD BFS visited bits     (~5 KB)
+ *   s_clu  : cluster BFS visited bits (~5 KB)
+ *   s_bfs  : WFD BFS ring buffer      (~8 KB)
+ *   s_cbuf : current cluster cells    (~0.5 KB)
+ *   Total  : ~18.5 KB — well within ESP32-S3's 512 KB SRAM.
+ * ──────────────────────────────────────────────────────────────────────── */
+static uint8_t  s_vis[VISITED_BYTES];
+static uint8_t  s_clu[VISITED_BYTES];
+static cell_t   s_bfs[BFS_QUEUE_CAP];
+static cell_t   s_cbuf[CLUSTER_CAP];
+
+/* ── 4-connected neighbour offsets ──────────────────────────────────────── */
+static const int8_t K4X[4] = {  1, -1,  0,  0 };
+static const int8_t K4Y[4] = {  0,  0,  1, -1 };
+
+/* ── 8-connected neighbour offsets (safety spiral) ──────────────────────── */
+static const int8_t K8X[8] = {  1, -1,  0,  0,  1,  1, -1, -1 };
+static const int8_t K8Y[8] = {  0,  0,  1, -1,  1, -1,  1, -1 };
+
+/* ═══════════════════════ BIT-ARRAY HELPERS ════════════════════════════════ */
+
+static inline bool bit_get(const uint8_t *a, int ix, int iy)
+{
+    unsigned idx = (unsigned)(iy * MAX_GRID_W + ix);
+    return (a[idx >> 3] >> (idx & 7u)) & 1u;
+}
+
+static inline void bit_set(uint8_t *a, int ix, int iy)
+{
+    unsigned idx = (unsigned)(iy * MAX_GRID_W + ix);
+    a[idx >> 3] |= (uint8_t)(1u << (idx & 7u));
+}
+
+/* ═══════════════════════ GRID HELPERS ═════════════════════════════════════ */
+
+/* Bounds check using unsigned cast — avoids two comparisons */
+static inline bool in_bounds(int ix, int iy, int mw, int mh)
+{
+    return (unsigned)ix < (unsigned)mw && (unsigned)iy < (unsigned)mh;
+}
+
+/* Cell centre position in mm (query at cell centre, not corner) */
+static inline float cx_mm(int ix, float res) { return (ix + 0.5f) * res; }
+static inline float cy_mm(int iy, float res) { return (iy + 0.5f) * res; }
+
+/* ═══════════════════════ OCCUPANCY CATEGORY HELPERS ══════════════════════ */
+
+static inline bool cell_is_free(const quadtree_map_t *m, float x, float y)
+{
+    return quadtree_map_query(m, x, y) <= OCC_FREE_MAX;
+}
+
+static inline bool cell_is_unknown(const quadtree_map_t *m, float x, float y)
+{
+    uint8_t v = quadtree_map_query(m, x, y);
+    return v >= OCC_UNK_MIN && v <= OCC_UNK_MAX;
+}
+
+/* ═══════════════════════ is_frontier ══════════════════════════════════════
+ * Returns true if cell (ix, iy) is free AND has at least one 4-connected
+ * neighbour that is unknown. This is the canonical WFD frontier definition.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static bool is_frontier(const quadtree_map_t *m, int ix, int iy,
+                         float res, int mw, int mh)
+{
+    if (!cell_is_free(m, cx_mm(ix, res), cy_mm(iy, res))) return false;
+
+    for (int k = 0; k < 4; k++) {
+        int nx = ix + K4X[k];
+        int ny = iy + K4Y[k];
+        if (!in_bounds(nx, ny, mw, mh)) continue;
+        if (cell_is_unknown(m, cx_mm(nx, res), cy_mm(ny, res))) return true;
+    }
+    return false;
+}
+
+/* ═══════════════════════ is_safe_cell ═════════════════════════════════════
+ * Returns true if all 8 neighbours of (ix, iy) are free.
+ * Used by safety_spiral: the target must not sit right next to a wall.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static bool is_safe_cell(const quadtree_map_t *m, int ix, int iy,
+                          float res, int mw, int mh)
+{
+    for (int k = 0; k < 8; k++) {
+        int nx = ix + K8X[k];
+        int ny = iy + K8Y[k];
+        if (!in_bounds(nx, ny, mw, mh)) continue;
+        if (!cell_is_free(m, cx_mm(nx, res), cy_mm(ny, res))) return false;
+    }
+    return true;
+}
+
+/* ═══════════════════════ safety_spiral ════════════════════════════════════
+ * If the chosen cell is unsafe (any 8-neighbour not free), expand outward
+ * ring by ring up to SPIRAL_STEPS cells and adopt the first safe cell found.
+ * Updates *ix, *iy in place. Keeps original if nothing better is found.
+ *
+ * Adapted from SLAMaleykoum get_safe_neighbor() — proven on hardware.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void safety_spiral(const quadtree_map_t *m, int *ix, int *iy,
+                           float res, int mw, int mh)
+{
+    if (is_safe_cell(m, *ix, *iy, res, mw, mh)) return;
+
+    for (int r = 1; r <= SPIRAL_STEPS; r++) {
+        for (int dy = -r; dy <= r; dy++) {
+            for (int dx = -r; dx <= r; dx++) {
+                /* Visit only the outermost ring at radius r */
+                if (abs(dx) != r && abs(dy) != r) continue;
+                int nx = *ix + dx;
+                int ny = *iy + dy;
+                if (!in_bounds(nx, ny, mw, mh)) continue;
+                if (!cell_is_free(m, cx_mm(nx, res), cy_mm(ny, res))) continue;
+                if (is_safe_cell(m, nx, ny, res, mw, mh)) {
+                    *ix = nx;
+                    *iy = ny;
+                    return;
+                }
+            }
+        }
+    }
+    /* No safe cell within spiral range — keep original (better than nothing) */
+}
+
+/* ═══════════════════════ cluster_frontier ═════════════════════════════════
+ * 4-connected flood-fill from seed (sx, sy) over cells that pass is_frontier.
+ * Stores visited cells in s_cbuf[] and marks them in s_clu[].
+ * Returns the number of cells found (capped at CLUSTER_CAP).
+ *
+ * Uses a local 512-byte stack queue — small enough for ESP32-S3 tasks.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static int cluster_frontier(const quadtree_map_t *m, int sx, int sy,
+                             float res, int mw, int mh)
+{
+    cell_t lq[CLUSTER_CAP];    /* local queue — 512 bytes on stack */
+    int head = 0, tail = 0, count = 0;
+
+    lq[tail++] = (cell_t){ (int16_t)sx, (int16_t)sy };
+    bit_set(s_clu, sx, sy);
+
+    while (head != tail && count < CLUSTER_CAP) {
+        cell_t c = lq[head++];
+        s_cbuf[count++] = c;
+
+        for (int k = 0; k < 4; k++) {
+            int nx = c.ix + K4X[k];
+            int ny = c.iy + K4Y[k];
+            if (!in_bounds(nx, ny, mw, mh))        continue;
+            if (bit_get(s_clu, nx, ny))             continue;
+            if (!is_frontier(m, nx, ny, res, mw, mh)) continue;
+            if (tail >= CLUSTER_CAP)                continue; /* queue full */
+            lq[tail++] = (cell_t){ (int16_t)nx, (int16_t)ny };
+            bit_set(s_clu, nx, ny);
+        }
+    }
+    return count;
+}
+
+/* ═══════════════════════ nearest_to_centroid ══════════════════════════════
+ * Finds the cell in s_cbuf[0..count) closest to the cluster centroid.
+ * Returns its map coordinates in mm via *out_ix / *out_iy.
+ *
+ * Why not use the raw centroid?
+ *   The centroid is the arithmetic mean of cell positions. It can fall
+ *   inside an obstacle or unknown cell (e.g., a concave frontier).
+ *   The cell nearest to the centroid is always an actual free cell,
+ *   so it is always reachable. (Topiwala et al. WFD recommendation.)
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void nearest_to_centroid(int count, int *out_ix, int *out_iy)
+{
+    /* Compute centroid in cell-index space */
+    float sum_x = 0.0f, sum_y = 0.0f;
+    for (int i = 0; i < count; i++) {
+        sum_x += s_cbuf[i].ix;
+        sum_y += s_cbuf[i].iy;
+    }
+    float cen_x = sum_x / (float)count;
+    float cen_y = sum_y / (float)count;
+
+    /* Find closest cluster cell to centroid */
+    float best_d = 1e9f;
+    int   best_i = 0;
+    for (int i = 0; i < count; i++) {
+        float dx = (float)s_cbuf[i].ix - cen_x;
+        float dy = (float)s_cbuf[i].iy - cen_y;
+        float d  = dx * dx + dy * dy;
+        if (d < best_d) { best_d = d; best_i = i; }
+    }
+    *out_ix = s_cbuf[best_i].ix;
+    *out_iy = s_cbuf[best_i].iy;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * frontier_detector_detect
+ *
+ * WFD BFS from robot pose outward through free cells.
+ * Returns up to 32 valid frontier clusters, each with a safe target point.
+ * ══════════════════════════════════════════════════════════════════════════ */
+frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
+                                          const pose_t *robot_pose)
+{
+    frontier_list_t result = {0};
+
+    if (!map || !robot_pose) return result;
+
+    float res = map->resolution_mm;
+    if (res <= 0.0f) return result;
+
+    /* Grid dimensions — clamped to static buffer limits */
+    int mw = (int)(map->width_mm  / res);
+    int mh = (int)(map->height_mm / res);
+    if (mw > MAX_GRID_W) mw = MAX_GRID_W;
+    if (mh > MAX_GRID_H) mh = MAX_GRID_H;
+
+    /* Clear visited arrays for this call */
+    memset(s_vis, 0, sizeof(s_vis));
+    memset(s_clu, 0, sizeof(s_clu));
+
+    /* Convert robot pose (mm) to grid cell index */
+    int rx = (int)(robot_pose->x / res);
+    int ry = (int)(robot_pose->y / res);
+    if (!in_bounds(rx, ry, mw, mh)) return result;
+
+    /* Robot must be in a free cell — if not, the map isn't ready yet */
+    if (!cell_is_free(map, cx_mm(rx, res), cy_mm(ry, res))) return result;
+
+    /* ── WFD BFS ──────────────────────────────────────────────────────── */
+    int head = 0, tail = 0;
+    s_bfs[tail++] = (cell_t){ (int16_t)rx, (int16_t)ry };
+    bit_set(s_vis, rx, ry);
+
+    while (head != tail) {
+        cell_t c = s_bfs[head];
+        head = (head + 1) % BFS_QUEUE_CAP;
+
+        /* ── Frontier check ─────────────────────────────────────────── */
+        /* If this free cell borders unknown space AND hasn't been
+         * absorbed into a cluster yet, grow a cluster from it. */
+        if (is_frontier(map, c.ix, c.iy, res, mw, mh) &&
+            !bit_get(s_clu, c.ix, c.iy))
+        {
+            int cnt = cluster_frontier(map, c.ix, c.iy, res, mw, mh);
+
+            if (cnt >= MIN_CLUSTER_SIZE) {
+                /* Find the cluster cell nearest to the centroid */
+                int tix, tiy;
+                nearest_to_centroid(cnt, &tix, &tiy);
+
+                /* Nudge target away from walls if needed */
+                safety_spiral(map, &tix, &tiy, res, mw, mh);
+
+                result.items[0].cx   = cx_mm(tix, res);
+                result.items[0].cy   = cy_mm(tiy, res);
+                result.items[0].size = (uint8_t)(cnt > 255 ? 255 : cnt);
+                result.count = 1;
+                return result;   /* BFS stops here — nearest valid cluster by
+                                    BFS order is already the closest reachable
+                                    frontier; no need to scan the full map.    */
+            }
+        }
+
+        /* ── BFS expansion ──────────────────────────────────────────── */
+        /* Expand only through free cells (frontier cells are free too,
+         * so they are naturally included and will be processed above). */
+        for (int k = 0; k < 4; k++) {
+            int nx = c.ix + K4X[k];
+            int ny = c.iy + K4Y[k];
+            if (!in_bounds(nx, ny, mw, mh))                   continue;
+            if (bit_get(s_vis, nx, ny))                        continue;
+            if (!cell_is_free(map, cx_mm(nx, res), cy_mm(ny, res))) continue;
+
+            int next_tail = (tail + 1) % BFS_QUEUE_CAP;
+            if (next_tail == head) continue;   /* queue full — skip, not crash */
+            s_bfs[tail] = (cell_t){ (int16_t)nx, (int16_t)ny };
+            tail = next_tail;
+            bit_set(s_vis, nx, ny);
+        }
+    }
+
+    return result;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * frontier_detector_best
+ *
+ * Score: U(f) = size / distance_to_robot   (Gain / Cost utility function)
+ *   - size     approximates information gain (more cells = more unknown exposed)
+ *   - distance approximates travel cost
+ *
+ * Returns the highest-scoring frontier, or a zero-initialised struct if
+ * the list is empty (caller must check result.size > 0 before using).
+ * ══════════════════════════════════════════════════════════════════════════ */
+frontier_t frontier_detector_best(const frontier_list_t *list,
+                                   const pose_t *robot_pose)
+{
+    frontier_t best = {0};
+    if (!list || !robot_pose || list->count == 0) return best;
+
+    float best_score = -1.0f;
+
+    for (uint8_t i = 0; i < list->count; i++) {
+        const frontier_t *f = &list->items[i];
+        float dx   = f->cx - robot_pose->x;
+        float dy   = f->cy - robot_pose->y;
+        float dist = sqrtf(dx * dx + dy * dy);
+
+        /* Clamp minimum distance to avoid division by zero when the robot
+         * is already sitting on a frontier cell (startup edge case). */
+        if (dist < 1.0f) dist = 1.0f;
+
+        float score = (float)f->size / dist;
+        if (score > best_score) {
+            best_score = score;
+            best       = *f;
+        }
+    }
+    return best;
+}
