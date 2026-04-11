@@ -1,16 +1,17 @@
 /**
  * Board: ESP32-S3 (SLAM Brain)
  *
- * Testing before full first implementation:
- *   1. Run frontier detection on the current map.
- *   2. If a frontier is found → send its position as the control target.
- *   3. If no frontier (map still a stub → all cells return 0 = free,
- *      no unknown neighbours) → fall back to a hardcoded 200 mm straight
- *      forward command so the car still moves and the UART link is verified.
+ * ── Debug flag ───────────────────────────────────────────────────────────────
+ * USE_FRONTIER_TARGET  0  →  Hardware smoke test: always send a hardcoded 200 mm
+ *                            straight-forward command regardless of what frontier
+ *                            detection returns. Proves the UART + motor chain
+ *                            works before path following is wired up.
  *
- * Once quadtree_map, rbpf, and hybrid_astar are implemented,we should replace the
- * commented-out full loop below and remove the debug fallback.
- */
+ * USE_FRONTIER_TARGET  1  →  Real mode: run frontier detection, pass the best
+ *                            target through command_gen, send the computed frame.
+ *                            Switch to this once UART + motors are verified.
+ * ─────────────────────────────────────────────────────────────────────────── */
+#define USE_FRONTIER_TARGET  0
 
 #include "src/lidar_driver.h"
 #include "src/polar_to_cart.h"
@@ -31,11 +32,11 @@
 #include "freertos/task.h"
 #include <math.h>
 
-/* ── Debug fallback distance ─────────────────────────────────────────────── */
-#define DEBUG_FORWARD_MM   200.0f   /* straight forward distance (mm)        */
-#define DEBUG_SPEED_MM_S   100.0f   /* target speed sent in control frame     */
+/* ── Debug fallback ──────────────────────────────────────────────────────── */
+#define DEBUG_FORWARD_MM   200.0f   /* hardcoded straight-forward distance    */
+#define DEBUG_SPEED_MM_S   100.0f   /* speed sent with the fallback command   */
 
-/* ── Event-driven replanning thresholds ─────────────────────────────────── */
+/* ── Event-driven replanning thresholds (used in full loop below) ─────────── */
 #define TARGET_REACHED_MM   150.0f  /* declare target reached within this radius */
 #define REPLAN_TIMEOUT_MS  5000     /* force replan if no progress for 5 s       */
 
@@ -51,45 +52,49 @@ void app_main(void)
     quadtree_map_t map;
     quadtree_map_init(&map, 10000.0f, 10000.0f, 50.0f);
 
-    /* Robot starts at the origin, heading = 0 (facing +X).
-     * RBPF will provide this once implemented; use (0,0,0) for debug. */
     pose_t pose = {0};
     pose.x     = 0.0f;
     pose.y     = 0.0f;
     pose.theta = 0.0f;
 
-    /* ── Frontier detection ───────────────────────────────────────────────
-     * With the quadtree stub (returns 0 = free for all cells), there are
-     * no unknown cells, so no frontiers will be detected. The fallback
-     * below handles this case. Once the quadtree is populated by the
-     * lidar→classifier→map_updater pipeline, this will return real frontiers.
-     * ──────────────────────────────────────────────────────────────────── */
+    /* ── Frontier detection ──────────────────────────────────────────────── */
     frontier_list_t frontiers = frontier_detector_detect(&map, &pose);
 
+    /* ── Build and send command ──────────────────────────────────────────── */
     control_frame_t cmd = {0};
 
+#if USE_FRONTIER_TARGET
+
+    /* ── Real mode: use command_gen output ─────────────────────────────────
+     * frontier_list_t.items[0] is already the nearest valid cluster (BFS
+     * order). Build a waypoint from it and let command_gen compute heading
+     * and speed-scaled frame. Fall back to 200 mm forward if no frontier. */
     if (frontiers.count > 0) {
-        /* ── Frontier found: send it as the navigation target ────────────
-         * Full implementation: pass to hybrid_astar_plan() then command_gen.
-         * Debug simplification: send frontier position directly at fixed speed.
-         * The Wemos will drive toward it as a straight-line approximation.
-         * ──────────────────────────────────────────────────────────────── */
         frontier_t best = frontier_detector_best(&frontiers, &pose);
-        cmd.tx        = best.cx;
-        cmd.ty        = best.cy;
-        cmd.t_heading = pose.theta;
-        cmd.t_speed   = DEBUG_SPEED_MM_S;
+        waypoint_t wp   = {0};
+        wp.x            = best.cx;
+        wp.y            = best.cy;
+        cmd             = command_gen_compute(&pose, &wp);
     } else {
-        /* ── Debug fallback: no frontier yet (map is stub) ───────────────
-         * Send a command to drive straight forward 200 mm.
-         * tx=0, ty=200 means "target is 200 mm ahead along current heading".
-         * The Wemos uses sqrt(tx²+ty²) as the distance to travel.
-         * ──────────────────────────────────────────────────────────────── */
         cmd.tx        = 0.0f;
         cmd.ty        = DEBUG_FORWARD_MM;
-        cmd.t_heading = 0.0f;
+        cmd.t_heading = pose.theta;
         cmd.t_speed   = DEBUG_SPEED_MM_S;
     }
+
+#else  /* USE_FRONTIER_TARGET == 0 */
+
+    /* ── Debug mode: UART + motor smoke test ───────────────────────────────
+     * Frontier detection ran above (crash-checks the module on real hardware)
+     * but its result is ignored. Send a fixed 200 mm forward command so the
+     * Wemos drives straight and we can confirm the full communication chain. */
+    (void)frontiers;
+    cmd.tx        = 0.0f;
+    cmd.ty        = DEBUG_FORWARD_MM;
+    cmd.t_heading = pose.theta;
+    cmd.t_speed   = DEBUG_SPEED_MM_S;
+
+#endif /* USE_FRONTIER_TARGET */
 
     uart_bridge_send_control(&cmd);
 
@@ -104,9 +109,9 @@ void app_main(void)
      *   3. Current target cell became occupied (obstacle appeared there).
      *   4. REPLAN_TIMEOUT_MS elapsed without reaching the target (stuck).
      *
-     * frontier_detector_detect() now returns at most 1 frontier (early-exit
-     * BFS), so frontier_detector_best() is no longer needed — items[0] is
-     * already the nearest valid cluster by BFS order.
+     * frontier_detector_detect() returns at most 1 frontier (early-exit BFS),
+     * so frontier_detector_best() is not needed — items[0] is already the
+     * nearest valid cluster by BFS order.
      *
      * pose_t    current_target = {0};
      * bool      has_target     = false;
@@ -144,24 +149,17 @@ void app_main(void)
      *     if (need_replan) {
      *         frontier_list_t frontiers = frontier_detector_detect(&map, &pose);
      *         if (frontiers.count > 0) {
-     *             current_target.x = frontiers.items[0].cx;
-     *             current_target.y = frontiers.items[0].cy;
+     *             waypoint_t wp = {0};
+     *             wp.x = frontiers.items[0].cx;
+     *             wp.y = frontiers.items[0].cy;
+     *             control_frame_t cmd = command_gen_compute(&pose, &wp);
+     *             uart_bridge_send_control(&cmd);
+     *             current_target.x = wp.x;
+     *             current_target.y = wp.y;
      *             has_target   = true;
      *             last_plan_ms = now_ms;
      *         } else {
      *             has_target = false;   // fully explored or map not ready
-     *         }
-     *     }
-     *
-     *     // ── Navigate toward current target ─────────────────────────────
-     *     if (has_target) {
-     *         path_t path = hybrid_astar_plan(&map, &pose, &current_target);
-     *         path_refiner_smooth(&path);
-     *         path_refiner_shortcut(&path, &map);
-     *
-     *         if (hybrid_astar_is_valid(&path)) {
-     *             control_frame_t cmd = command_gen_compute(&pose, &path.waypoints[0]);
-     *             uart_bridge_send_control(&cmd);
      *         }
      *     }
      *
