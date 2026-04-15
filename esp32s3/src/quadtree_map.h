@@ -10,50 +10,64 @@
 #define QUADTREE_MAP_H
 
 #include <stdint.h>
-#include "../../types.h"
+#include <stddef.h>
 
-/** Forward declaration for internal quadtree node (opaque to callers). */
-typedef struct quadtree_node_t quadtree_node_t;
 
-/** Top-level quadtree occupancy map descriptor. */
+
+#define QT_MAX_DEPTH 6
+
+// complete quadtree to depth 6 needs at most 5 461 nodes -> 6 000 gives a comfortable safety marginƒ
+#define QT_POOL_SIZE 6000
+#define QT_NULL 0 // no child index 
+
+// Log-odds increments 
+#define QT_HIT_INC 15  // obstacle confirmed → value rises
+#define QT_MISS_DEC (-6)  // ray passed through → value drops 
+#define QT_VALUE_MAX 40
+#define QT_VALUE_MIN (-40)
+
+// Node 
 typedef struct {
-    void  *root;          /**< Pointer to root quadtree_node_t (opaque) */
-    float  resolution_mm; /**< Leaf cell size in millimetres */
-    float  width_mm;      /**< Total map width in millimetres */
-    float  height_mm;     /**< Total map height in millimetres */
-} quadtree_map_t;
+    uint16_t children[4]; // pool indices; QT_NULL = absent 
+    int8_t value; // log-odds occupancy (meaningful at leaves) 
+    uint8_t depth; // depth in tree (root = 1) 
+} QTNode;
 
-/**
- * Initialize a quadtree map covering [0, width_mm] x [0, height_mm].
- * @param map           Pointer to the quadtree_map_t to initialize.
- * @param width_mm      Map width in millimetres.
- * @param height_mm     Map height in millimetres.
- * @param resolution_mm Minimum leaf cell size in millimetres.
- */
-void quadtree_map_init(quadtree_map_t *map, float width_mm, float height_mm, float resolution_mm);
 
-/**
- * Insert a classified observation at the given map coordinates.
- * @param map Pointer to the map.
- * @param x   X coordinate of the observation in mm.
- * @param y   Y coordinate of the observation in mm.
- * @param cls Semantic class of the observation.
- */
-void quadtree_map_insert(quadtree_map_t *map, float x, float y, semantic_class_t cls);
+typedef struct {
+    QTNode *pool; // heap-allocated array (from 0 to QT_POOL_SIZE)
+    uint16_t count; // next free slot 
+    float x_min, x_max;
+    float y_min, y_max;
+} QuadTreeMap;
 
-/**
- * Query occupancy at a given map coordinate.
- * @param map Pointer to the map (const, no modification).
- * @param x   X coordinate to query in mm.
- * @param y   Y coordinate to query in mm.
- * @return Occupancy value 0 (free) to 255 (fully occupied).
- */
-uint8_t quadtree_map_query(const quadtree_map_t *map, float x, float y);
 
-/**
- * Free all dynamically allocated nodes in the quadtree map.
- * @param map Pointer to the map to free.
- */
-void quadtree_map_free(quadtree_map_t *map);
+// Initialise a map covering [x_min,x_max] × [y_min,y_max] and 
+// allocates the node pool with malloc + call qt_free() when done 
+void qt_init(QuadTreeMap *map,
+             float x_min, float x_max,
+             float y_min, float y_max);
 
-#endif /* QUADTREE_MAP_H */
+// free the node pool                                             
+void qt_free(QuadTreeMap *map);
+
+// update the log-odds value at world position (x, y).
+// Pass QT_HIT_INC for an obstacle hit/ QT_MISS_DEC for a free ray 
+void qt_update(QuadTreeMap *map, float x, float y, int8_t delta);
+
+//Return the log-odds value at (x, y).
+//Returns 0 if never observed/out of bounds
+
+int8_t qt_query(QuadTreeMap *map, float x, float y);
+
+// qt_iterate_occupied: Initiates traversal of occupied cells cad value > 0).
+//cb receives the cell centre (cx, cy)+ its value+ userdata 
+void qt_iterate_occupied(QuadTreeMap *map,
+                         void (*cb)(float cx, float cy,
+                                    int8_t value, void *userdata),
+                         void *userdata);
+
+// qt_memory_bytes: returns memory usage of allocated nodes.
+size_t qt_memory_bytes(const QuadTreeMap *map);
+
+#endif 
