@@ -1,0 +1,12 @@
+# SLAMborghini Wemos D1 R32 — ESP-IDF Kconfig overrides
+# Applied by PlatformIO before building (same as esp32s3/sdkconfig.defaults).
+
+# WebSocket support in ESP-IDF HTTP server (required for /ws endpoint)
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# STA mode only — no SoftAP needed
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+
+# HTTP server tuning
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512

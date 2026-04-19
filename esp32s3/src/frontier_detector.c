@@ -271,22 +271,25 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
 
     if (!map || !robot_pose) return result;
 
-    float res = map->resolution_mm;
+    /* Derive resolution from bounds (quadtree_map_init step_mm = width/MAX_GRID_W).
+     * The new QuadTreeMap stores x_min/x_max/y_min/y_max instead of resolution_mm. */
+    float map_w = map->x_max - map->x_min;
+    float map_h = map->y_max - map->y_min;
+    float res   = map_w / (float)MAX_GRID_W;
     if (res <= 0.0f) return result;
 
     /* Grid dimensions — clamped to static buffer limits */
-    int mw = (int)(map->width_mm  / res);
-    int mh = (int)(map->height_mm / res);
-    if (mw > MAX_GRID_W) mw = MAX_GRID_W;
+    int mw = MAX_GRID_W;
+    int mh = (int)(map_h / res);
     if (mh > MAX_GRID_H) mh = MAX_GRID_H;
 
     /* Clear visited arrays for this call */
     memset(s_vis, 0, sizeof(s_vis));
     memset(s_clu, 0, sizeof(s_clu));
 
-    /* Convert robot pose (mm) to grid cell index */
-    int rx = (int)(robot_pose->x / res);
-    int ry = (int)(robot_pose->y / res);
+    /* Convert robot pose (mm) to grid cell index — offset by map origin */
+    int rx = (int)((robot_pose->x - map->x_min) / res);
+    int ry = (int)((robot_pose->y - map->y_min) / res);
     if (!in_bounds(rx, ry, mw, mh)) return result;
 
     /* Robot must be in a free cell — if not, the map isn't ready yet */

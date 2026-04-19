@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SLAMborghini — Live Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #111;
+    color: #e0e0e0;
+    font-family: 'Courier New', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 14px;
+    gap: 12px;
+    min-height: 100vh;
+  }
+  h1 { color: #00d4ff; font-size: 1.05rem; letter-spacing: 2px; }
+
+  .toolbar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center;
+  }
+  input[type=text] {
+    background: #1a1a2e; border: 1px solid #444; color: #e0e0e0;
+    padding: 5px 10px; border-radius: 4px; font-family: inherit; width: 200px;
+  }
+  button {
+    background: #1a1a2e; border: 1px solid #555; color: #ccc;
+    padding: 5px 12px; border-radius: 4px; cursor: pointer; font-family: inherit;
+  }
+  button:hover:not(:disabled) { background: #2a2a4e; }
+  button:disabled { opacity: 0.3; cursor: default; }
+  #btnStart { border-color: #52b788; color: #52b788; }
+  #btnStop  { border-color: #e76f51; color: #e76f51; }
+
+  .dot {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    background: #555; vertical-align: middle; margin-right: 5px;
+  }
+  .dot.green  { background: #52b788; box-shadow: 0 0 5px #52b788; }
+  .dot.orange { background: #f4a261; box-shadow: 0 0 5px #f4a261; }
+  #statusTxt  { font-size: 0.76rem; color: #888; }
+
+  .main-area {
+    display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; justify-content: center;
+  }
+
+  /* Map fills the full grid — scroll if it exceeds viewport */
+  #mapWrap {
+    overflow: auto;
+    border: 2px solid #333;
+    background: #ff8c00; /* matches unknown cell color — no gaps visible */
+    flex-shrink: 0;
+    max-width: calc(100vw - 300px);
+    max-height: 82vh;
+  }
+  #mapCanvas { image-rendering: pixelated; display: block; }
+
+  .panel {
+    background: #1a1a2e; border: 1px solid #333; border-radius: 6px;
+    padding: 12px; width: 250px; display: flex; flex-direction: column; gap: 12px;
+  }
+  .panel h3 { color: #00d4ff; font-size: 0.8rem; border-bottom: 1px solid #333; padding-bottom: 5px; }
+
+  .tele { font-size: 0.74rem; line-height: 2.1; color: #888; }
+  .tele span { color: #00d4ff; font-weight: bold; }
+  .tele .fr  { color: #f4a261; }
+
+  .leg-row { display: flex; align-items: center; gap: 7px; font-size: 0.73rem; }
+  .sw { width: 13px; height: 13px; flex-shrink: 0; border: 1px solid #555; border-radius: 2px; }
+
+  .log {
+    background: #0d0d1a; border: 1px solid #333; border-radius: 4px;
+    padding: 7px; font-size: 0.68rem; line-height: 1.8; max-height: 220px;
+    overflow-y: auto; color: #7ec8e3;
+  }
+  .log .w { color: #f4a261; }
+  .log .e { color: #e76f51; }
+  .log .ok { color: #52b788; }
+
+  .zoom-row { display: flex; align-items: center; gap: 7px; font-size: 0.73rem; }
+  input[type=range] { flex: 1; accent-color: #00d4ff; }
+</style>
+</head>
+<body>
+
+<h1>SLAMBORGHINI 2026 — Live Map</h1>
+
+<div class="toolbar">
+  <label style="font-size:.76rem;color:#888">ESP32 IP:</label>
+  <input type="text" id="ipInput" value="192.168.1.100" placeholder="192.168.x.x">
+  <button id="btnConnect"    onclick="connectWS()">Connect</button>
+  <button id="btnDisconnect" onclick="disconnectWS()" disabled>Disconnect</button>
+  <button id="btnStart"      onclick="sendCmd('start')" disabled>▶ Start</button>
+  <button id="btnStop"       onclick="sendCmd('stop')"  disabled>■ Stop</button>
+  <span><span class="dot" id="dot"></span><span id="statusTxt">Disconnected</span></span>
+</div>
+
+<div class="main-area">
+
+  <div id="mapWrap"><canvas id="mapCanvas"></canvas></div>
+
+  <div class="panel">
+    <h3>Telemetry</h3>
+    <div class="tele">
+      Car X: <span id="tX">—</span> mm<br>
+      Car Y: <span id="tY">—</span> mm<br>
+      Heading: <span id="tTheta">—</span> °<br>
+      Frontier X: <span class="fr" id="tFX">—</span> mm<br>
+      Frontier Y: <span class="fr" id="tFY">—</span> mm<br>
+      Frontier: <span id="tHF" style="color:#888">—</span><br>
+      Map frames: <span id="tFrames">0</span>
+    </div>
+
+    <h3>Legend</h3>
+    <div style="display:flex;flex-direction:column;gap:4px">
+      <div class="leg-row"><div class="sw" style="background:#ff8c00"></div>Unknown</div>
+      <div class="leg-row"><div class="sw" style="background:#fff;border-color:#aaa"></div>Free / explored</div>
+      <div class="leg-row"><div class="sw" style="background:#000"></div>Wall</div>
+      <div class="leg-row"><div class="sw" style="background:#0f0;border-radius:50%"></div>Robot (green arrow)</div>
+      <div class="leg-row"><div class="sw" style="background:#00ffff;border-radius:50%"></div>Frontier target</div>
+    </div>
+
+    <h3>Zoom</h3>
+    <div class="zoom-row">
+      <input type="range" id="zoomSlider" min="2" max="20" value="6">
+      <span id="zoomVal">6</span> px/cell
+    </div>
+
+    <h3>Log</h3>
+    <div class="log" id="logBox"></div>
+    <button onclick="clearLog()" style="font-size:.7rem;padding:3px 8px">Clear</button>
+  </div>
+
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+ * Rendering approach (same as SLAMaleykoum ground_station.py):
+ *   canvas = gw*scale × gh*scale  — the ENTIRE map is always drawn.
+ *   No viewport offsets. Car is always somewhere on the canvas.
+ *   Scroll the page/wrapper if the map is larger than the screen.
+ *
+ * Colors (matching lidar_map.png output):
+ *   unknown → orange  #ff8c00   (val 128, never observed)
+ *   free    → white   #ffffff   (val  20, log-odds < 0)
+ *   wall    → black   #000000   (val 230, log-odds > 0)
+ *
+ * Robot: green arrow pointing in heading direction (SLAMurai style).
+ * Frontier: cyan dot + dashed line (SLAMaleykoum C_CYAN style).
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+const canvas = document.getElementById('mapCanvas');
+const ctx    = canvas.getContext('2d');
+
+let scale    = parseInt(document.getElementById('zoomSlider').value);
+let liveGrid = null;   // { gw, gh, cellMm, cells: Uint8Array }
+let carState = null;
+
+/* ─── draw ──────────────────────────────────────────────────────────────── */
+function draw() {
+  if (!liveGrid) return;
+  const { gw, gh, cellMm, cells } = liveGrid;
+
+  /* Canvas always = full grid size */
+  canvas.width  = gw * scale;
+  canvas.height = gh * scale;
+
+  /* Build 1-px/cell image, then scale to canvas */
+  const off = document.createElement('canvas');
+  off.width = gw; off.height = gh;
+  const oc  = off.getContext('2d');
+  const img = oc.createImageData(gw, gh);
+  const d   = img.data;
+
+  for (let iy = 0; iy < gh; iy++) {
+    for (let ix = 0; ix < gw; ix++) {
+      const val = cells[iy * gw + ix];
+      const py  = gh - 1 - iy;          /* Y-flip: row 0 = y_min = bottom */
+      const k   = (py * gw + ix) * 4;
+      if (val <= 50) {                   /* free  → white */
+        d[k]=255; d[k+1]=255; d[k+2]=255; d[k+3]=255;
+      } else if (val <= 178) {           /* unknown → orange (lidar_map.png) */
+        d[k]=255; d[k+1]=140; d[k+2]=0;  d[k+3]=255;
+      } else {                           /* wall  → black */
+        d[k]=0;   d[k+1]=0;   d[k+2]=0;  d[k+3]=255;
+      }
+    }
+  }
+  oc.putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+
+  if (!carState) return;
+
+  /* mm → canvas px  (col = x/cellMm, row = gh-1 - y/cellMm, then scale) */
+  function toPx(x_mm, y_mm) {
+    return [
+      (x_mm / cellMm) * scale + scale / 2,
+      (gh - 1 - y_mm / cellMm) * scale + scale / 2
+    ];
+  }
+
+  const [cx, cy] = toPx(carState.x, carState.y);
+
+  /* Frontier: cyan dot + dashed line (SLAMaleykoum C_CYAN) */
+  if (carState.has_frontier) {
+    const [fx, fy] = toPx(carState.fx, carState.fy);
+
+    ctx.fillStyle = '#00ffff';
+    ctx.beginPath();
+    ctx.arc(fx, fy, Math.max(5, scale * 0.7), 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = '#00ffff88';
+    ctx.lineWidth   = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(fx, fy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  /* ── Robot: box + wheels sized relative to map (like a real RC car) ──────
+   * Car body ≈ 400 mm × 240 mm in world space.
+   * cellMm converts mm → cells; scale converts cells → px.
+   * Canvas Y is inverted vs world Y, so we rotate by -theta.               */
+  const pxPerMm = scale / cellMm;
+  const bL = 400 * pxPerMm;   /* body length px */
+  const bW = 240 * pxPerMm;   /* body width  px */
+  const wL =  90 * pxPerMm;   /* wheel length px */
+  const wW =  40 * pxPerMm;   /* wheel width  px */
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(-carState.theta);   /* canvas +Y is down, world +Y is up */
+
+  /* Body */
+  ctx.fillStyle   = '#4361ee';
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth   = Math.max(1, pxPerMm * 10);
+  ctx.fillRect  (-bL / 2, -bW / 2, bL, bW);
+  ctx.strokeRect(-bL / 2, -bW / 2, bL, bW);
+
+  /* Front stripe (shows heading direction) */
+  ctx.fillStyle = '#00d4ff';
+  ctx.fillRect(bL / 2 - bL * 0.18, -bW / 2, bL * 0.18, bW);
+
+  /* Wheels — 4 corners, black rectangles */
+  ctx.fillStyle = '#111';
+  const wX = bL / 2 - wL * 0.5;   /* wheel x offset from centre */
+  const wY = bW / 2;               /* wheel y offset from centre */
+  /* front-right */  ctx.fillRect( wX - wL / 2,  wY,       wL, wW);
+  /* front-left  */  ctx.fillRect( wX - wL / 2, -wY - wW,  wL, wW);
+  /* rear-right  */  ctx.fillRect(-wX - wL / 2,  wY,       wL, wW);
+  /* rear-left   */  ctx.fillRect(-wX - wL / 2, -wY - wW,  wL, wW);
+
+  ctx.restore();
+}
+
+/* ─── WebSocket ─────────────────────────────────────────────────────────── */
+let ws = null, frames = 0;
+
+function setStatus(msg, dotCls) {
+  document.getElementById('statusTxt').textContent = msg;
+  document.getElementById('dot').className = 'dot ' + (dotCls || '');
+}
+
+function log(txt, cls) {
+  const box  = document.getElementById('logBox');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString('en-GB',{hour12:false})}] ${txt}`;
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+  while (box.children.length > 200) box.removeChild(box.firstChild);
+}
+
+function clearLog() {
+  document.getElementById('logBox').innerHTML = '';
+  frames = 0;
+  document.getElementById('tFrames').textContent = '0';
+}
+
+function connectWS() {
+  const ip = document.getElementById('ipInput').value.trim();
+  if (!ip) return;
+  setStatus(`Connecting to ${ip}…`, 'orange');
+  log(`Connecting to ws://${ip}/ws …`, 'w');
+
+  ws = new WebSocket(`ws://${ip}/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    setStatus('Connected', 'green');
+    log(`Connected`, 'ok');
+    document.getElementById('btnConnect').disabled    = true;
+    document.getElementById('btnDisconnect').disabled = false;
+    document.getElementById('btnStart').disabled      = false;
+    document.getElementById('btnStop').disabled       = true;
+  };
+
+  ws.onclose = () => {
+    setStatus('Disconnected — retrying…', '');
+    log('Disconnected — retry in 3 s', 'e');
+    document.getElementById('btnConnect').disabled    = false;
+    document.getElementById('btnDisconnect').disabled = true;
+    document.getElementById('btnStart').disabled      = true;
+    document.getElementById('btnStop').disabled       = true;
+    ws = null;
+    setTimeout(() => { if (!ws) connectWS(); }, 3000);
+  };
+
+  ws.onerror = () => log('WebSocket error', 'e');
+
+  ws.onmessage = (evt) => {
+    /* Binary frame = full occupancy grid */
+    if (evt.data instanceof ArrayBuffer) {
+      const v  = new DataView(evt.data);
+      const gw = v.getUint16(0, true);
+      const gh = v.getUint16(2, true);
+      const mm = v.getFloat32(4, true);
+      if (gw > 0 && gh > 0 && mm > 0) {
+        liveGrid = { gw, gh, cellMm: mm, cells: new Uint8Array(evt.data, 8) };
+        draw();
+        document.getElementById('tFrames').textContent = ++frames;
+      }
+      return;
+    }
+
+    /* Text frame = pose + frontier JSON */
+    let d;
+    try { d = JSON.parse(evt.data); } catch(e) { return; }
+    carState = d;
+
+    document.getElementById('tX').textContent     = d.x.toFixed(0);
+    document.getElementById('tY').textContent     = d.y.toFixed(0);
+    document.getElementById('tTheta').textContent = (d.theta * 180 / Math.PI).toFixed(1);
+
+    if (d.has_frontier) {
+      document.getElementById('tFX').textContent  = d.fx.toFixed(0);
+      document.getElementById('tFY').textContent  = d.fy.toFixed(0);
+      document.getElementById('tHF').textContent  = 'YES';
+      document.getElementById('tHF').style.color  = '#52b788';
+      const dist = Math.hypot(d.fx - d.x, d.fy - d.y);
+      log(`→ frontier (${d.fx.toFixed(0)}, ${d.fy.toFixed(0)}) mm  dist=${dist.toFixed(0)} mm`);
+    } else {
+      document.getElementById('tFX').textContent  = '—';
+      document.getElementById('tFY').textContent  = '—';
+      document.getElementById('tHF').textContent  = 'no';
+      document.getElementById('tHF').style.color  = '#888';
+    }
+
+    draw();
+  };
+}
+
+function disconnectWS() {
+  if (!ws) return;
+  ws.onclose = null;
+  ws.close();
+  ws = null;
+  setStatus('Disconnected', '');
+}
+
+function sendCmd(cmd) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ cmd }));
+  if (cmd === 'start') {
+    document.getElementById('btnStart').disabled = true;
+    document.getElementById('btnStop').disabled  = false;
+    log('Start sent — exploring', 'ok');
+  } else {
+    document.getElementById('btnStop').disabled  = true;
+    document.getElementById('btnStart').disabled = false;
+    log('Stop sent', 'w');
+  }
+}
+
+document.getElementById('zoomSlider').addEventListener('input', function() {
+  scale = parseInt(this.value);
+  document.getElementById('zoomVal').textContent = scale;
+  draw();
+});
+</script>
+</body>
+</html>

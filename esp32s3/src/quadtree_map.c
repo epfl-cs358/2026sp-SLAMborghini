@@ -4,13 +4,13 @@
  * Board: ESP32-S3
  * Implementation phase: stub (tree allocation and traversal not yet implemented)
  */
- 
+
 #include "quadtree_map.h"
- 
+
 #include <stdlib.h>
 #include <string.h>
- 
- 
+
+
 // clamp an int to the log-odds range
 
 static inline int8_t _clamp(int v)
@@ -19,7 +19,7 @@ static inline int8_t _clamp(int v)
     if (v < QT_VALUE_MIN) return (int8_t)QT_VALUE_MIN;
     return (int8_t)v;
 }
- 
+
 // return which quadrant of [xmn,xmx]×[ymn,ymx] contains (x,y)
 //   0 = NW  (x < cx, y >= cy)
 //   1 = NE  (x >= cx, y >= cy)
@@ -34,9 +34,9 @@ static inline int _quadrant(float xmn, float xmx,
     float cy = 0.5f * (ymn + ymx);
     int east  = (x >= cx) ? 1 : 0;
     int north = (y >= cy) ? 1 : 0;
-    return north ? east : (2 + east); 
+    return north ? east : (2 + east);
 }
- 
+
 // fill the bounds of child quadrant q inside [xmn,xmx]×[ymn,ymx]
 static inline void _child_bounds(float xmn, float xmx,
                                   float ymn, float ymx, int q,
@@ -52,7 +52,7 @@ static inline void _child_bounds(float xmn, float xmx,
         case 3: *cxmn=cx;  *cxmx=xmx; *cymn=ymn; *cymx=cy;  break; // SE
     }
 }
- 
+
 // Allocate one node from the pool/ returns QT_NULL if pool=full
 static uint16_t _alloc(QuadTreeMap *map, uint8_t depth)
 {
@@ -65,8 +65,8 @@ static uint16_t _alloc(QuadTreeMap *map, uint8_t depth)
     n->depth = depth;
     return idx;
 }
- 
- 
+
+
 void qt_init(QuadTreeMap *map,
              float x_min, float x_max,
              float y_min, float y_max)
@@ -74,16 +74,16 @@ void qt_init(QuadTreeMap *map,
     // pool[0] is the null sentinel - never used as a real node.
     map->pool  = (QTNode *)calloc(QT_POOL_SIZE, sizeof(QTNode));
     map->count = 1; // slot 0 is reserved as QT_NULL
- 
-    map->x_min = x_min;  
+
+    map->x_min = x_min;
     map->x_max = x_max;
-    map->y_min = y_min;  
+    map->y_min = y_min;
     map->y_max = y_max;
- 
+
     // allocate root node = index 1
     _alloc(map, 1);
 }
- 
+
 void qt_free(QuadTreeMap *map)
 {
     if (!map) return;
@@ -91,22 +91,22 @@ void qt_free(QuadTreeMap *map)
     map->pool  = NULL;
     map->count = 0;
 }
-  
+
 static void _update(QuadTreeMap *map, uint16_t idx,
                     float xmn, float xmx, float ymn, float ymx,
                     float x, float y, int8_t delta)
 {
     QTNode *n = &map->pool[idx];
- 
+
     // max depth = this is a leaf -> update value + return.
     if (n->depth >= QT_MAX_DEPTH) {
         n->value = _clamp((int)n->value + (int)delta);
         return;
     }
- 
+
     // internal node : find/create the right child then descend.
     int q = _quadrant(xmn, xmx, ymn, ymx, x, y);
- 
+
     if (n->children[q] == QT_NULL) {
         uint16_t child = _alloc(map, n->depth + 1);
         if (child == QT_NULL) return;  // pool full — silently drop
@@ -115,13 +115,13 @@ static void _update(QuadTreeMap *map, uint16_t idx,
         //  practice.)
         map->pool[idx].children[q] = child;
     }
- 
+
     float cxmn, cxmx, cymn, cymx;
     _child_bounds(xmn, xmx, ymn, ymx, q, &cxmn, &cxmx, &cymn, &cymx);
     _update(map, map->pool[idx].children[q],
             cxmn, cxmx, cymn, cymx, x, y, delta);
 }
- 
+
 void qt_update(QuadTreeMap *map, float x, float y, int8_t delta)
 {
     if (!map || !map->pool) return;
@@ -131,25 +131,25 @@ void qt_update(QuadTreeMap *map, float x, float y, int8_t delta)
             map->x_min, map->x_max, map->y_min, map->y_max,
             x, y, delta);
 }
- 
+
 static int8_t _query(const QuadTreeMap *map, uint16_t idx,
                      float xmn, float xmx, float ymn, float ymx,
                      float x, float y)
 {
     const QTNode *n = &map->pool[idx];
- 
+
     // leaf -> return stored value
     if (n->depth >= QT_MAX_DEPTH) return n->value;
- 
+
     int q = _quadrant(xmn, xmx, ymn, ymx, x, y);
     if (n->children[q] == QT_NULL) return 0; // never observed
- 
+
     float cxmn, cxmx, cymn, cymx;
     _child_bounds(xmn, xmx, ymn, ymx, q, &cxmn, &cxmx, &cymn, &cymx);
     return _query(map, n->children[q],
                   cxmn, cxmx, cymn, cymx, x, y);
 }
- 
+
 int8_t qt_query(QuadTreeMap *map, float x, float y)
 {
     if (!map || !map->pool) return 0;
@@ -159,23 +159,23 @@ int8_t qt_query(QuadTreeMap *map, float x, float y)
                   map->x_min, map->x_max, map->y_min, map->y_max,
                   x, y);
 }
- 
-//  qt_iterate_occupied 
- 
+
+//  qt_iterate_occupied
+
 static void _iterate(const QuadTreeMap *map, uint16_t idx,
                      float xmn, float xmx, float ymn, float ymx,
                      void (*cb)(float, float, int8_t, void *), void *ud)
 {
     if (idx == QT_NULL) return;
     const QTNode *n = &map->pool[idx];
- 
+
     // Leaf : report if occupied.
     if (n->depth >= QT_MAX_DEPTH) {
         if (n->value > 0)
             cb(0.5f*(xmn+xmx), 0.5f*(ymn+ymx), n->value, ud);
         return;
     }
- 
+
     // internal : recurse into existing children only.
     for (int q = 0; q < 4; q++) {
         if (n->children[q] == QT_NULL) continue;
@@ -185,7 +185,7 @@ static void _iterate(const QuadTreeMap *map, uint16_t idx,
                  cxmn, cxmx, cymn, cymx, cb, ud);
     }
 }
- 
+
 void qt_iterate_occupied(QuadTreeMap *map,
                          void (*cb)(float cx, float cy,
                                     int8_t value, void *userdata),
@@ -196,11 +196,11 @@ void qt_iterate_occupied(QuadTreeMap *map,
              map->x_min, map->x_max, map->y_min, map->y_max,
              cb, userdata);
 }
- 
+
 
 // report actual used nodes × node size.
 // Node size is fixed at 10 bytes on every platform because we
- 
+
 size_t qt_memory_bytes(const QuadTreeMap *map)
 {
     if (!map) return 0;

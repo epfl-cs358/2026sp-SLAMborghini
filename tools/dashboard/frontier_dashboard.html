@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SLAMborghini — Frontier Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0d0d1a;
+    color: #e0e0e0;
+    font-family: 'Courier New', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+    gap: 12px;
+    min-height: 100vh;
+  }
+  h1 { color: #00d4ff; font-size: 1.2rem; letter-spacing: 2px; }
+
+  #controls {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  input[type=text] {
+    background: #1a1a2e;
+    border: 1px solid #444;
+    color: #e0e0e0;
+    padding: 6px 10px;
+    border-radius: 4px;
+    width: 180px;
+  }
+  button {
+    background: #1a1a2e;
+    border: 1px solid #00d4ff;
+    color: #00d4ff;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 0.15s;
+  }
+  button:hover:not(:disabled) { background: #00d4ff22; }
+  button:disabled { opacity: 0.3; cursor: default; border-color: #444; color: #666; }
+  #btnStart {
+    border-color: #00ff88;
+    color: #00ff88;
+  }
+  #btnStart:hover:not(:disabled) { background: #00ff8822; }
+
+  #status {
+    font-size: 0.78rem;
+    color: #aaa;
+    min-width: 260px;
+    text-align: center;
+  }
+  .dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #555;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .dot.green  { background: #00ff88; box-shadow: 0 0 6px #00ff88; }
+  .dot.orange { background: #ff8c00; box-shadow: 0 0 6px #ff8c00; }
+  .dot.blue   { background: #00d4ff; box-shadow: 0 0 6px #00d4ff; }
+
+  #legend {
+    display: flex; gap: 16px; font-size: 0.72rem; color: #bbb; flex-wrap: wrap;
+    justify-content: center;
+  }
+  .leg { display: flex; align-items: center; gap: 5px; }
+  .swatch {
+    width: 14px; height: 14px; border-radius: 2px;
+    display: inline-block;
+  }
+
+  #mapWrap {
+    position: relative;
+    border: 1px solid #333;
+    overflow: hidden;
+    background: #111;
+  }
+  #canvasBase  { display: block; }
+  #canvasOver  { position: absolute; top: 0; left: 0; pointer-events: none; }
+
+  #stats {
+    font-size: 0.75rem;
+    color: #888;
+    display: flex; gap: 20px; flex-wrap: wrap; justify-content: center;
+  }
+  #stats span { color: #ccc; }
+
+  #zoomRow { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; }
+</style>
+</head>
+<body>
+
+<h1>SLAMborghini — Frontier Explorer</h1>
+
+<div id="controls">
+  <input id="ipInput" type="text" placeholder="192.168.x.x" value=""/>
+  <button id="btnConnect" onclick="connect()">Connect</button>
+  <button id="btnDisconnect" onclick="disconnect()" disabled>Disconnect</button>
+  <button id="btnStart" onclick="requestStart()" disabled>&#9654; Start Exploration</button>
+  <button id="btnStop" onclick="requestStop()" disabled style="border-color:#ff4444;color:#ff4444;">&#9632; STOP</button>
+  <button onclick="resetView()">&#8635; Reset View</button>
+</div>
+
+<div id="status"><span class="dot" id="dot"></span><span id="statusText">Disconnected — enter Wemos IP and connect</span></div>
+
+<div id="legend">
+  <div class="leg"><span class="swatch" style="background:#ff8c00"></span> Unknown</div>
+  <div class="leg"><span class="swatch" style="background:#ffffff"></span> Free</div>
+  <div class="leg"><span class="swatch" style="background:#1a1a1a;border:1px solid #444"></span> Wall</div>
+  <div class="leg"><span class="swatch" style="background:#00d4ff"></span> Car path</div>
+  <div class="leg"><span class="swatch" style="background:#4488ff"></span> Car</div>
+  <div class="leg"><span class="swatch" style="background:#ff8c00;border:2px solid #fff"></span> Frontier</div>
+</div>
+
+<div id="zoomRow">
+  <label>Zoom:</label>
+  <input id="zoomSlider" type="range" min="1" max="6" value="2" oninput="setZoom(+this.value)"/>
+  <span id="zoomLabel">2×</span>
+</div>
+
+<div id="mapWrap">
+  <canvas id="canvasBase"></canvas>
+  <canvas id="canvasOver"></canvas>
+</div>
+
+<div id="stats">
+  Pose: <span id="statPose">—</span>
+  &nbsp;Frontier: <span id="statFrontier">—</span>
+  &nbsp;Map frames: <span id="statScans">0</span>
+  &nbsp;Cycles: <span id="statCycles">0</span>
+</div>
+
+<!-- room_scan_data.js must be in the same directory as this file -->
+<script src="room_scan_data.js"></script>
+<script src="room_map_data.js"></script>
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// Scan data is optional — dashboard works in live binary-frame mode without it
+// ─────────────────────────────────────────────────────────────────────────────
+const hasScanData = typeof SCAN_META !== 'undefined' && typeof ROOM_MAP_META !== 'undefined';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Map geometry — scan-playback fields initialised only when data is available
+// ─────────────────────────────────────────────────────────────────────────────
+let originX, originY, pxPerMeter, maxRange, nBeams, beamStartRad, beamStepRad;
+let espStartX_m = 0, espStartY_m = 0;
+const ESP_ORIGIN_MM = 5000.0;
+let W = 200, H = 200;
+
+if (hasScanData) {
+  ({ originX, originY, pxPerMeter,
+     width: W, height: H,
+     maxRange, nBeams, beamStartRad, beamStepRad } = SCAN_META);
+  espStartX_m = SCAN_POSES[0][0];
+  espStartY_m = SCAN_POSES[0][1];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live binary-grid state (set when ESP32 sends binary map frames)
+// ─────────────────────────────────────────────────────────────────────────────
+let liveGrid = null;   // { gw, gh, cellMm }
+
+// Unified coordinate helper — returns [col, row] in native canvas pixels (pre-zoom)
+function espMmToCanvasPx(ex_mm, ey_mm) {
+  if (liveGrid) {
+    const col = ex_mm / liveGrid.cellMm;
+    const row = liveGrid.gh - 1 - ey_mm / liveGrid.cellMm;  // Y-flip
+    return [col, row];
+  }
+  if (hasScanData) {
+    const wx = espStartX_m + (ex_mm - ESP_ORIGIN_MM) / 1000.0;
+    const wy = espStartY_m + (ey_mm - ESP_ORIGIN_MM) / 1000.0;
+    return [
+      Math.floor((wx - originX) * pxPerMeter),
+      H - 1 - Math.floor((wy - originY) * pxPerMeter)
+    ];
+  }
+  const cellMm = 50.0;
+  return [ex_mm / cellMm, H - 1 - ey_mm / cellMm];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Canvas setup
+// ─────────────────────────────────────────────────────────────────────────────
+let zoom = 2;
+const baseCanvas = document.getElementById('canvasBase');
+const overCanvas = document.getElementById('canvasOver');
+const bCtx = baseCanvas.getContext('2d');
+const oCtx = overCanvas.getContext('2d');
+
+const offCanvas = document.createElement('canvas');
+const offCtx    = offCanvas.getContext('2d');
+let imgData;
+
+function initCanvasSize(w, h) {
+  W = w; H = h;
+  offCanvas.width  = w;
+  offCanvas.height = h;
+  imgData = offCtx.createImageData(w, h);
+  // Start fully orange (unknown)
+  for (let i = 0; i < w * h; i++) {
+    imgData.data[i*4+0] = 255;
+    imgData.data[i*4+1] = 140;
+    imgData.data[i*4+2] = 0;
+    imgData.data[i*4+3] = 255;
+  }
+  offCtx.putImageData(imgData, 0, 0);
+  setZoom(zoom);
+}
+
+function setZoom(z) {
+  zoom = z;
+  document.getElementById('zoomLabel').textContent = z + '×';
+  baseCanvas.width  = W * z;
+  baseCanvas.height = H * z;
+  overCanvas.width  = W * z;
+  overCanvas.height = H * z;
+  document.getElementById('mapWrap').style.width  = (W * z) + 'px';
+  document.getElementById('mapWrap').style.height = (H * z) + 'px';
+  redraw();
+}
+
+function redraw() {
+  bCtx.imageSmoothingEnabled = false;
+  bCtx.drawImage(offCanvas, 0, 0, W * zoom, H * zoom);
+  drawOverlay();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Binary frame handler — decodes ESP32 occupancy grid and paints imgData
+//
+// Frame layout (little-endian):
+//   [0..1]  uint16 gw, [2..3] uint16 gh, [4..7] float32 cellMm
+//   [8..]   uint8  cells[gw*gh]  — iy=0 is y_min (bottom of world)
+//
+// Cell value → colour:
+//   ≤ 50   : free / traversed  → white  #ffffff
+//   51-178 : unknown           → orange #ff8c00
+//   > 178  : wall / occupied   → black  #000000
+// ─────────────────────────────────────────────────────────────────────────────
+function applyBinaryFrame(buffer) {
+  const view   = new DataView(buffer);
+  const gw     = view.getUint16(0, true);
+  const gh     = view.getUint16(2, true);
+  const cellMm = view.getFloat32(4, true);
+  if (gw === 0 || gh === 0 || cellMm <= 0) return;
+
+  if (!liveGrid || liveGrid.gw !== gw || liveGrid.gh !== gh) {
+    liveGrid = { gw, gh, cellMm };
+    initCanvasSize(gw, gh);   // resets imgData to all-orange, updates zoom
+  }
+
+  const cells = new Uint8Array(buffer, 8);
+  for (let iy = 0; iy < gh; iy++) {
+    const py = gh - 1 - iy;    // Y-flip: iy=0 (y_min) → canvas bottom row
+    for (let ix = 0; ix < gw; ix++) {
+      const val = cells[iy * gw + ix];
+      const idx = (py * gw + ix) * 4;
+      if (val <= 50) {
+        imgData.data[idx] = 255; imgData.data[idx+1] = 255; imgData.data[idx+2] = 255;
+      } else if (val <= 178) {
+        imgData.data[idx] = 255; imgData.data[idx+1] = 140; imgData.data[idx+2] = 0;
+      } else {
+        imgData.data[idx] = 0;   imgData.data[idx+1] = 0;   imgData.data[idx+2] = 0;
+      }
+      imgData.data[idx+3] = 255;
+    }
+  }
+  offCtx.putImageData(imgData, 0, 0);
+  redraw();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bresenham scan-playback — used only when scan data is present and no liveGrid
+// ─────────────────────────────────────────────────────────────────────────────
+function setPixel(x, y, r, g, b) {
+  if (x < 0 || x >= W || y < 0 || y >= H) return;
+  const idx = (y * W + x) * 4;
+  imgData.data[idx]   = r;
+  imgData.data[idx+1] = g;
+  imgData.data[idx+2] = b;
+  imgData.data[idx+3] = 255;
+}
+
+function bresenham(x0, y0, x1, y1, cb) {
+  let dx = Math.abs(x1-x0), sx = x0 < x1 ? 1 : -1;
+  let dy = -Math.abs(y1-y0), sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy;
+  while (true) {
+    cb(x0, y0);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+let lastScanIdx = -1;
+
+function processScan(idx) {
+  const [px, py_w, pth] = SCAN_POSES[idx];
+  const ox = Math.floor((px - originX) * pxPerMeter);
+  const oy = H - 1 - Math.floor((py_w - originY) * pxPerMeter);
+  const ranges = SCAN_RANGES[idx];
+  for (let b = 0; b < nBeams; b++) {
+    const r     = ranges[b];
+    const angle = pth + beamStartRad + b * beamStepRad;
+    const rClip = r >= maxRange ? maxRange : r;
+    const ex    = px + rClip * Math.cos(angle);
+    const ey_w  = py_w + rClip * Math.sin(angle);
+    const epx   = Math.floor((ex - originX) * pxPerMeter);
+    const epy   = H - 1 - Math.floor((ey_w - originY) * pxPerMeter);
+    bresenham(ox, oy, epx, epy, (x, y) => setPixel(x, y, 255, 255, 255));
+    if (r < maxRange) setPixel(epx, epy, 0, 0, 0);  // wall → black
+  }
+}
+
+function advanceToScan(targetIdx) {
+  if (!hasScanData || liveGrid) return;
+  if (targetIdx < 0 || targetIdx >= SCAN_POSES.length) return;
+  for (let i = lastScanIdx + 1; i <= targetIdx; i++) processScan(i);
+  if (targetIdx > lastScanIdx) {
+    lastScanIdx = targetIdx;
+    document.getElementById('statScans').textContent = lastScanIdx + 1;
+  }
+  offCtx.putImageData(imgData, 0, 0);
+}
+
+function nearestScanIdx(wx, wy) {
+  let best = 0, bestD = Infinity;
+  for (let i = 0; i < SCAN_POSES.length; i++) {
+    const dx = SCAN_POSES[i][0] - wx;
+    const dy = SCAN_POSES[i][1] - wy;
+    const d = dx*dx + dy*dy;
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Overlay: car (slam_toolbox style), frontier target, cyan trail
+// ─────────────────────────────────────────────────────────────────────────────
+let carState   = null;   // { cx, cy, theta } — native-pixel coords (pre-zoom)
+let frontierSt = null;   // { cx, cy, carCx, carCy }
+const trail    = [];     // [[cx, cy], ...]
+
+function drawCar(cx_px, cy_px, theta_rad) {
+  const px = cx_px * zoom + zoom / 2;
+  const py = cy_px * zoom + zoom / 2;
+
+  // Dimensions scale with zoom (RViz-style top-down robot: ~400 mm long, ~300 mm wide)
+  const bL  = Math.max(12, zoom * 4.5);  // body length (front→rear)
+  const bW  = Math.max(8,  zoom * 3.0);  // body width
+  const wL  = Math.max(3,  zoom * 1.2);  // wheel length
+  const wW  = Math.max(2,  zoom * 0.7);  // wheel width
+  const wOX = bL * 0.30;                 // wheel x offset from centre (front/rear)
+  const wOY = bW / 2 + wW / 2;          // wheel y offset from centre (left/right)
+
+  oCtx.save();
+  oCtx.translate(px, py);
+  // Canvas Y is down; world Y is up → negate theta to rotate correctly
+  oCtx.rotate(-theta_rad);
+
+  // ── 4 dark-grey wheels (drawn behind body) ─────────────────────────────
+  oCtx.fillStyle = '#2a2a2a';
+  [[ wOX, -wOY], [ wOX,  wOY],   // front-left, front-right
+   [-wOX, -wOY], [-wOX,  wOY]]   // rear-left,  rear-right
+    .forEach(([ox, oy]) => {
+      oCtx.beginPath();
+      oCtx.rect(ox - wL/2, oy - wW/2, wL, wW);
+      oCtx.fill();
+    });
+
+  // ── Grey body ───────────────────────────────────────────────────────────
+  oCtx.fillStyle   = '#808080';
+  oCtx.strokeStyle = '#c0c0c0';
+  oCtx.lineWidth   = 1;
+  oCtx.beginPath();
+  oCtx.rect(-bL/2, -bW/2, bL, bW);
+  oCtx.fill();
+  oCtx.stroke();
+
+  // ── Yellow front stripe (direction indicator) ───────────────────────────
+  oCtx.fillStyle = '#f0c000';
+  oCtx.beginPath();
+  oCtx.rect(bL/2 - bL*0.22, -bW/2, bL*0.22, bW);
+  oCtx.fill();
+
+  oCtx.restore();
+}
+
+function drawOverlay() {
+  oCtx.clearRect(0, 0, overCanvas.width, overCanvas.height);
+
+  // Cyan trail
+  oCtx.fillStyle = '#00d4ff';
+  for (const [cx, cy] of trail) {
+    oCtx.fillRect(cx * zoom, cy * zoom, zoom, zoom);
+  }
+
+  // Frontier: dashed line + orange dot + "F"
+  if (frontierSt) {
+    const { cx, cy, carCx, carCy } = frontierSt;
+    if (carCx !== undefined) {
+      oCtx.save();
+      oCtx.setLineDash([4, 4]);
+      oCtx.strokeStyle = 'rgba(255,140,0,0.7)';
+      oCtx.lineWidth   = 1.5;
+      oCtx.beginPath();
+      oCtx.moveTo(carCx * zoom + zoom/2, carCy * zoom + zoom/2);
+      oCtx.lineTo(cx   * zoom + zoom/2, cy    * zoom + zoom/2);
+      oCtx.stroke();
+      oCtx.restore();
+    }
+    oCtx.beginPath();
+    oCtx.arc(cx * zoom + zoom/2, cy * zoom + zoom/2, 6, 0, Math.PI * 2);
+    oCtx.fillStyle   = '#ff8c00';
+    oCtx.fill();
+    oCtx.strokeStyle = '#ffffff';
+    oCtx.lineWidth   = 1.5;
+    oCtx.stroke();
+    oCtx.fillStyle = '#ffffff';
+    oCtx.font = `bold ${Math.max(9, zoom*4)}px monospace`;
+    oCtx.fillText('F', cx * zoom + zoom/2 + 8, cy * zoom + zoom/2 + 4);
+  }
+
+  // Car (slam_toolbox style)
+  if (carState) drawCar(carState.cx, carState.cy, carState.theta);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WebSocket
+// ─────────────────────────────────────────────────────────────────────────────
+let ws = null, cycleCount = 0, explorationStarted = false;
+let autoReconnect = false, reconnectTimer = null;
+
+function setStatus(msg, dotClass) {
+  document.getElementById('statusText').textContent = msg;
+  document.getElementById('dot').className = 'dot ' + (dotClass || '');
+}
+
+function connect() {
+  const ip = document.getElementById('ipInput').value.trim();
+  if (!ip) { alert('Enter the ESP32 IP address'); return; }
+  autoReconnect = true;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) ws.close();
+
+  ws = new WebSocket('ws://' + ip + '/ws');
+  ws.binaryType = 'arraybuffer';
+  setStatus('Connecting to ws://' + ip + '/ws …', '');
+
+  ws.onopen = () => {
+    setStatus('Connected — waiting for map data.  Click Start when ready.', 'green');
+    document.getElementById('btnConnect').disabled    = true;
+    document.getElementById('btnDisconnect').disabled = false;
+    document.getElementById('btnStart').disabled      = false;
+    document.getElementById('btnStop').disabled       = true;
+  };
+
+  ws.onclose = () => {
+    setStatus('Disconnected', '');
+    document.getElementById('btnConnect').disabled    = false;
+    document.getElementById('btnDisconnect').disabled = true;
+    document.getElementById('btnStart').disabled      = true;
+    document.getElementById('btnStop').disabled       = true;
+    explorationStarted = false;
+    ws = null;
+    if (autoReconnect) {
+      setStatus('Disconnected — reconnecting in 3 s…', 'orange');
+      reconnectTimer = setTimeout(connect, 3000);
+    }
+  };
+
+  ws.onerror = () => setStatus('WebSocket error — check IP and retry', 'orange');
+
+  ws.onmessage = (ev) => {
+    // ── Binary frame = occupancy grid from wifi_dashboard_update() ──────────
+    if (ev.data instanceof ArrayBuffer) {
+      applyBinaryFrame(ev.data);
+      const n = parseInt(document.getElementById('statScans').textContent) || 0;
+      document.getElementById('statScans').textContent = n + 1;
+      return;
+    }
+
+    // ── Text frame = pose + frontier JSON ───────────────────────────────────
+    let data;
+    try { data = JSON.parse(ev.data); } catch(e) { return; }
+
+    cycleCount++;
+    document.getElementById('statCycles').textContent = cycleCount;
+
+    const [col, row] = espMmToCanvasPx(data.x, data.y);
+
+    // Scan-playback map reveal (only when scan data available and no liveGrid)
+    if (hasScanData && !liveGrid) {
+      const wx = espStartX_m + (data.x - ESP_ORIGIN_MM) / 1000.0;
+      const wy = espStartY_m + (data.y - ESP_ORIGIN_MM) / 1000.0;
+      advanceToScan(nearestScanIdx(wx, wy));
+    }
+
+    if (carState) trail.push([carState.cx, carState.cy]);
+    if (trail.length > 2000) trail.shift();
+    carState = { cx: col, cy: row, theta: data.theta };
+
+    if (data.has_frontier) {
+      const [fc, fr] = espMmToCanvasPx(data.fx, data.fy);
+      frontierSt = { cx: fc, cy: fr, carCx: col, carCy: row };
+      document.getElementById('statFrontier').textContent =
+        `(${data.fx.toFixed(0)} mm, ${data.fy.toFixed(0)} mm)`;
+    } else {
+      frontierSt = null;
+      document.getElementById('statFrontier').textContent = 'none';
+    }
+
+    document.getElementById('statPose').textContent =
+      `(${data.x.toFixed(0)} mm, ${data.y.toFixed(0)} mm,  ${(data.theta*180/Math.PI).toFixed(1)}°)`;
+
+    redraw();
+
+    if (explorationStarted) {
+      setStatus(data.has_frontier ? 'Exploring — frontier detected' : 'Exploring — no frontier (nudging fwd)', 'blue');
+    } else {
+      setStatus('Connected — waiting for Start Exploration', 'green');
+    }
+  };
+}
+
+function disconnect() {
+  autoReconnect = false;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) ws.close();
+}
+
+function requestStart() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ cmd: 'start' }));
+  explorationStarted = true;
+  document.getElementById('btnStart').disabled = true;
+  document.getElementById('btnStop').disabled  = false;
+  setStatus('Start sent — car is now exploring!', 'blue');
+}
+
+function requestStop() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ cmd: 'stop' }));
+  explorationStarted = false;
+  document.getElementById('btnStop').disabled  = true;
+  document.getElementById('btnStart').disabled = false;
+  setStatus('STOP sent — car halted. Press Start to resume.', 'orange');
+}
+
+function resetView() {
+  carState = null; frontierSt = null; trail.length = 0;
+  lastScanIdx = -1; cycleCount = 0; explorationStarted = false;
+  liveGrid = null;
+  initCanvasSize(hasScanData ? SCAN_META.width : 200, hasScanData ? SCAN_META.height : 200);
+  document.getElementById('statPose').textContent      = '—';
+  document.getElementById('statFrontier').textContent  = '—';
+  document.getElementById('statScans').textContent     = '0';
+  document.getElementById('statCycles').textContent    = '0';
+  document.getElementById('btnStart').disabled = !ws || ws.readyState !== WebSocket.OPEN;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init
+// ─────────────────────────────────────────────────────────────────────────────
+initCanvasSize(W, H);
+</script>
+</body>
+</html>

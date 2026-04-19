@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SLAMborghini — Live Playback Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0d1117;
+    color: #e0e0e0;
+    font-family: 'Courier New', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 18px;
+    gap: 16px;
+    min-height: 100vh;
+  }
+  h1 { color: #00d4ff; font-size: 1.1rem; letter-spacing: 2px; }
+  h2 { color: #666; font-size: 0.78rem; font-weight: normal; letter-spacing: 1px; }
+
+  .toolbar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    justify-content: center; width: 100%;
+  }
+  input[type=text] {
+    background: #161b22; border: 1px solid #30363d; border-radius: 4px;
+    color: #e0e0e0; padding: 6px 10px; font-family: inherit; font-size: 0.82rem;
+    width: 200px;
+  }
+  button {
+    background: #0f3460; color: #e0e0e0; border: 1px solid #00d4ff44;
+    border-radius: 4px; padding: 7px 14px; cursor: pointer;
+    font-family: inherit; font-size: 0.82rem; transition: background 0.15s;
+  }
+  button:hover  { background: #1a5276; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button.danger { border-color: #e76f5144; }
+  button.danger:hover { background: #5a2020; }
+
+  .status-dot {
+    width: 10px; height: 10px; border-radius: 50%; background: #333;
+    display: inline-block; vertical-align: middle; margin-right: 4px;
+  }
+  .status-dot.connected    { background: #52b788; }
+  .status-dot.connecting   { background: #f4a261; animation: pulse 1s infinite; }
+  .status-dot.disconnected { background: #e76f51; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+  #statusLabel { font-size: 0.78rem; color: #888; }
+
+  .main-area {
+    display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  #mapCanvas {
+    border: 1px solid #21262d;
+    image-rendering: pixelated;
+    cursor: crosshair;
+    max-width: 100%;
+  }
+
+  .side-panel {
+    background: #161b22; border: 1px solid #21262d; border-radius: 6px;
+    padding: 14px; width: 250px; display: flex; flex-direction: column;
+    gap: 14px; flex-shrink: 0;
+  }
+  .side-panel h3 {
+    color: #00d4ff; font-size: 0.82rem;
+    border-bottom: 1px solid #21262d; padding-bottom: 6px;
+  }
+
+  .telemetry { font-size: 0.75rem; line-height: 2.0; color: #888; }
+  .telemetry .val { color: #00d4ff; font-weight: bold; }
+  .telemetry .wp  { color: #f4a261; font-weight: bold; }
+
+  .legend-row { display: flex; align-items: center; gap: 8px; font-size: 0.75rem; }
+  .swatch { width: 14px; height: 14px; border: 1px solid #444; flex-shrink: 0; border-radius: 2px; }
+
+  .progress-bar { background: #21262d; border-radius: 4px; height: 6px; overflow: hidden; }
+  .progress-fill { background: #00d4ff; height: 100%; width: 0%; }
+
+  .stats { font-size: 0.74rem; line-height: 2.0; color: #888; }
+  .stats .val { color: #00d4ff; font-weight: bold; }
+
+  .log-box {
+    background: #0d1117; border: 1px solid #21262d; border-radius: 4px;
+    padding: 8px; font-size: 0.7rem; line-height: 1.7; max-height: 160px;
+    overflow-y: auto; color: #7ec8e3;
+  }
+  .log-box .warn { color: #f4a261; }
+  .log-box .err  { color: #e76f51; }
+  .log-box .ok   { color: #52b788; }
+
+  .slider-row { display: flex; align-items: center; gap: 8px; font-size: 0.74rem; }
+  input[type=range] { flex: 1; accent-color: #00d4ff; }
+</style>
+</head>
+<body>
+
+<h1>SLAMBORGHINI 2026 — Live Playback Dashboard</h1>
+<h2>room.log trajectory · real motor commands · live map sync · WebSocket</h2>
+
+<!-- ── Connection toolbar ─────────────────────────────────────────────────── -->
+<div class="toolbar">
+  <label style="font-size:0.78rem;color:#888">ESP32 IP:</label>
+  <input type="text" id="ipInput" value="192.168.1.100" placeholder="192.168.x.x">
+  <button id="btnConnect">Connect</button>
+  <button id="btnDisconnect" class="danger" disabled>Disconnect</button>
+  <button id="btnReset" title="Clear map and restart replay">↺ Reset map</button>
+  <span>
+    <span class="status-dot disconnected" id="dot"></span>
+    <span id="statusLabel">Disconnected</span>
+  </span>
+</div>
+
+<!-- ── Main area ─────────────────────────────────────────────────────────── -->
+<div class="main-area">
+  <canvas id="mapCanvas"></canvas>
+
+  <div class="side-panel">
+
+    <h3>Car Telemetry</h3>
+    <div class="telemetry">
+      Car X:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="val" id="tX">—</span>&nbsp;mm<br>
+      Car Y:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="val" id="tY">—</span>&nbsp;mm<br>
+      Heading:&nbsp;&nbsp;<span class="val" id="tTheta">—</span>&nbsp;°<br>
+      Waypoint X:&nbsp;<span class="wp"  id="tFX">—</span>&nbsp;mm<br>
+      Waypoint Y:&nbsp;<span class="wp"  id="tFY">—</span>&nbsp;mm<br>
+      Frames rx:&nbsp;&nbsp;<span class="val" id="tFrames">0</span>
+    </div>
+
+    <h3>Map Progress</h3>
+    <div style="font-size:0.73rem;color:#666">
+      Scan&nbsp;<span id="scanNum" style="color:#00d4ff">0</span>
+      &nbsp;/&nbsp;<span id="scanTotal">—</span>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="stats">
+      Free cells:&nbsp;&nbsp;<span class="val" id="sFree">0</span><br>
+      Wall cells:&nbsp;&nbsp;<span class="val" id="sWall">0</span><br>
+      Explored:&nbsp;&nbsp;&nbsp;<span class="val" id="sPct">0.0</span>%
+    </div>
+
+    <h3>Legend</h3>
+    <div style="display:flex;flex-direction:column;gap:5px">
+      <div class="legend-row"><div class="swatch" style="background:#ff8c00;border-color:#e07800"></div>Unknown</div>
+      <div class="legend-row"><div class="swatch" style="background:#ffffff;border-color:#aaa"></div>Free (scanned)</div>
+      <div class="legend-row"><div class="swatch" style="background:#000000;border-color:#555"></div>Wall (obstacle)</div>
+      <div class="legend-row"><div class="swatch" style="background:#00b4dc;border-color:#0090b0"></div>Robot path (cyan)</div>
+      <div class="legend-row">
+        <div style="width:14px;height:14px;border-radius:50%;background:#4361ee;
+                    border:1px solid #2a3db5;flex-shrink:0"></div>
+        Current position
+      </div>
+      <div class="legend-row"><div class="swatch" style="background:#f4a261;border-radius:50%"></div>Next waypoint</div>
+    </div>
+
+    <h3>View</h3>
+    <div class="slider-row">
+      Zoom:
+      <input type="range" id="zoomSlider" min="1" max="6" value="2">
+      <span id="zoomVal">2</span>px/cell
+    </div>
+
+    <h3>Log</h3>
+    <div class="log-box" id="logBox"></div>
+    <button id="btnClearLog" style="font-size:0.73rem;padding:4px 8px">Clear log</button>
+  </div>
+</div>
+
+<!-- Scan data generated by generate_lidar_map.py -->
+<script src="room_scan_data.js"></script>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+ * Guard: room_scan_data.js must be present
+ * ════════════════════════════════════════════════════════════════════════════ */
+if (typeof SCAN_META === 'undefined') {
+  document.body.innerHTML =
+    '<div style="color:#e76f51;font-family:monospace;padding:40px">' +
+    '<b>room_scan_data.js not found.</b><br><br>' +
+    'Run <code>python3 tools/parse_room/generate_lidar_map.py</code> first, ' +
+    'then open this file from the <code>tools/dashboard/</code> directory.</div>';
+  throw new Error('SCAN_META not loaded');
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Constants from scan metadata
+ * ════════════════════════════════════════════════════════════════════════════ */
+const { originX, originY, pxPerMeter,
+        width: W, height: H,
+        maxRange, nBeams, beamStartRad, beamStepRad } = SCAN_META;
+
+const TOTAL = SCAN_POSES.length;
+document.getElementById('scanTotal').textContent = TOTAL;
+
+/* ESP32 dead-reckoning origin = first scan world position in mm */
+const ESP_START_MM = 5000.0;
+const WORLD_X0_M   = SCAN_POSES[0][0];   /* world metres of first scan pose */
+const WORLD_Y0_M   = SCAN_POSES[0][1];
+
+/* Cell states */
+const ST_UNKNOWN = 0;
+const ST_FREE    = 1;
+const ST_WALL    = 2;
+
+/* RGBA colour constants */
+const C_UNKNOWN = [255, 140,   0, 255];
+const C_FREE    = [255, 255, 255, 255];
+const C_WALL    = [  0,   0,   0, 255];
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Map state
+ * ════════════════════════════════════════════════════════════════════════════ */
+const state   = new Uint8Array(W * H);
+const imgData = new ImageData(W, H);
+const d       = imgData.data;
+
+let freeCnt = 0, wallCnt = 0;
+let trail   = [];         /* [[col, row], …] — robot path in pixel space */
+let carState = null;      /* latest WebSocket frame */
+let lastScanIdx = -1;     /* highest scan index processed so far */
+
+function resetMapState() {
+  state.fill(ST_UNKNOWN);
+  freeCnt = 0; wallCnt = 0;
+  trail   = [];
+  carState = null;
+  lastScanIdx = -1;
+  for (let i = 0; i < W * H * 4; i += 4) {
+    d[i]   = C_UNKNOWN[0];
+    d[i+1] = C_UNKNOWN[1];
+    d[i+2] = C_UNKNOWN[2];
+    d[i+3] = 255;
+  }
+}
+resetMapState();
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Canvas setup
+ * ════════════════════════════════════════════════════════════════════════════ */
+const canvas    = document.getElementById('mapCanvas');
+const ctx       = canvas.getContext('2d');
+const offscreen = document.createElement('canvas');
+offscreen.width  = W;
+offscreen.height = H;
+const offCtx = offscreen.getContext('2d');
+
+let PX = parseInt(document.getElementById('zoomSlider').value);
+
+function resizeCanvas() {
+  canvas.width  = W * PX;
+  canvas.height = H * PX;
+}
+resizeCanvas();
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Coordinate helpers
+ *
+ * ESP32 broadcasts x, y in mm starting at (ESP_START_MM, ESP_START_MM).
+ * Mapping: worldX_m = WORLD_X0_M + (espX - ESP_START_MM) / 1000
+ *
+ * Pixel mapping mirrors generate_lidar_map.py  to_px():
+ *   col = floor((worldX_m - originX) * pxPerMeter)
+ *   row = H - 1 - floor((worldY_m - originY) * pxPerMeter)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function espMmToWorld(espX, espY) {
+  return [
+    WORLD_X0_M + (espX - ESP_START_MM) / 1000.0,
+    WORLD_Y0_M + (espY - ESP_START_MM) / 1000.0,
+  ];
+}
+
+function worldToPx(wx, wy) {
+  const col = Math.floor((wx - originX) * pxPerMeter);
+  const row = H - 1 - Math.floor((wy - originY) * pxPerMeter);
+  return [col, row];
+}
+
+function espToPx(espX, espY) {
+  const [wx, wy] = espMmToWorld(espX, espY);
+  return worldToPx(wx, wy);
+}
+
+function inBounds(c, r) {
+  return c >= 0 && c < W && r >= 0 && r < H;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Pixel write (into ImageData only)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function setPixel(c, r, col) {
+  if (!inBounds(c, r)) return;
+  const i = (r * W + c) * 4;
+  d[i]   = col[0];
+  d[i+1] = col[1];
+  d[i+2] = col[2];
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Bresenham line
+ * ════════════════════════════════════════════════════════════════════════════ */
+function bresenham(x0, y0, x1, y1, cb) {
+  let dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+  let sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  for (;;) {
+    cb(x0, y0);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = err << 1;
+    if (e2 > -dy) { err -= dy; x0 += sx; }
+    if (e2 <  dx) { err += dx; y0 += sy; }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * processScan — ray-trace one FLASER scan into the occupancy ImageData
+ *
+ * Uses SCAN_POSES[idx] (world metres) directly so the scan coordinate frame
+ * is identical to what the Python renderer used — no extra offset needed.
+ * ════════════════════════════════════════════════════════════════════════════ */
+function processScan(idx) {
+  if (idx < 0 || idx >= TOTAL) return;
+  const [rx, ry, th] = SCAN_POSES[idx];
+  const ranges = SCAN_RANGES[idx];
+
+  const [rc, rr] = worldToPx(rx, ry);
+
+  /* Add to trail using the WORLD coordinates (not ESP32 mm) */
+  if (inBounds(rc, rr)) trail.push([rc, rr]);
+
+  for (let i = 0; i < nBeams; i++) {
+    const range = ranges[i];
+    const angle = th + beamStartRad + i * beamStepRad;
+    const cosA  = Math.cos(angle);
+    const sinA  = Math.sin(angle);
+
+    const effR = Math.min(range, maxRange - 0.05);
+    const [hc, hr] = worldToPx(rx + effR * cosA, ry + effR * sinA);
+
+    /* Bresenham: FREE along beam */
+    bresenham(rc, rr, hc, hr, (c, r) => {
+      if (!inBounds(c, r)) return;
+      const si = r * W + c;
+      if (state[si] === ST_UNKNOWN) {
+        state[si] = ST_FREE;
+        setPixel(c, r, C_FREE);
+        freeCnt++;
+      }
+    });
+
+    /* WALL at hit endpoint */
+    if (range < maxRange) {
+      const [wc, wr] = worldToPx(rx + range * cosA, ry + range * sinA);
+      if (inBounds(wc, wr)) {
+        const si = wr * W + wc;
+        if (state[si] !== ST_WALL) {
+          if (state[si] === ST_FREE) freeCnt--;
+          state[si] = ST_WALL;
+          setPixel(wc, wr, C_WALL);
+          wallCnt++;
+        }
+      }
+    }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * advanceToScan — process all scans from lastScanIdx+1 up to targetIdx
+ * ════════════════════════════════════════════════════════════════════════════ */
+function advanceToScan(targetIdx) {
+  const start = lastScanIdx + 1;
+  const end   = Math.min(targetIdx, TOTAL - 1);
+  for (let i = start; i <= end; i++) processScan(i);
+  if (end >= start) lastScanIdx = end;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Render
+ *
+ * 1. putImageData    — occupancy map (orange / white / black)
+ * 2. fillRect        — cyan robot trail  (drawn on top of putImageData)
+ * 3. arc             — next waypoint target dot (orange)
+ * 4. arc + line      — car position (blue) + heading tick
+ * 5. drawImage       — scale offscreen → display canvas (pixelated)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function render() {
+  /* 1. Map */
+  offCtx.putImageData(imgData, 0, 0);
+
+  /* 2. Trail */
+  offCtx.fillStyle = '#00b4dc';
+  for (const [c, r] of trail) offCtx.fillRect(c, r, 1, 1);
+
+  if (carState) {
+    const [carC, carR] = espToPx(carState.x, carState.y);
+    const radius = Math.max(3, Math.round(W / 100));
+
+    /* 3. Next waypoint dot */
+    if (carState.has_frontier) {
+      const [wpC, wpR] = espToPx(carState.fx, carState.fy);
+      if (inBounds(wpC, wpR)) {
+        offCtx.fillStyle = '#f4a261';
+        offCtx.beginPath();
+        offCtx.arc(wpC, wpR, radius + 1, 0, Math.PI * 2);
+        offCtx.fill();
+
+        /* Dashed arrow to waypoint */
+        offCtx.strokeStyle = '#f4a26188';
+        offCtx.lineWidth   = 1;
+        offCtx.setLineDash([3, 3]);
+        offCtx.beginPath();
+        offCtx.moveTo(carC, carR);
+        offCtx.lineTo(wpC, wpR);
+        offCtx.stroke();
+        offCtx.setLineDash([]);
+      }
+    }
+
+    /* 4. Car position */
+    if (inBounds(carC, carR)) {
+      offCtx.fillStyle = '#4361ee';
+      offCtx.beginPath();
+      offCtx.arc(carC, carR, radius, 0, Math.PI * 2);
+      offCtx.fill();
+
+      /* Heading tick (Y inverted for canvas) */
+      offCtx.strokeStyle = '#ffffff';
+      offCtx.lineWidth   = 1;
+      offCtx.beginPath();
+      offCtx.moveTo(carC, carR);
+      offCtx.lineTo(
+        carC + (radius + 5) * Math.cos(carState.theta),
+        carR - (radius + 5) * Math.sin(carState.theta)
+      );
+      offCtx.stroke();
+    }
+  }
+
+  /* 5. Scale to display */
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(offscreen, 0, 0, W, H, 0, 0, canvas.width, canvas.height);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Stats update
+ * ════════════════════════════════════════════════════════════════════════════ */
+function updateStats() {
+  document.getElementById('sFree').textContent  = freeCnt;
+  document.getElementById('sWall').textContent  = wallCnt;
+  document.getElementById('sPct').textContent   =
+    ((freeCnt + wallCnt) / (W * H) * 100).toFixed(1);
+  const si = Math.max(0, lastScanIdx);
+  document.getElementById('scanNum').textContent = si;
+  document.getElementById('progressFill').style.width =
+    (si / (TOTAL - 1) * 100).toFixed(1) + '%';
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * WebSocket
+ * ════════════════════════════════════════════════════════════════════════════ */
+let ws         = null;
+let frameCount = 0;
+
+function setStatus(state) {
+  const dot   = document.getElementById('dot');
+  const label = document.getElementById('statusLabel');
+  dot.className     = 'status-dot ' + state;
+  label.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+}
+
+function logMsg(text, cls) {
+  const box  = document.getElementById('logBox');
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  line.textContent = `[${ts}] ${text}`;
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+  while (box.children.length > 200) box.removeChild(box.firstChild);
+}
+
+function connectWS() {
+  const ip  = document.getElementById('ipInput').value.trim();
+  const url = `ws://${ip}/ws`;
+  logMsg(`Connecting to ${url} …`, 'warn');
+  setStatus('connecting');
+
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    setStatus('connected');
+    logMsg(`Connected to ${ip}`, 'ok');
+    document.getElementById('btnConnect').disabled    = true;
+    document.getElementById('btnDisconnect').disabled = false;
+  };
+
+  ws.onclose = () => {
+    setStatus('disconnected');
+    logMsg('WebSocket closed', 'err');
+    document.getElementById('btnConnect').disabled    = false;
+    document.getElementById('btnDisconnect').disabled = true;
+    ws = null;
+  };
+
+  ws.onerror = () => { logMsg('WebSocket error', 'err'); };
+
+  ws.onmessage = (evt) => {
+    /* Only handle JSON text frames (pose + scan_idx) */
+    if (typeof evt.data !== 'string') return;
+
+    let data;
+    try { data = JSON.parse(evt.data); }
+    catch (e) { logMsg(`Bad JSON: ${evt.data}`, 'err'); return; }
+
+    carState = data;
+    frameCount++;
+
+    /* ── Advance map to the scan index broadcast by the ESP32 ────────────── */
+    const si = typeof data.si === 'number' ? data.si : 0;
+    if (si > lastScanIdx) {
+      advanceToScan(si);
+    }
+
+    /* ── Update telemetry panel ──────────────────────────────────────────── */
+    document.getElementById('tX').textContent     = data.x.toFixed(0);
+    document.getElementById('tY').textContent     = data.y.toFixed(0);
+    document.getElementById('tTheta').textContent = (data.theta * 180 / Math.PI).toFixed(1);
+    document.getElementById('tFrames').textContent = frameCount;
+
+    if (data.has_frontier) {
+      document.getElementById('tFX').textContent = data.fx.toFixed(0);
+      document.getElementById('tFY').textContent = data.fy.toFixed(0);
+    } else {
+      document.getElementById('tFX').textContent = '—';
+      document.getElementById('tFY').textContent = '—';
+    }
+
+    const wpStr = `scan ${si}/${TOTAL - 1}  ` +
+      `pos (${data.x.toFixed(0)}, ${data.y.toFixed(0)}) mm`;
+    if (data.has_frontier) {
+      logMsg(`→ Waypoint reached · ${wpStr}`);
+    }
+
+    render();
+    updateStats();
+  };
+}
+
+function disconnectWS() {
+  if (ws) ws.close();
+}
+
+document.getElementById('btnConnect').addEventListener('click', connectWS);
+document.getElementById('btnDisconnect').addEventListener('click', disconnectWS);
+
+document.getElementById('btnReset').addEventListener('click', () => {
+  resetMapState();
+  render();
+  updateStats();
+  logMsg('Map reset — waiting for new frames …', 'warn');
+});
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Zoom
+ * ════════════════════════════════════════════════════════════════════════════ */
+document.getElementById('zoomSlider').addEventListener('input', function () {
+  PX = parseInt(this.value);
+  document.getElementById('zoomVal').textContent = PX;
+  resizeCanvas();
+  render();
+});
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Init
+ * ════════════════════════════════════════════════════════════════════════════ */
+resizeCanvas();
+render();
+updateStats();
+logMsg(`Scan data loaded: ${TOTAL} scans  (${W}×${H} px grid)`, 'ok');
+logMsg('Enter ESP32 IP and click Connect to start the live replay.');
+</script>
+</body>
+</html>

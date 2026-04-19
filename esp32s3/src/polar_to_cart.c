@@ -6,19 +6,21 @@
  */
 
 #include "polar_to_cart.h"
+#include <math.h>
 
 void polar_to_cart_convert(const lidar_scan_t *scan, point2f_t *out_pts, uint16_t *out_count)
 {
-    // TODO: implement
-    // For each point in scan->points[i]:
-    //   float rad = scan->points[i].theta_deg * (M_PI / 180.0f);
-    //   out_pts[i].x = scan->points[i].r_mm * cosf(rad);
-    //   out_pts[i].y = scan->points[i].r_mm * sinf(rad);
-    //   out_pts[i].intensity = scan->points[i].intensity;
-    // Set *out_count = scan->count;
-    (void)scan;
-    (void)out_pts;
-    if (out_count) {
-        *out_count = 0;
+    if (!scan || !out_pts || !out_count) return;
+
+    uint16_t n = 0;
+    for (uint16_t i = 0; i < scan->count; i++) {
+        float r = scan->points[i].r_mm;
+        if (r <= 0.0f) continue;
+        float rad = scan->points[i].theta_deg * (3.14159265f / 180.0f);
+        out_pts[n].x         = r * cosf(rad);
+        out_pts[n].y         = r * sinf(rad);
+        out_pts[n].intensity = scan->points[i].intensity;
+        n++;
     }
+    *out_count = n;
 }

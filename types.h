@@ -89,7 +89,11 @@ typedef enum {
     CLASS_WALL     = 1,
     CLASS_OBSTACLE = 2,
     CLASS_GLASS    = 3,
-    CLASS_PERSON   = 4
+    CLASS_PERSON   = 4,
+    CLASS_FREE     = 5  /**< Explicitly free (traversed) space — used by
+                         *   build_test_room() when pre-seeding free cells.
+                         *   quadtree_map_insert(CLASS_FREE) must set leaf
+                         *   occupancy to ~20 (OCC_FREE ≤ 50). */
 } semantic_class_t;
 
 /** A Cartesian point annotated with a semantic class. */

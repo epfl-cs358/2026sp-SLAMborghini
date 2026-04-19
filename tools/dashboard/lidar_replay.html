@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SLAMborghini — LiDAR Replay Visualizer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0d1117;
+    color: #e0e0e0;
+    font-family: 'Courier New', monospace;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 18px;
+    gap: 16px;
+    min-height: 100vh;
+  }
+  h1 { color: #00d4ff; font-size: 1.1rem; letter-spacing: 2px; }
+  h2 { color: #666; font-size: 0.78rem; font-weight: normal; letter-spacing: 1px; }
+
+  .main-area {
+    display: flex; gap: 16px; align-items: flex-start;
+    flex-wrap: wrap; justify-content: center;
+  }
+
+  #mapCanvas {
+    border: 1px solid #21262d;
+    image-rendering: pixelated;
+    cursor: crosshair;
+  }
+
+  .side-panel {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 14px;
+    width: 240px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    flex-shrink: 0;
+  }
+  .side-panel h3 {
+    color: #00d4ff;
+    font-size: 0.82rem;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 6px;
+  }
+
+  button {
+    background: #0f3460;
+    color: #e0e0e0;
+    border: 1px solid #00d4ff44;
+    border-radius: 4px;
+    padding: 7px 12px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.82rem;
+    transition: background 0.15s;
+    flex: 1;
+  }
+  button:hover { background: #1a5276; }
+  button:disabled { opacity: 0.4; cursor: default; }
+
+  .ctrl-row { display: flex; gap: 6px; }
+
+  .legend-row { display: flex; align-items: center; gap: 8px; font-size: 0.75rem; }
+  .swatch {
+    width: 14px; height: 14px;
+    border: 1px solid #444;
+    flex-shrink: 0; border-radius: 2px;
+  }
+
+  .stats { font-size: 0.74rem; line-height: 2.0; color: #888; }
+  .stats .val { color: #00d4ff; font-weight: bold; }
+
+  .progress-bar {
+    background: #21262d;
+    border-radius: 4px;
+    height: 6px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    background: #00d4ff;
+    height: 100%;
+    width: 0%;
+  }
+
+  .slider-row { display: flex; align-items: center; gap: 8px; font-size: 0.74rem; }
+  input[type=range] { flex: 1; accent-color: #00d4ff; }
+</style>
+</head>
+<body>
+
+<h1>SLAMBORGHINI 2026 — LiDAR Replay Visualizer</h1>
+<h2>room.log scan-by-scan occupancy map simulation</h2>
+
+<div class="main-area">
+  <canvas id="mapCanvas"></canvas>
+
+  <div class="side-panel">
+
+    <!-- Playback controls -->
+    <h3>Playback</h3>
+    <div class="ctrl-row">
+      <button id="btnPlay">▶ Play</button>
+      <button id="btnStep">⏭ Step</button>
+    </div>
+    <div class="ctrl-row">
+      <button id="btnReset">↺ Reset</button>
+      <button id="btnEnd" title="Jump to end">⏭⏭ End</button>
+    </div>
+    <div class="slider-row">
+      Speed:
+      <input type="range" id="speedSlider" min="1" max="20" value="3">
+      <span id="speedVal">3</span>×
+    </div>
+    <div style="font-size:0.73rem;color:#666">
+      Scan&nbsp;<span id="scanNum" style="color:#00d4ff">0</span>
+      &nbsp;/&nbsp;<span id="scanTotal">?</span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+
+    <!-- Legend -->
+    <h3>Legend</h3>
+    <div style="display:flex;flex-direction:column;gap:5px">
+      <div class="legend-row">
+        <div class="swatch" style="background:#ff8c00;border-color:#e07800"></div>
+        Unknown
+      </div>
+      <div class="legend-row">
+        <div class="swatch" style="background:#ffffff;border-color:#aaa"></div>
+        Free (scanned)
+      </div>
+      <div class="legend-row">
+        <div class="swatch" style="background:#000000;border-color:#555"></div>
+        Wall (obstacle)
+      </div>
+      <div class="legend-row">
+        <div class="swatch" style="background:#00b4dc;border-color:#0090b0"></div>
+        Robot path (cyan)
+      </div>
+      <div class="legend-row">
+        <div style="width:14px;height:14px;border-radius:50%;
+                    background:#4361ee;border:1px solid #2a3db5;flex-shrink:0"></div>
+        Current position
+      </div>
+    </div>
+
+    <!-- Stats -->
+    <h3>Stats</h3>
+    <div class="stats">
+      Free cells:&nbsp;&nbsp;<span class="val" id="sFree">0</span><br>
+      Wall cells:&nbsp;&nbsp;<span class="val" id="sWall">0</span><br>
+      Explored:&nbsp;&nbsp;&nbsp;<span class="val" id="sPct">0.0</span>%<br>
+      Robot X:&nbsp;&nbsp;&nbsp;&nbsp;<span class="val" id="sX">—</span>&nbsp;m<br>
+      Robot Y:&nbsp;&nbsp;&nbsp;&nbsp;<span class="val" id="sY">—</span>&nbsp;m<br>
+      Heading:&nbsp;&nbsp;&nbsp;&nbsp;<span class="val" id="sTh">—</span>&nbsp;°
+    </div>
+
+    <!-- Zoom -->
+    <h3>View</h3>
+    <div class="slider-row">
+      Zoom:
+      <input type="range" id="zoomSlider" min="1" max="6" value="2">
+      <span id="zoomVal">2</span>px/cell
+    </div>
+
+  </div>
+</div>
+
+<!-- Scan data generated by generate_lidar_map.py -->
+<script src="room_scan_data.js"></script>
+
+<script>
+/* ════════════════════════════════════════════════════════════════════════════
+ * Guard: ensure room_scan_data.js was loaded
+ * ════════════════════════════════════════════════════════════════════════════ */
+if (typeof SCAN_META === 'undefined') {
+  document.body.innerHTML =
+    '<div style="color:#e76f51;font-family:monospace;padding:40px">' +
+    '<b>room_scan_data.js not found.</b><br><br>' +
+    'Run <code>python3 tools/parse_room/generate_lidar_map.py</code> first,<br>' +
+    'then open this file from the <code>tools/dashboard/</code> directory.</div>';
+  throw new Error('SCAN_META not loaded');
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Constants from scan metadata
+ * ════════════════════════════════════════════════════════════════════════════ */
+const { originX, originY, pxPerMeter,
+        width: W, height: H,
+        maxRange, nBeams, beamStartRad, beamStepRad } = SCAN_META;
+
+const TOTAL = SCAN_POSES.length;
+document.getElementById('scanTotal').textContent = TOTAL;
+
+/* Cell states (for occupancy logic — separate from display) */
+const ST_UNKNOWN = 0;
+const ST_FREE    = 1;
+const ST_WALL    = 2;
+
+/* RGBA colours */
+const C_UNKNOWN = [255, 140,   0, 255];   // orange
+const C_FREE    = [255, 255, 255, 255];   // white
+const C_WALL    = [  0,   0,   0, 255];   // black
+const C_TRAIL   = [  0, 180, 220, 255];   // cyan  (robot path)
+const C_ROBOT   = [ 67,  97, 238, 255];   // blue  (current position)
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Map state
+ * ════════════════════════════════════════════════════════════════════════════ */
+const state   = new Uint8Array(W * H);        // occupancy state
+const imgData = new ImageData(W, H);          // pixel buffer (RGB painted here)
+const d       = imgData.data;                 // alias for the Uint8ClampedArray
+
+let freeCnt = 0, wallCnt = 0;
+let trail   = [];     // [[col, row], …] — robot trajectory in pixel space
+let curPose = null;   // {x, y, th, c, r}
+let scanIdx = 0;
+
+/* Initialise every pixel to orange (unknown) */
+for (let i = 0; i < W * H * 4; i += 4) {
+  d[i]   = C_UNKNOWN[0];
+  d[i+1] = C_UNKNOWN[1];
+  d[i+2] = C_UNKNOWN[2];
+  d[i+3] = 255;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Canvas setup (offscreen + display)
+ * ════════════════════════════════════════════════════════════════════════════ */
+const canvas    = document.getElementById('mapCanvas');
+const ctx       = canvas.getContext('2d');
+const offscreen = document.createElement('canvas');
+offscreen.width  = W;
+offscreen.height = H;
+const offCtx = offscreen.getContext('2d');
+
+let PX = parseInt(document.getElementById('zoomSlider').value);
+
+function resizeCanvas() {
+  canvas.width  = W * PX;
+  canvas.height = H * PX;
+}
+resizeCanvas();
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Coordinate helpers
+ * Mirrors generate_lidar_map.py: to_px(x_m, y_m, ox, oy, H)
+ *   col = floor((wx - originX) * pxPerMeter)
+ *   row = H - 1 - floor((wy - originY) * pxPerMeter)   ← Y-flip (world↑, canvas↓)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function worldToPx(wx, wy) {
+  const col = Math.floor((wx - originX) * pxPerMeter);
+  const row = H - 1 - Math.floor((wy - originY) * pxPerMeter);
+  return [col, row];
+}
+
+function inBounds(c, r) {
+  return c >= 0 && c < W && r >= 0 && r < H;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Pixel write — updates imgData only (does NOT draw to canvas)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function setPixel(c, r, col) {
+  if (!inBounds(c, r)) return;
+  const i = (r * W + c) * 4;
+  d[i]   = col[0];
+  d[i+1] = col[1];
+  d[i+2] = col[2];
+  // alpha already 255
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Bresenham line — calls cb(col, row) for every pixel on the segment
+ * ════════════════════════════════════════════════════════════════════════════ */
+function bresenham(x0, y0, x1, y1, cb) {
+  let dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+  let sx = x0 < x1 ? 1 : -1,   sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  for (;;) {
+    cb(x0, y0);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = err << 1;
+    if (e2 > -dy) { err -= dy; x0 += sx; }
+    if (e2 <  dx) { err += dx; y0 += sy; }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Process one FLASER scan
+ *
+ * For each beam:
+ *   • Bresenham from robot → hit point:  mark cells FREE (white)
+ *                                        (skip cells already WALL)
+ *   • If range < maxRange:               mark hit cell WALL (black)
+ *
+ * Robot position added to trail (cyan, drawn as separate layer).
+ * ════════════════════════════════════════════════════════════════════════════ */
+function processScan(idx) {
+  const [rx, ry, th] = SCAN_POSES[idx];
+  const ranges = SCAN_RANGES[idx];
+
+  const [rc, rr] = worldToPx(rx, ry);
+  if (inBounds(rc, rr)) trail.push([rc, rr]);
+  curPose = { x: rx, y: ry, th, c: rc, r: rr };
+
+  for (let i = 0; i < nBeams; i++) {
+    const range  = ranges[i];
+    const angle  = th + beamStartRad + i * beamStepRad;
+    const cosA   = Math.cos(angle);
+    const sinA   = Math.sin(angle);
+
+    /* Effective ray endpoint — cap at just under maxRange so open returns
+     * still trace through free space but don't create spurious wall pixels */
+    const effR = Math.min(range, maxRange - 0.05);
+    const [hc, hr] = worldToPx(rx + effR * cosA, ry + effR * sinA);
+
+    /* Bresenham: mark traversed cells FREE (don't overwrite WALL) */
+    bresenham(rc, rr, hc, hr, (c, r) => {
+      if (!inBounds(c, r)) return;
+      const si = r * W + c;
+      if (state[si] === ST_UNKNOWN) {
+        state[si] = ST_FREE;
+        setPixel(c, r, C_FREE);
+        freeCnt++;
+      }
+    });
+
+    /* Mark real wall hit at exact range (not the capped effR) */
+    if (range < maxRange) {
+      const [wc, wr] = worldToPx(rx + range * cosA, ry + range * sinA);
+      if (inBounds(wc, wr)) {
+        const si = wr * W + wc;
+        if (state[si] !== ST_WALL) {
+          if (state[si] === ST_FREE) freeCnt--;
+          state[si] = ST_WALL;
+          setPixel(wc, wr, C_WALL);
+          wallCnt++;
+        }
+      }
+    }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Render
+ *
+ * 1. putImageData — map (orange / white / black)
+ * 2. fillRect     — robot trail (cyan) — drawn ON TOP of the map
+ * 3. arc          — current robot position (blue dot + heading tick)
+ * 4. drawImage    — scale offscreen → display canvas (pixelated)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function render() {
+  /* 1. Map layer */
+  offCtx.putImageData(imgData, 0, 0);
+
+  /* 2. Robot trail (cyan) — 1 pixel per recorded pose */
+  offCtx.fillStyle = '#00b4dc';
+  for (const [c, r] of trail) {
+    offCtx.fillRect(c, r, 1, 1);
+  }
+
+  /* 3. Current robot position */
+  if (curPose) {
+    const { c, r, th } = curPose;
+    const radius = Math.max(3, Math.round(W / 100));
+
+    /* Dot */
+    offCtx.fillStyle = '#4361ee';
+    offCtx.beginPath();
+    offCtx.arc(c, r, radius, 0, Math.PI * 2);
+    offCtx.fill();
+
+    /* Heading tick (note: canvas Y is inverted → negate sin) */
+    const len = radius + 5;
+    offCtx.strokeStyle = '#ffffff';
+    offCtx.lineWidth   = 1;
+    offCtx.beginPath();
+    offCtx.moveTo(c, r);
+    offCtx.lineTo(c + len * Math.cos(th), r - len * Math.sin(th));
+    offCtx.stroke();
+  }
+
+  /* 4. Scale to display canvas */
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(offscreen, 0, 0, W, H, 0, 0, canvas.width, canvas.height);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Stats
+ * ════════════════════════════════════════════════════════════════════════════ */
+function updateStats() {
+  document.getElementById('sFree').textContent  = freeCnt;
+  document.getElementById('sWall').textContent  = wallCnt;
+  document.getElementById('sPct').textContent   =
+    ((freeCnt + wallCnt) / (W * H) * 100).toFixed(1);
+  document.getElementById('scanNum').textContent = scanIdx;
+  document.getElementById('progressFill').style.width =
+    (scanIdx / TOTAL * 100).toFixed(1) + '%';
+  if (curPose) {
+    document.getElementById('sX').textContent  = curPose.x.toFixed(3);
+    document.getElementById('sY').textContent  = curPose.y.toFixed(3);
+    document.getElementById('sTh').textContent =
+      (curPose.th * 180 / Math.PI).toFixed(1);
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Animation loop
+ * ════════════════════════════════════════════════════════════════════════════ */
+let animHandle = null;
+let playing    = false;
+
+function scansPerFrame() {
+  return parseInt(document.getElementById('speedSlider').value);
+}
+
+function step(n) {
+  const end = Math.min(scanIdx + n, TOTAL);
+  while (scanIdx < end) processScan(scanIdx++);
+  render();
+  updateStats();
+}
+
+function animLoop() {
+  if (!playing) return;
+  if (scanIdx >= TOTAL) {
+    playing = false;
+    document.getElementById('btnPlay').textContent = '▶ Play';
+    animHandle = null;
+    return;
+  }
+  step(scansPerFrame());
+  animHandle = requestAnimationFrame(animLoop);
+}
+
+function resetAll() {
+  playing = false;
+  if (animHandle) { cancelAnimationFrame(animHandle); animHandle = null; }
+  document.getElementById('btnPlay').textContent = '▶ Play';
+
+  scanIdx  = 0;
+  freeCnt  = 0;
+  wallCnt  = 0;
+  trail    = [];
+  curPose  = null;
+  state.fill(ST_UNKNOWN);
+
+  for (let i = 0; i < W * H * 4; i += 4) {
+    d[i]   = C_UNKNOWN[0];
+    d[i+1] = C_UNKNOWN[1];
+    d[i+2] = C_UNKNOWN[2];
+    d[i+3] = 255;
+  }
+  render();
+  updateStats();
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Button handlers
+ * ════════════════════════════════════════════════════════════════════════════ */
+document.getElementById('btnPlay').addEventListener('click', () => {
+  if (scanIdx >= TOTAL) resetAll();
+  playing = !playing;
+  document.getElementById('btnPlay').textContent = playing ? '⏸ Pause' : '▶ Play';
+  if (playing) {
+    animHandle = requestAnimationFrame(animLoop);
+  } else if (animHandle) {
+    cancelAnimationFrame(animHandle);
+    animHandle = null;
+  }
+});
+
+document.getElementById('btnStep').addEventListener('click', () => {
+  /* Pause first */
+  if (playing) {
+    playing = false;
+    document.getElementById('btnPlay').textContent = '▶ Play';
+    if (animHandle) { cancelAnimationFrame(animHandle); animHandle = null; }
+  }
+  if (scanIdx < TOTAL) step(1);
+});
+
+document.getElementById('btnReset').addEventListener('click', resetAll);
+
+document.getElementById('btnEnd').addEventListener('click', () => {
+  if (playing) {
+    playing = false;
+    document.getElementById('btnPlay').textContent = '▶ Play';
+    if (animHandle) { cancelAnimationFrame(animHandle); animHandle = null; }
+  }
+  step(TOTAL - scanIdx);
+});
+
+document.getElementById('speedSlider').addEventListener('input', function () {
+  document.getElementById('speedVal').textContent = this.value;
+});
+
+document.getElementById('zoomSlider').addEventListener('input', function () {
+  PX = parseInt(this.value);
+  document.getElementById('zoomVal').textContent = PX;
+  resizeCanvas();
+  render();
+});
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Init
+ * ════════════════════════════════════════════════════════════════════════════ */
+render();
+updateStats();
+</script>
+</body>
+</html>

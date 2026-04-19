@@ -70,4 +70,33 @@ void qt_iterate_occupied(QuadTreeMap *map,
 // qt_memory_bytes: returns memory usage of allocated nodes.
 size_t qt_memory_bytes(const QuadTreeMap *map);
 
-#endif 
+// qt_query const variant — does not modify the map.
+int8_t qt_query_const(const QuadTreeMap *map, float x, float y);
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Compatibility layer — keeps frontier_detector, test_room, wifi_dashboard,
+ * and map_updater compiling without renaming every call site.
+ *
+ * Legacy API:
+ *   quadtree_map_t                           → typedef for QuadTreeMap
+ *   quadtree_map_init(map, w_mm, h_mm, step) → qt_init(0, w, 0, h)
+ *   quadtree_map_insert(map, x, y, cls)      → qt_update with correct delta
+ *   quadtree_map_query(map, x, y) → uint8_t  → mapped from log-odds int8_t
+ *
+ * Log-odds → uint8_t thresholds (match frontier_detector.c constants):
+ *   log-odds < 0  (free)    → 20   ≤ OCC_FREE_MAX  (50)
+ *   log-odds == 0 (unknown) → 128  ∈ OCC_UNK range (77-178)
+ *   log-odds > 0  (wall)    → 230  > OCC_UNK_MAX   (178)
+ * ════════════════════════════════════════════════════════════════════════════ */
+typedef QuadTreeMap quadtree_map_t;
+
+#include "../../types.h"   /* semantic_class_t */
+
+void     quadtree_map_init  (quadtree_map_t *map,
+                              float width_mm, float height_mm, float step_mm);
+void     quadtree_map_insert(quadtree_map_t *map,
+                              float x, float y, semantic_class_t cls);
+uint8_t  quadtree_map_query (const quadtree_map_t *map, float x, float y);
+
+#endif
