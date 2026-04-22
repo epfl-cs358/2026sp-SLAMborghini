@@ -1,44 +1,54 @@
 /**
  * hybrid_astar.c
- * Module: Hybrid A* kinematically-feasible path planner.
+ * Module: Direct-on-quadtree global path planner.
  * Board: ESP32-S3
- * Current phase: first heading-aware Hybrid A* implementation on planning grid.
+ *
+ * Current phase:
+ * - no temporary planning grid
+ * - A* runs directly on a sparse graph built from free quadtree leaves
+ *
+ * Note:
+ * This keeps the public hybrid_astar_plan() API unchanged for compatibility.
+ * Internally, this is graph-based A* on quadtree leaves, not full
+ * car-kinematic Hybrid A* yet.
  */
 
 #include "hybrid_astar.h"
-#include "planning_grid.h"
 
 #include <math.h>
 #include <stddef.h>
+#include <float.h>
+#include <stdbool.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-#define PLANNER_CELL_SIZE_MM 100.0f
-#define PLANNER_INFLATION_RADIUS_CELLS 2
 #define DEFAULT_TARGET_SPEED_MM_S 200.0f
-
-#define ASTAR_MAX_W 128
-#define ASTAR_MAX_H 128
-#define ANGLE_BINS 16
-#define HYBRID_MAX_STATES (ASTAR_MAX_W * ASTAR_MAX_H * ANGLE_BINS)
 #define ASTAR_INF 1.0e30f
-
-#define PRIMITIVE_STEP_CELLS 1.5f
-#define PRIMITIVE_TURN_ANGLE_RAD 0.39269908f   /* ~22.5 deg */
-#define COLLISION_SAMPLES 5
+#define MAX_QT_FREE_LEAVES 4096
+#define MAX_QT_NEIGHBORS 16
 #define MAX_PATH_WAYPOINTS 64
+
+typedef struct {
+    float x_min;
+    float x_max;
+    float y_min;
+    float y_max;
+    float cx;
+    float cy;
+    int8_t value;
+    uint16_t neighbors[MAX_QT_NEIGHBORS];
+    uint8_t neighbor_count;
+} qt_graph_node_t;
 
 typedef struct {
     bool open;
     bool closed;
     float g;
     float f;
-    int parent_x;
-    int parent_y;
-    int parent_theta;
-} hybrid_cell_t;
+    int parent;
+} astar_state_t;
 
 static path_t hybrid_astar_empty_path(void)
 {
@@ -62,150 +72,222 @@ static bool is_pose_inside_map(const quadtree_map_t *map, float x, float y)
             y >= map->y_min && y < map->y_max);
 }
 
-static float wrap_angle(float a)
+static bool node_has_children(const QTNode *n)
 {
-    while (a > (float)M_PI) {
-        a -= 2.0f * (float)M_PI;
+    return (n->children[0] != QT_NULL ||
+            n->children[1] != QT_NULL ||
+            n->children[2] != QT_NULL ||
+            n->children[3] != QT_NULL);
+}
+
+static void child_bounds(float xmn, float xmx,
+                         float ymn, float ymx,
+                         int q,
+                         float *cxmn, float *cxmx,
+                         float *cymn, float *cymx)
+{
+    float cx = 0.5f * (xmn + xmx);
+    float cy = 0.5f * (ymn + ymx);
+
+    switch (q) {
+        case 0: /* NW */
+            *cxmn = xmn; *cxmx = cx;
+            *cymn = cy;  *cymx = ymx;
+            break;
+        case 1: /* NE */
+            *cxmn = cx;  *cxmx = xmx;
+            *cymn = cy;  *cymx = ymx;
+            break;
+        case 2: /* SW */
+            *cxmn = xmn; *cxmx = cx;
+            *cymn = ymn; *cymx = cy;
+            break;
+        default: /* SE */
+            *cxmn = cx;  *cxmx = xmx;
+            *cymn = ymn; *cymx = cy;
+            break;
     }
-    while (a < -(float)M_PI) {
-        a += 2.0f * (float)M_PI;
-    }
-    return a;
 }
 
-static int theta_to_bin(float theta)
+static void collect_free_leaves_recursive(const quadtree_map_t *map,
+                                          uint16_t idx,
+                                          float xmn, float xmx,
+                                          float ymn, float ymx,
+                                          qt_graph_node_t *nodes,
+                                          int *count)
 {
-    float wrapped = wrap_angle(theta);
-    float normalized = (wrapped + (float)M_PI) / (2.0f * (float)M_PI);
-    int bin = (int)(normalized * (float)ANGLE_BINS);
-
-    if (bin < 0) {
-        bin = 0;
-    }
-    if (bin >= ANGLE_BINS) {
-        bin = ANGLE_BINS - 1;
+    if (map == NULL || map->pool == NULL || idx == QT_NULL || count == NULL) {
+        return;
     }
 
-    return bin;
+    const QTNode *n = &map->pool[idx];
+
+    /* In the current implementation, meaningful occupancy is stored at leaves.
+       Traversable leaves are the ones with negative log-odds (free). */
+    if (!node_has_children(n)) {
+        if (n->value < 0 && *count < MAX_QT_FREE_LEAVES) {
+            qt_graph_node_t *out = &nodes[*count];
+            out->x_min = xmn;
+            out->x_max = xmx;
+            out->y_min = ymn;
+            out->y_max = ymx;
+            out->cx = 0.5f * (xmn + xmx);
+            out->cy = 0.5f * (ymn + ymx);
+            out->value = n->value;
+            out->neighbor_count = 0;
+            (*count)++;
+        }
+        return;
+    }
+
+    for (int q = 0; q < 4; ++q) {
+        if (n->children[q] == QT_NULL) {
+            continue;
+        }
+
+        float cxmn, cxmx, cymn, cymx;
+        child_bounds(xmn, xmx, ymn, ymx, q, &cxmn, &cxmx, &cymn, &cymx);
+
+        collect_free_leaves_recursive(map,
+                                      n->children[q],
+                                      cxmn, cxmx, cymn, cymx,
+                                      nodes, count);
+    }
 }
 
-static float bin_to_theta(int bin)
+static int collect_free_leaves(const quadtree_map_t *map, qt_graph_node_t *nodes)
 {
-    float frac = ((float)bin + 0.5f) / (float)ANGLE_BINS;
-    return frac * 2.0f * (float)M_PI - (float)M_PI;
+    int count = 0;
+
+    if (map == NULL || map->pool == NULL || map->count <= 1) {
+        return 0;
+    }
+
+    collect_free_leaves_recursive(map,
+                                  1,
+                                  map->x_min, map->x_max,
+                                  map->y_min, map->y_max,
+                                  nodes, &count);
+    return count;
 }
 
-static int world_to_grid_x(const quadtree_map_t *map, const planning_grid_t *grid, float x_mm)
+static bool intervals_overlap(float a0, float a1, float b0, float b1)
 {
-    return (int)((x_mm - map->x_min) / grid->cell_size_mm);
+    return (fminf(a1, b1) - fmaxf(a0, b0)) > 0.0f;
 }
 
-static int world_to_grid_y(const quadtree_map_t *map, const planning_grid_t *grid, float y_mm)
+static bool leaves_are_adjacent(const qt_graph_node_t *a, const qt_graph_node_t *b)
 {
-    return (int)((y_mm - map->y_min) / grid->cell_size_mm);
+    const float eps = 1e-3f;
+
+    bool touch_vertical =
+        (fabsf(a->x_max - b->x_min) < eps || fabsf(b->x_max - a->x_min) < eps) &&
+        intervals_overlap(a->y_min, a->y_max, b->y_min, b->y_max);
+
+    bool touch_horizontal =
+        (fabsf(a->y_max - b->y_min) < eps || fabsf(b->y_max - a->y_min) < eps) &&
+        intervals_overlap(a->x_min, a->x_max, b->x_min, b->x_max);
+
+    return touch_vertical || touch_horizontal;
 }
 
-static float grid_to_world_x(const quadtree_map_t *map, const planning_grid_t *grid, int gx)
+static void add_neighbor(qt_graph_node_t *nodes, int from, int to)
 {
-    return map->x_min + ((float)gx + 0.5f) * grid->cell_size_mm;
+    if (nodes[from].neighbor_count >= MAX_QT_NEIGHBORS) {
+        return;
+    }
+    nodes[from].neighbors[nodes[from].neighbor_count++] = (uint16_t)to;
 }
 
-static float grid_to_world_y(const quadtree_map_t *map, const planning_grid_t *grid, int gy)
+static void build_adjacency(qt_graph_node_t *nodes, int count)
 {
-    return map->y_min + ((float)gy + 0.5f) * grid->cell_size_mm;
+    for (int i = 0; i < count; ++i) {
+        nodes[i].neighbor_count = 0;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        for (int j = i + 1; j < count; ++j) {
+            if (leaves_are_adjacent(&nodes[i], &nodes[j])) {
+                add_neighbor(nodes, i, j);
+                add_neighbor(nodes, j, i);
+            }
+        }
+    }
 }
 
-static bool is_blocked(const planning_grid_t *grid, int gx, int gy)
+static float node_distance(const qt_graph_node_t *a, const qt_graph_node_t *b)
 {
-    planner_cell_t cell = planning_grid_get(grid, gx, gy);
-
-    return (cell == CELL_OCCUPIED ||
-            cell == CELL_UNKNOWN ||
-            cell == CELL_INFLATED);
-}
-
-static float heuristic_cost(int x0, int y0, int x1, int y1)
-{
-    float dx = (float)(x1 - x0);
-    float dy = (float)(y1 - y0);
+    float dx = a->cx - b->cx;
+    float dy = a->cy - b->cy;
     return sqrtf(dx * dx + dy * dy);
 }
 
-static float heading_difference_cost(int theta_bin, float goal_theta)
+static int find_containing_free_leaf(const qt_graph_node_t *nodes, int count, float x, float y)
 {
-    float theta = bin_to_theta(theta_bin);
-    float d = wrap_angle(goal_theta - theta);
-    return fabsf(d);
+    for (int i = 0; i < count; ++i) {
+        if (x >= nodes[i].x_min && x < nodes[i].x_max &&
+            y >= nodes[i].y_min && y < nodes[i].y_max) {
+            return i;
+        }
+    }
+    return -1;
 }
 
-static int hybrid_index(const planning_grid_t *grid, int x, int y, int theta_bin)
+static int find_nearest_free_leaf(const qt_graph_node_t *nodes, int count, float x, float y)
 {
-    return (theta_bin * grid->height + y) * grid->width + x;
-}
+    int best = -1;
+    float best_d2 = FLT_MAX;
 
-static bool apply_motion_primitive(const quadtree_map_t *map,
-                                   const planning_grid_t *grid,
-                                   int x,
-                                   int y,
-                                   int theta_bin,
-                                   float steering_delta,
-                                   int *out_x,
-                                   int *out_y,
-                                   int *out_theta_bin)
-{
-    float theta = bin_to_theta(theta_bin);
-    float new_theta = wrap_angle(theta + steering_delta);
+    for (int i = 0; i < count; ++i) {
+        float dx = nodes[i].cx - x;
+        float dy = nodes[i].cy - y;
+        float d2 = dx * dx + dy * dy;
 
-    float wx = grid_to_world_x(map, grid, x);
-    float wy = grid_to_world_y(map, grid, y);
-    float step_mm = PRIMITIVE_STEP_CELLS * grid->cell_size_mm;
-
-    float new_wx = wx + step_mm * cosf(new_theta);
-    float new_wy = wy + step_mm * sinf(new_theta);
-
-    int gx = world_to_grid_x(map, grid, new_wx);
-    int gy = world_to_grid_y(map, grid, new_wy);
-    int gt = theta_to_bin(new_theta);
-
-    if (!planning_grid_is_inside(grid, gx, gy)) {
-        return false;
+        if (d2 < best_d2) {
+            best_d2 = d2;
+            best = i;
+        }
     }
 
-    *out_x = gx;
-    *out_y = gy;
-    *out_theta_bin = gt;
-    return true;
+    return best;
 }
 
-static bool primitive_is_collision_free(const quadtree_map_t *map,
-                                        const planning_grid_t *grid,
-                                        int x0,
-                                        int y0,
-                                        int theta0_bin,
-                                        int x1,
-                                        int y1,
-                                        int theta1_bin)
+static float min_leaf_size_mm(const quadtree_map_t *map)
 {
-    (void)theta0_bin;
-    (void)theta1_bin;
+    float width = map->x_max - map->x_min;
+    float height = map->y_max - map->y_min;
+    float side = fminf(width, height);
+    float divisions = (float)(1 << (QT_MAX_DEPTH - 1));
+    return side / divisions;
+}
 
-    float wx0 = grid_to_world_x(map, grid, x0);
-    float wy0 = grid_to_world_y(map, grid, y0);
-    float wx1 = grid_to_world_x(map, grid, x1);
-    float wy1 = grid_to_world_y(map, grid, y1);
+static bool line_is_collision_free_quadtree(const quadtree_map_t *map,
+                                            float x0, float y0,
+                                            float x1, float y1)
+{
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float dist = sqrtf(dx * dx + dy * dy);
 
-    for (int i = 0; i <= COLLISION_SAMPLES; ++i) {
-        float t = (float)i / (float)COLLISION_SAMPLES;
-        float wx = wx0 + t * (wx1 - wx0);
-        float wy = wy0 + t * (wy1 - wy0);
+    float step = 0.5f * min_leaf_size_mm(map);
+    if (step <= 1e-3f) {
+        step = 50.0f;
+    }
 
-        int gx = world_to_grid_x(map, grid, wx);
-        int gy = world_to_grid_y(map, grid, wy);
+    int samples = (int)(dist / step);
+    if (samples < 1) {
+        samples = 1;
+    }
 
-        if (!planning_grid_is_inside(grid, gx, gy)) {
-            return false;
-        }
-        if (is_blocked(grid, gx, gy)) {
+    for (int i = 0; i <= samples; ++i) {
+        float t = (float)i / (float)samples;
+        float x = x0 + t * dx;
+        float y = y0 + t * dy;
+
+        int8_t v = qt_query_const(map, x, y);
+
+        /* free < 0, unknown == 0, occupied > 0 */
+        if (v >= 0) {
             return false;
         }
     }
@@ -213,42 +295,74 @@ static bool primitive_is_collision_free(const quadtree_map_t *map,
     return true;
 }
 
-static bool reconstruct_hybrid_path(const quadtree_map_t *map,
-                                    const planning_grid_t *grid,
-                                    hybrid_cell_t *states,
-                                    int goal_x,
-                                    int goal_y,
-                                    int goal_theta,
-                                    path_t *out_path)
+static void smooth_path_quadtree(const quadtree_map_t *map, path_t *path)
 {
-    int rev_x[MAX_PATH_WAYPOINTS];
-    int rev_y[MAX_PATH_WAYPOINTS];
-    int rev_t[MAX_PATH_WAYPOINTS];
+    if (map == NULL || path == NULL || path->length < 3) {
+        return;
+    }
+
+    waypoint_t smoothed[MAX_PATH_WAYPOINTS];
+    uint8_t new_len = 0;
+    int i = 0;
+
+    while (i < path->length && new_len < MAX_PATH_WAYPOINTS) {
+        smoothed[new_len++] = path->waypoints[i];
+
+        int farthest = i + 1;
+        for (int j = path->length - 1; j > i + 1; --j) {
+            if (line_is_collision_free_quadtree(map,
+                                                path->waypoints[i].x, path->waypoints[i].y,
+                                                path->waypoints[j].x, path->waypoints[j].y)) {
+                farthest = j;
+                break;
+            }
+        }
+
+        i = farthest;
+    }
+
+    if (new_len < MAX_PATH_WAYPOINTS) {
+        waypoint_t last = path->waypoints[path->length - 1];
+        if (new_len == 0 ||
+            smoothed[new_len - 1].x != last.x ||
+            smoothed[new_len - 1].y != last.y) {
+            smoothed[new_len++] = last;
+        }
+    }
+
+    path->length = new_len;
+    for (int k = 0; k < new_len; ++k) {
+        path->waypoints[k] = smoothed[k];
+    }
+
+    for (int k = 0; k + 1 < path->length; ++k) {
+        float dx = path->waypoints[k + 1].x - path->waypoints[k].x;
+        float dy = path->waypoints[k + 1].y - path->waypoints[k].y;
+        path->waypoints[k].theta = atan2f(dy, dx);
+    }
+
+    if (path->length >= 2) {
+        path->waypoints[path->length - 1].theta = path->waypoints[path->length - 2].theta;
+    }
+}
+
+static bool reconstruct_graph_path(const qt_graph_node_t *nodes,
+                                   const astar_state_t *states,
+                                   int goal_idx,
+                                   path_t *out_path)
+{
+    int rev[MAX_PATH_WAYPOINTS];
     int count = 0;
+    int cur = goal_idx;
 
-    int cx = goal_x;
-    int cy = goal_y;
-    int ct = goal_theta;
+    while (cur >= 0 && count < MAX_PATH_WAYPOINTS) {
+        rev[count++] = cur;
 
-    while (count < MAX_PATH_WAYPOINTS) {
-        hybrid_cell_t *c = &states[hybrid_index(grid, cx, cy, ct)];
-
-        rev_x[count] = cx;
-        rev_y[count] = cy;
-        rev_t[count] = ct;
-        count++;
-
-        if (c->parent_x == cx && c->parent_y == cy && c->parent_theta == ct) {
+        if (states[cur].parent == cur) {
             break;
         }
 
-        if (c->parent_x < 0 || c->parent_y < 0 || c->parent_theta < 0) {
-            break;
-        }
-
-        cx = c->parent_x;
-        cy = c->parent_y;
-        ct = c->parent_theta;
+        cur = states[cur].parent;
     }
 
     if (count <= 0) {
@@ -258,127 +372,91 @@ static bool reconstruct_hybrid_path(const quadtree_map_t *map,
     out_path->length = (uint8_t)count;
 
     for (int i = 0; i < count; ++i) {
-        int src = count - 1 - i;
+        int src = rev[count - 1 - i];
 
-        out_path->waypoints[i].x = grid_to_world_x(map, grid, rev_x[src]);
-        out_path->waypoints[i].y = grid_to_world_y(map, grid, rev_y[src]);
-        out_path->waypoints[i].theta = bin_to_theta(rev_t[src]);
+        out_path->waypoints[i].x = nodes[src].cx;
+        out_path->waypoints[i].y = nodes[src].cy;
         out_path->waypoints[i].v_target = DEFAULT_TARGET_SPEED_MM_S;
+
+        if (i + 1 < count) {
+            int next = rev[count - 2 - i];
+            float dx = nodes[next].cx - nodes[src].cx;
+            float dy = nodes[next].cy - nodes[src].cy;
+            out_path->waypoints[i].theta = atan2f(dy, dx);
+        } else if (i > 0) {
+            out_path->waypoints[i].theta = out_path->waypoints[i - 1].theta;
+        } else {
+            out_path->waypoints[i].theta = 0.0f;
+        }
     }
 
     return true;
 }
 
-static bool run_hybrid_astar(const quadtree_map_t *map,
-                             const planning_grid_t *grid,
-                             int start_x,
-                             int start_y,
-                             int start_theta,
-                             int goal_x,
-                             int goal_y,
-                             path_t *out_path)
+static bool run_quadtree_graph_astar(const qt_graph_node_t *nodes,
+                                     int node_count,
+                                     int start_idx,
+                                     int goal_idx,
+                                     path_t *out_path)
 {
-    static hybrid_cell_t states[HYBRID_MAX_STATES];
-    const float primitives[3] = {
-        -PRIMITIVE_TURN_ANGLE_RAD,
-         0.0f,
-         PRIMITIVE_TURN_ANGLE_RAD
-    };
+    static astar_state_t states[MAX_QT_FREE_LEAVES];
 
-    int total = grid->width * grid->height * ANGLE_BINS;
-    if (grid->width > ASTAR_MAX_W ||
-        grid->height > ASTAR_MAX_H ||
-        total > HYBRID_MAX_STATES) {
+    if (node_count <= 0 || node_count > MAX_QT_FREE_LEAVES) {
         return false;
     }
 
-    for (int i = 0; i < total; ++i) {
+    for (int i = 0; i < node_count; ++i) {
         states[i].open = false;
         states[i].closed = false;
         states[i].g = ASTAR_INF;
         states[i].f = ASTAR_INF;
-        states[i].parent_x = -1;
-        states[i].parent_y = -1;
-        states[i].parent_theta = -1;
+        states[i].parent = -1;
     }
 
-    float goal_heading = atan2f((float)(goal_y - start_y), (float)(goal_x - start_x));
-
-    int start_idx = hybrid_index(grid, start_x, start_y, start_theta);
     states[start_idx].g = 0.0f;
-    states[start_idx].f = heuristic_cost(start_x, start_y, goal_x, goal_y);
+    states[start_idx].f = node_distance(&nodes[start_idx], &nodes[goal_idx]);
     states[start_idx].open = true;
-    states[start_idx].parent_x = start_x;
-    states[start_idx].parent_y = start_y;
-    states[start_idx].parent_theta = start_theta;
+    states[start_idx].parent = start_idx;
 
     while (1) {
-        int best_x = -1;
-        int best_y = -1;
-        int best_t = -1;
+        int best = -1;
         float best_f = ASTAR_INF;
 
-        for (int t = 0; t < ANGLE_BINS; ++t) {
-            for (int y = 0; y < grid->height; ++y) {
-                for (int x = 0; x < grid->width; ++x) {
-                    hybrid_cell_t *s = &states[hybrid_index(grid, x, y, t)];
-                    if (s->open && !s->closed && s->f < best_f) {
-                        best_f = s->f;
-                        best_x = x;
-                        best_y = y;
-                        best_t = t;
-                    }
-                }
+        for (int i = 0; i < node_count; ++i) {
+            if (states[i].open && !states[i].closed && states[i].f < best_f) {
+                best_f = states[i].f;
+                best = i;
             }
         }
 
-        if (best_x < 0 || best_y < 0 || best_t < 0) {
+        if (best < 0) {
             return false;
         }
 
-        if (best_x == goal_x && best_y == goal_y) {
-            return reconstruct_hybrid_path(map, grid, states, best_x, best_y, best_t, out_path);
+        if (best == goal_idx) {
+            return reconstruct_graph_path(nodes, states, goal_idx, out_path);
         }
 
-        hybrid_cell_t *current = &states[hybrid_index(grid, best_x, best_y, best_t)];
-        current->closed = true;
-        current->open = false;
+        states[best].open = false;
+        states[best].closed = true;
 
-        for (int i = 0; i < 3; ++i) {
-            int nx = 0;
-            int ny = 0;
-            int nt = 0;
+        for (int k = 0; k < nodes[best].neighbor_count; ++k) {
+            int nb = (int)nodes[best].neighbors[k];
 
-            if (!apply_motion_primitive(map, grid, best_x, best_y, best_t,
-                                        primitives[i], &nx, &ny, &nt)) {
+            if (nb < 0 || nb >= node_count) {
+                continue;
+            }
+            if (states[nb].closed) {
                 continue;
             }
 
-            if (is_blocked(grid, nx, ny)) {
-                continue;
-            }
+            float tentative_g = states[best].g + node_distance(&nodes[best], &nodes[nb]);
 
-            if (!primitive_is_collision_free(map, grid, best_x, best_y, best_t, nx, ny, nt)) {
-                continue;
-            }
-
-            hybrid_cell_t *neighbor = &states[hybrid_index(grid, nx, ny, nt)];
-            if (neighbor->closed) {
-                continue;
-            }
-
-            float steering_penalty = (i == 1) ? 0.0f : 0.2f;
-            float tentative_g = current->g + 1.0f + steering_penalty;
-            float h = heuristic_cost(nx, ny, goal_x, goal_y) +
-                      0.2f * heading_difference_cost(nt, goal_heading);
-
-            if (!neighbor->open || tentative_g < neighbor->g) {
-                neighbor->open = true;
-                neighbor->g = tentative_g;
-                neighbor->f = tentative_g + h;
-                neighbor->parent_x = best_x;
-                neighbor->parent_y = best_y;
-                neighbor->parent_theta = best_t;
+            if (!states[nb].open || tentative_g < states[nb].g) {
+                states[nb].open = true;
+                states[nb].g = tentative_g;
+                states[nb].f = tentative_g + node_distance(&nodes[nb], &nodes[goal_idx]);
+                states[nb].parent = best;
             }
         }
     }
@@ -389,7 +467,7 @@ path_t hybrid_astar_plan(const quadtree_map_t *map,
                          const frontier_t *goal)
 {
     path_t path = hybrid_astar_empty_path();
-    planning_grid_t grid;
+    qt_graph_node_t nodes[MAX_QT_FREE_LEAVES];
 
     if (map == NULL || start == NULL || goal == NULL) {
         return path;
@@ -400,47 +478,31 @@ path_t hybrid_astar_plan(const quadtree_map_t *map,
         return path;
     }
 
-    float map_width_mm = map->x_max - map->x_min;
-    float map_height_mm = map->y_max - map->y_min;
-
-    int grid_w = (int)(map_width_mm / PLANNER_CELL_SIZE_MM);
-    int grid_h = (int)(map_height_mm / PLANNER_CELL_SIZE_MM);
-
-    if (grid_w <= 0 || grid_h <= 0) {
+    int node_count = collect_free_leaves(map, nodes);
+    if (node_count <= 0) {
         return path;
     }
 
-    if (!planning_grid_init(&grid, grid_w, grid_h, PLANNER_CELL_SIZE_MM)) {
+    build_adjacency(nodes, node_count);
+
+    int start_idx = find_containing_free_leaf(nodes, node_count, start->x, start->y);
+    if (start_idx < 0) {
+        start_idx = find_nearest_free_leaf(nodes, node_count, start->x, start->y);
+    }
+
+    int goal_idx = find_containing_free_leaf(nodes, node_count, goal->cx, goal->cy);
+    if (goal_idx < 0) {
+        goal_idx = find_nearest_free_leaf(nodes, node_count, goal->cx, goal->cy);
+    }
+
+    if (start_idx < 0 || goal_idx < 0) {
         return path;
     }
 
-    if (!planning_grid_build_from_quadtree(map, &grid)) {
-        planning_grid_free(&grid);
-        return path;
-    }
-
-    planning_grid_inflate(&grid, PLANNER_INFLATION_RADIUS_CELLS);
-
-    int start_x = world_to_grid_x(map, &grid, start->x);
-    int start_y = world_to_grid_y(map, &grid, start->y);
-    int start_theta = theta_to_bin(start->theta);
-
-    int goal_x = world_to_grid_x(map, &grid, goal->cx);
-    int goal_y = world_to_grid_y(map, &grid, goal->cy);
-
-    if (!planning_grid_is_inside(&grid, start_x, start_y) ||
-        !planning_grid_is_inside(&grid, goal_x, goal_y) ||
-        is_blocked(&grid, start_x, start_y) ||
-        is_blocked(&grid, goal_x, goal_y)) {
-        planning_grid_free(&grid);
-        return path;
-    }
-
-    if (!run_hybrid_astar(map, &grid, start_x, start_y, start_theta, goal_x, goal_y, &path)) {
-        planning_grid_free(&grid);
+    if (!run_quadtree_graph_astar(nodes, node_count, start_idx, goal_idx, &path)) {
         return hybrid_astar_empty_path();
     }
 
-    planning_grid_free(&grid);
+    smooth_path_quadtree(map, &path);
     return path;
 }

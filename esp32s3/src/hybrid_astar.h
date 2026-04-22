@@ -1,9 +1,11 @@
 /**
- * hybrid_astar.h
- * Module: Hybrid A* kinematically-feasible path planner.
- * Board: ESP32-S3
- * Plans collision-free paths from the current robot pose to an exploration frontier,
- * respecting the non-holonomic constraints of the differential-drive robot.
+ * Plan a path from start to the given frontier goal.
+ * Current implementation builds a sparse adjacency graph from traversable
+ * quadtree leaves and runs A* directly on that graph.
+ * @param map   Pointer to the current quadtree map.
+ * @param start Pointer to the current robot pose.
+ * @param goal  Pointer to the target frontier.
+ * @return path_t with length > 0 on success, or length == 0 on failure.
  */
 
 #ifndef HYBRID_ASTAR_H
