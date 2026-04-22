@@ -25,7 +25,8 @@ typedef struct {
 
 /**
  * Plan a kinematically feasible path from start to the given frontier goal.
- * Uses the quadtree map for collision checking during tree expansion.
+  * Uses the quadtree map as the source occupancy representation and may build
+ * an internal planning grid for collision checking and search.
  * @param map   Pointer to the current quadtree map (const, for collision checks).
  * @param start Pointer to the current robot pose.
  * @param goal  Pointer to the target frontier.
