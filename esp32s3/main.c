@@ -2,6 +2,12 @@
  * Board: ESP32-S3 (SLAM Brain)
  *
  * ── Mode flags ───────────────────────────────────────────────────────────────
+ * USE_REAL_LIDAR         1  →  Real hardware: RPLiDAR C1 → quadtree → dashboard.
+ *                              Set USE_WAYPOINT_PLAYBACK and USE_FRONTIER_TARGET
+ *                              to 0 when using this mode.
+ *                              Open tools/dashboard/live_dashboard.html, enter
+ *                              ESP32 IP, click "Start Exploration".
+ *
  * USE_WAYPOINT_PLAYBACK  1  →  Follow room.log trajectory waypoints physically.
  *                              The car drives through the pre-recorded path;
  *                              the browser (playback_dashboard.html) builds the
@@ -16,14 +22,16 @@
  * USE_WAYPOINT_PLAYBACK  0,
  * USE_FRONTIER_TARGET    0  →  UART + motor smoke test (hardcoded 200 mm fwd).
  * ─────────────────────────────────────────────────────────────────────────── */
-#define USE_WAYPOINT_PLAYBACK  1   /* ← SET TO 1 FOR ROOM.LOG PLAYBACK         */
-#define USE_FRONTIER_TARGET    0   /* ← SET TO 1 FOR FRONTIER EXPLORATION       */
+#define USE_REAL_LIDAR         1   /* ← SET TO 1 FOR REAL LIDAR HARDWARE        */
+#define USE_WAYPOINT_PLAYBACK  0   /* ← SET TO 1 FOR ROOM.LOG PLAYBACK          */
+#define USE_FRONTIER_TARGET    0   /* ← SET TO 1 FOR FRONTIER EXPLORATION        */
 
 /* ── Wi-Fi credentials — fill in before flashing ───────────────────────── */
 #define WIFI_SSID      "YOUR_SSID"
 #define WIFI_PASSWORD  "YOUR_PASSWORD"
 
 #include "src/lidar_driver.h"
+#include "src/lidar_to_map.h"
 #include "src/polar_to_cart.h"
 #include "src/scan_matcher.h"
 #include "src/rbpf.h"
@@ -98,6 +106,84 @@ void app_main(void)
 
 
 /* ════════════════════════════════════════════════════════════════════════════
+ * MODE R — Real LiDAR hardware: RPLiDAR C1 → quadtree map → live dashboard.
+ *
+ * To use:
+ *   1. Wire RPLiDAR C1 to ESP32-S3 UART (lidar_driver.h for pin config).
+ *   2. Flash with USE_REAL_LIDAR=1, USE_WAYPOINT_PLAYBACK=0.
+ *   3. Open tools/dashboard/live_dashboard.html in your browser.
+ *   4. Enter ESP32 IP, click "Start Exploration".
+ * ════════════════════════════════════════════════════════════════════════════ */
+#if USE_REAL_LIDAR
+
+    lidar_driver_init();
+
+    /* 10 m × 10 m map, robot starts at centre (5000, 5000) mm */
+    quadtree_map_t slam_map;
+    quadtree_map_init(&slam_map, 10000.0f, 10000.0f, 50.0f);
+
+    pose_t pose = { .x = 5000.0f, .y = 5000.0f, .theta = 0.0f };
+    lidar_scan_t scan;
+
+    /* Wait for browser to send {"cmd":"start"} before driving */
+    while (!wifi_dashboard_exploration_requested()) {
+        wifi_dashboard_update(&slam_map, &pose);
+        wifi_dashboard_broadcast_state(&pose, 0.0f, 0.0f, false, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    while (1) {
+
+        /* ── Acquire scan, integrate into map ───────────────────────────── */
+        if (lidar_driver_read_scan(&scan) && scan.count > 10) {
+            lidar_to_map(&slam_map, &scan, &pose, 6000.0f, 50.0f);
+        }
+
+        /* ── Push updated map to dashboard ──────────────────────────────── */
+        wifi_dashboard_update(&slam_map, &pose);
+
+        /* ── Frontier detection ──────────────────────────────────────────── */
+        frontier_list_t frontiers = frontier_detector_detect(&slam_map, &pose);
+
+        control_frame_t cmd = {0};
+        bool has_frontier   = false;
+        float fx = 0.0f, fy = 0.0f;
+
+        if (frontiers.count > 0) {
+            frontier_t best = frontier_detector_best(&frontiers, &pose);
+            waypoint_t wp   = { .x = best.cx, .y = best.cy };
+            cmd             = command_gen_compute(&pose, &wp);
+            has_frontier    = true;
+            fx              = best.cx;
+            fy              = best.cy;
+        } else {
+            /* No frontier yet — nudge forward slowly */
+            cmd.tx        = 0.0f;
+            cmd.ty        = DEBUG_FORWARD_MM;
+            cmd.t_heading = pose.theta;
+            cmd.t_speed   = DEBUG_SPEED_MM_S;
+        }
+
+        /* ── Transmit command to Wemos ───────────────────────────────────── */
+        uart_bridge_send_control(&cmd);
+
+        /* ── Broadcast state ─────────────────────────────────────────────── */
+        wifi_dashboard_broadcast_state(&pose, fx, fy, has_frontier, 0);
+
+        /* ── Dead-reckon pose from command ───────────────────────────────── */
+        dead_reckon_pose(&pose, &cmd);
+
+        /* ── Wait for Wemos to finish driving ────────────────────────────── */
+        float dist_mm = sqrtf(cmd.tx * cmd.tx + cmd.ty * cmd.ty);
+        float speed   = (cmd.t_speed > 10.0f) ? cmd.t_speed : DEBUG_SPEED_MM_S;
+        uint32_t drive_ms = (uint32_t)((dist_mm / speed) * 1000.0f);
+        if (drive_ms > MAX_DRIVE_MS) drive_ms = MAX_DRIVE_MS;
+        if (drive_ms < 50u)          drive_ms = 50u;
+        vTaskDelay(pdMS_TO_TICKS(drive_ms + CYCLE_DELAY_MS));
+    }
+
+
+/* ════════════════════════════════════════════════════════════════════════════
  * MODE A — Waypoint playback: follow room.log trajectory physically.
  *
  * The car drives through ROOM_WAYPOINTS[] derived from the recorded poses.
@@ -110,7 +196,7 @@ void app_main(void)
  *   3. Open tools/dashboard/playback_dashboard.html in your browser
  *   4. Enter ESP32 IP and connect
  * ════════════════════════════════════════════════════════════════════════════ */
-#if USE_WAYPOINT_PLAYBACK
+#elif USE_WAYPOINT_PLAYBACK
 
     /* Dummy map (not used for planning; browser handles map display) */
     quadtree_map_t map;
@@ -169,9 +255,9 @@ void app_main(void)
 
 
 /* ════════════════════════════════════════════════════════════════════════════
- * MODE B/C — Frontier exploration OR UART smoke test (previous behaviour)
+ * MODE B/C — Frontier exploration OR UART smoke test (simulated test room)
  * ════════════════════════════════════════════════════════════════════════════ */
-#else   /* !USE_WAYPOINT_PLAYBACK */
+#else   /* !USE_REAL_LIDAR && !USE_WAYPOINT_PLAYBACK */
 
     /* ── Two maps for realistic simulation ──────────────────────────────── */
     /* truth_map: full room (all walls pre-loaded) — used only for ray-casting */
@@ -258,5 +344,5 @@ void app_main(void)
         wifi_dashboard_update(&slam_map, &pose);
     }
 
-#endif  /* USE_WAYPOINT_PLAYBACK */
+#endif  /* USE_REAL_LIDAR / USE_WAYPOINT_PLAYBACK */
 }

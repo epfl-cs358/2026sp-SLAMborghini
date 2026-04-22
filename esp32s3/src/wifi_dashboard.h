@@ -73,4 +73,29 @@ bool wifi_dashboard_stop_requested(void);
  */
 bool wifi_dashboard_stop_peek(void);
 
+/**
+ * Broadcast a downsampled LiDAR scan as a binary type-0x02 frame.
+ * Call after each scan at up to 10 Hz. Silently drops if no client connected.
+ * @param scan  Raw LiDAR scan (up to 460 points; downsampled to ≤180 on send).
+ * @param pose  Robot pose at scan time (used by browser for world projection).
+ */
+void wifi_dashboard_broadcast_scan(const lidar_scan_t *scan, const pose_t *pose);
+
+/**
+ * Send a plain-text log line to the dashboard log box.
+ * Silently drops if no client is connected.
+ * @param msg Null-terminated string (max ~200 chars).
+ */
+void wifi_dashboard_log(const char *msg);
+
+/**
+ * Broadcast the full quadtree structure as a type-0x05 binary frame.
+ * Call at ~1 Hz from the planning loop for live debug visualization.
+ * Frame: [type(1)][count(2)][{x_min(2),y_min(2),size(2),depth(1),value(1)}×N]
+ * All coordinates in mm (little-endian uint16). value is raw log-odds int8.
+ * Capped at 1500 nodes; DFS order ensures shallow nodes are never truncated.
+ * @param map  Current quadtree map (read-only; no mutex needed from plan_task).
+ */
+void wifi_dashboard_broadcast_quadtree(const quadtree_map_t *map);
+
 #endif /* WIFI_DASHBOARD_H */

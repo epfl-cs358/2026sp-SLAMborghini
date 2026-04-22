@@ -2,367 +2,816 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>SLAMborghini — Live Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SLAMborghini 2026 — Live</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: #111;
-    color: #e0e0e0;
-    font-family: 'Courier New', monospace;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 14px;
-    gap: 12px;
-    min-height: 100vh;
-  }
-  h1 { color: #00d4ff; font-size: 1.05rem; letter-spacing: 2px; }
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-  .toolbar {
-    display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center;
-  }
-  input[type=text] {
-    background: #1a1a2e; border: 1px solid #444; color: #e0e0e0;
-    padding: 5px 10px; border-radius: 4px; font-family: inherit; width: 200px;
-  }
-  button {
-    background: #1a1a2e; border: 1px solid #555; color: #ccc;
-    padding: 5px 12px; border-radius: 4px; cursor: pointer; font-family: inherit;
-  }
-  button:hover:not(:disabled) { background: #2a2a4e; }
-  button:disabled { opacity: 0.3; cursor: default; }
-  #btnStart { border-color: #52b788; color: #52b788; }
-  #btnStop  { border-color: #e76f51; color: #e76f51; }
+:root {
+  --bg:      #111;
+  --surface: #1a1a2e;
+  --border:  #333;
+  --text:    #e0e0e0;
+  --muted:   #888;
+  --accent:  #00d4ff;
+  --green:   #52b788;
+  --red:     #e76f51;
+  --orange:  #f4a261;
+  --cyan:    #00ffff;
+}
 
-  .dot {
-    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
-    background: #555; vertical-align: middle; margin-right: 5px;
-  }
-  .dot.green  { background: #52b788; box-shadow: 0 0 5px #52b788; }
-  .dot.orange { background: #f4a261; box-shadow: 0 0 5px #f4a261; }
-  #statusTxt  { font-size: 0.76rem; color: #888; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Courier New', monospace;
+  font-size: 13px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 
-  .main-area {
-    display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; justify-content: center;
-  }
+/* ── Toolbar ── */
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+#toolbar label { color: var(--muted); font-size: 11px; }
+#titleTxt { color: var(--accent); font-size: 12px; letter-spacing: 2px; margin-right: 4px; }
 
-  /* Map fills the full grid — scroll if it exceeds viewport */
-  #mapWrap {
-    overflow: auto;
-    border: 2px solid #333;
-    background: #ff8c00; /* matches unknown cell color — no gaps visible */
-    flex-shrink: 0;
-    max-width: calc(100vw - 300px);
-    max-height: 82vh;
-  }
-  #mapCanvas { image-rendering: pixelated; display: block; }
+input[type=text] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  width: 155px;
+}
+button {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+button:disabled { opacity: .3; cursor: default; }
+#btnStart { border-color: #1d3d2b; color: var(--green); }
+#btnStop  { border-color: #3d1d1d; color: var(--red); }
 
-  .panel {
-    background: #1a1a2e; border: 1px solid #333; border-radius: 6px;
-    padding: 12px; width: 250px; display: flex; flex-direction: column; gap: 12px;
-  }
-  .panel h3 { color: #00d4ff; font-size: 0.8rem; border-bottom: 1px solid #333; padding-bottom: 5px; }
+.dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+.dot.green  { background: var(--green);  box-shadow: 0 0 5px var(--green); }
+.dot.orange { background: var(--orange); box-shadow: 0 0 5px var(--orange); animation: blink 1s ease-in-out infinite; }
+.dot.red    { background: var(--red);    box-shadow: 0 0 5px var(--red); }
+@keyframes blink { 50% { opacity: .3; } }
+#statusTxt { font-size: 11px; color: var(--muted); }
 
-  .tele { font-size: 0.74rem; line-height: 2.1; color: #888; }
-  .tele span { color: #00d4ff; font-weight: bold; }
-  .tele .fr  { color: #f4a261; }
+/* ── Main area ── */
+#main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
 
-  .leg-row { display: flex; align-items: center; gap: 7px; font-size: 0.73rem; }
-  .sw { width: 13px; height: 13px; flex-shrink: 0; border: 1px solid #555; border-radius: 2px; }
+/* ── Canvas ── */
+#mapWrap {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: #0a0a0a;
+  cursor: grab;
+  user-select: none;
+}
+#mapWrap.dragging { cursor: grabbing; }
+#mapCanvas { position: absolute; top: 0; left: 0; display: block; }
 
-  .log {
-    background: #0d0d1a; border: 1px solid #333; border-radius: 4px;
-    padding: 7px; font-size: 0.68rem; line-height: 1.8; max-height: 220px;
-    overflow-y: auto; color: #7ec8e3;
-  }
-  .log .w { color: #f4a261; }
-  .log .e { color: #e76f51; }
-  .log .ok { color: #52b788; }
+#hud {
+  position: absolute;
+  bottom: 8px; left: 8px;
+  background: rgba(17,17,17,.88);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 9px;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.9;
+  pointer-events: none;
+}
+#hud span { color: var(--accent); }
 
-  .zoom-row { display: flex; align-items: center; gap: 7px; font-size: 0.73rem; }
-  input[type=range] { flex: 1; accent-color: #00d4ff; }
+/* ── Panel ── */
+#panel {
+  width: 240px;
+  flex-shrink: 0;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sec-title {
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 2px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+  margin-bottom: 4px;
+}
+.row { display: flex; justify-content: space-between; color: var(--muted); margin: 2px 0; font-size: 12px; }
+.row span { color: var(--text); }
+.row .hi  { color: var(--orange); }
+
+.leg { display: flex; align-items: center; gap: 7px; margin: 3px 0; font-size: 11px; color: var(--muted); }
+.sw  { width: 13px; height: 13px; flex-shrink: 0; border: 1px solid #555; border-radius: 2px; }
+
+.ck  { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+.ck label { color: var(--muted); font-size: 11px; cursor: pointer; }
+input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
+
+.log {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px;
+  font-size: 10px;
+  line-height: 1.8;
+  max-height: 170px;
+  overflow-y: auto;
+  color: var(--muted);
+}
+.log .ok { color: var(--green); }
+.log .w  { color: var(--orange); }
+.log .e  { color: var(--red); }
 </style>
 </head>
 <body>
 
-<h1>SLAMBORGHINI 2026 — Live Map</h1>
-
-<div class="toolbar">
-  <label style="font-size:.76rem;color:#888">ESP32 IP:</label>
-  <input type="text" id="ipInput" value="192.168.1.100" placeholder="192.168.x.x">
-  <button id="btnConnect"    onclick="connectWS()">Connect</button>
-  <button id="btnDisconnect" onclick="disconnectWS()" disabled>Disconnect</button>
+<div id="toolbar">
+  <span id="titleTxt">SLAMBORGHINI 2026</span>
+  <label>IP</label>
+  <input type="text" id="ipInput" value="192.168.1.100">
+  <button id="btnConnect"    onclick="wsConnect()">Connect</button>
+  <button id="btnDisconnect" onclick="wsDisconnect()" disabled>Disconnect</button>
   <button id="btnStart"      onclick="sendCmd('start')" disabled>▶ Start</button>
   <button id="btnStop"       onclick="sendCmd('stop')"  disabled>■ Stop</button>
-  <span><span class="dot" id="dot"></span><span id="statusTxt">Disconnected</span></span>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:7px">
+    <div class="dot" id="dot"></div>
+    <span id="statusTxt">Disconnected</span>
+  </div>
 </div>
 
-<div class="main-area">
-
-  <div id="mapWrap"><canvas id="mapCanvas"></canvas></div>
-
-  <div class="panel">
-    <h3>Telemetry</h3>
-    <div class="tele">
-      Car X: <span id="tX">—</span> mm<br>
-      Car Y: <span id="tY">—</span> mm<br>
-      Heading: <span id="tTheta">—</span> °<br>
-      Frontier X: <span class="fr" id="tFX">—</span> mm<br>
-      Frontier Y: <span class="fr" id="tFY">—</span> mm<br>
-      Frontier: <span id="tHF" style="color:#888">—</span><br>
-      Map frames: <span id="tFrames">0</span>
+<div id="main">
+  <div id="mapWrap">
+    <canvas id="mapCanvas"></canvas>
+    <div id="hud">
+      Zoom <span id="hudZoom">—</span> &nbsp;|&nbsp;
+      Map <span id="hudMapAge">—</span> &nbsp;|&nbsp;
+      FPS <span id="hudFps">—</span>
     </div>
-
-    <h3>Legend</h3>
-    <div style="display:flex;flex-direction:column;gap:4px">
-      <div class="leg-row"><div class="sw" style="background:#ff8c00"></div>Unknown</div>
-      <div class="leg-row"><div class="sw" style="background:#fff;border-color:#aaa"></div>Free / explored</div>
-      <div class="leg-row"><div class="sw" style="background:#000"></div>Wall</div>
-      <div class="leg-row"><div class="sw" style="background:#0f0;border-radius:50%"></div>Robot (green arrow)</div>
-      <div class="leg-row"><div class="sw" style="background:#00ffff;border-radius:50%"></div>Frontier target</div>
-    </div>
-
-    <h3>Zoom</h3>
-    <div class="zoom-row">
-      <input type="range" id="zoomSlider" min="2" max="20" value="6">
-      <span id="zoomVal">6</span> px/cell
-    </div>
-
-    <h3>Log</h3>
-    <div class="log" id="logBox"></div>
-    <button onclick="clearLog()" style="font-size:.7rem;padding:3px 8px">Clear</button>
   </div>
 
+  <div id="panel">
+    <div>
+      <div class="sec-title">TELEMETRY</div>
+      <div class="row">X <span id="tX">—</span></div>
+      <div class="row">Y <span id="tY">—</span></div>
+      <div class="row">θ <span id="tTheta">—</span></div>
+      <div class="row">Frontier <span id="tHF">—</span></div>
+      <div class="row">Target X <span class="hi" id="tFX">—</span></div>
+      <div class="row">Target Y <span class="hi" id="tFY">—</span></div>
+    </div>
+
+    <div>
+      <div class="sec-title">NETWORK</div>
+      <div class="row">Latency <span id="sLat">—</span></div>
+      <div class="row">Map frames <span id="sMap">0</span></div>
+      <div class="row">Scan frames <span id="sScan">0</span></div>
+      <div class="row">Pose frames <span id="sPose">0</span></div>
+    </div>
+
+    <div>
+      <div class="sec-title">LEGEND</div>
+      <div class="leg"><div class="sw" style="background:#f4a261"></div>Unknown</div>
+      <div class="leg"><div class="sw" style="background:#fff;border-color:#aaa"></div>Free (explored)</div>
+      <div class="leg"><div class="sw" style="background:#000"></div>Wall</div>
+      <div class="leg"><div class="sw" style="background:#fbbf24;border-radius:50%"></div>LiDAR scan</div>
+      <div class="leg"><div class="sw" style="background:#4361ee"></div>Robot</div>
+      <div class="leg"><div class="sw" style="background:#00ffff;border-radius:50%"></div>Path trail</div>
+      <div class="leg"><div class="sw" style="background:#f4a261;border-radius:50%"></div>Frontier target</div>
+    </div>
+
+    <div>
+      <div class="sec-title">VIEW</div>
+      <div class="ck"><input type="checkbox" id="chkFollow" checked><label for="chkFollow">Follow robot</label></div>
+      <div class="ck"><input type="checkbox" id="chkScan"   checked><label for="chkScan">LiDAR scan</label></div>
+      <div class="ck"><input type="checkbox" id="chkTrail"  checked><label for="chkTrail">Path trail</label></div>
+      <div class="ck"><input type="checkbox" id="chkQT"><label for="chkQT">Quadtree grid</label></div>
+      <button onclick="resetView()" style="width:100%;margin-top:6px">Reset View</button>
+    </div>
+
+    <div>
+      <div class="sec-title">LOG</div>
+      <div class="log" id="logBox"></div>
+      <button onclick="clearLog()" style="width:100%;margin-top:4px;font-size:10px;padding:2px">Clear</button>
+    </div>
+  </div>
 </div>
 
 <script>
-/* ════════════════════════════════════════════════════════════════════════════
- * Rendering approach (same as SLAMaleykoum ground_station.py):
- *   canvas = gw*scale × gh*scale  — the ENTIRE map is always drawn.
- *   No viewport offsets. Car is always somewhere on the canvas.
- *   Scroll the page/wrapper if the map is larger than the screen.
- *
- * Colors (matching lidar_map.png output):
- *   unknown → orange  #ff8c00   (val 128, never observed)
- *   free    → white   #ffffff   (val  20, log-odds < 0)
- *   wall    → black   #000000   (val 230, log-odds > 0)
- *
- * Robot: green arrow pointing in heading direction (SLAMurai style).
- * Frontier: cyan dot + dashed line (SLAMaleykoum C_CYAN style).
- * ════════════════════════════════════════════════════════════════════════════ */
+'use strict';
 
+/* ════════════════════════════════════════════════════════════════════════════
+ * Protocol constants
+ * ════════════════════════════════════════════════════════════════════════════ */
+const MSG_MAP       = 0x01;
+const MSG_SCAN      = 0x02;
+const MSG_POSE      = 0x03;
+const MSG_MAP_DELTA = 0x04;
+const MSG_QUADTREE  = 0x05;
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Rendering constants
+ * ════════════════════════════════════════════════════════════════════════════ */
+const BASE_PX        = 1;     // canvas px per cell at zoom=1
+const SCAN_MAX_ACCUM = 5000;  // persistent scan world-points (circular buffer)
+const TRAIL_STEP_MM  = 50;    // add trail point every N mm of travel
+const TRAIL_MAX      = 80;    // max trail points
+const RENDER_LAG_MS  = 80;    // pose render delay for smooth interpolation
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * State
+ * ════════════════════════════════════════════════════════════════════════════ */
+let mapState   = null;   // { gw, gh, cellMm, xMin, yMin, bitmap, ts }
+let poseRing   = [];     // [{x, y, theta, ts}, ...] — last 4 frames
+let scanAccum  = [];     // persistent [{wx,wy}, ...] — circular, max SCAN_MAX_ACCUM
+let trailPts   = [];     // [{x,y}, ...] — robot path
+let lastFront  = null;   // {fx, fy, has} — latest frontier
+let lastPose   = null;   // most recent raw pose (for scan projection)
+let qtNodes    = null;   // [{xMin,yMin,size,depth,value}, ...] — latest quadtree frame
+
+const cam = { zoom: 6, tx: 0, ty: 0 };
+let drag = null;
+
+let ws = null, wsRetryTimer = null;
+let pingTs = 0, latency = null;
+
+let nMap = 0, nScan = 0, nPose = 0;
+let fpsCnt = 0, fpsLast = 0, fpsVal = 0;
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Canvas
+ * ════════════════════════════════════════════════════════════════════════════ */
+const wrap   = document.getElementById('mapWrap');
 const canvas = document.getElementById('mapCanvas');
 const ctx    = canvas.getContext('2d');
 
-let scale    = parseInt(document.getElementById('zoomSlider').value);
-let liveGrid = null;   // { gw, gh, cellMm, cells: Uint8Array }
-let carState = null;
+function resizeCanvas() {
+  canvas.width  = wrap.clientWidth;
+  canvas.height = wrap.clientHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
 
-/* ─── draw ──────────────────────────────────────────────────────────────── */
-function draw() {
-  if (!liveGrid) return;
-  const { gw, gh, cellMm, cells } = liveGrid;
+/* ════════════════════════════════════════════════════════════════════════════
+ * Coordinate helper
+ * world mm → canvas px (applies current camera transform)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function w2c(wx, wy) {
+  if (!mapState) return [0, 0];
+  const { cellMm, gh, xMin, yMin } = mapState;
+  return [
+    ((wx - xMin) / cellMm) * BASE_PX * cam.zoom + cam.tx,
+    (gh - (wy - yMin) / cellMm) * BASE_PX * cam.zoom + cam.ty
+  ];
+}
 
-  /* Canvas always = full grid size */
-  canvas.width  = gw * scale;
-  canvas.height = gh * scale;
+/* ════════════════════════════════════════════════════════════════════════════
+ * Message handlers
+ * ════════════════════════════════════════════════════════════════════════════ */
 
-  /* Build 1-px/cell image, then scale to canvas */
-  const off = document.createElement('canvas');
-  off.width = gw; off.height = gh;
-  const oc  = off.getContext('2d');
-  const img = oc.createImageData(gw, gh);
+// Build an ImageBitmap from a raw cell grid (log-odds+128 uint8 values).
+// rawGrid is row-major [iy=0..gh-1][ix=0..gw-1]; Y is flipped for canvas.
+async function buildBitmap(rawGrid, gw, gh) {
+  const img = new ImageData(gw, gh);
   const d   = img.data;
-
   for (let iy = 0; iy < gh; iy++) {
     for (let ix = 0; ix < gw; ix++) {
-      const val = cells[iy * gw + ix];
-      const py  = gh - 1 - iy;          /* Y-flip: row 0 = y_min = bottom */
+      const val = rawGrid[iy * gw + ix];
+      const py  = gh - 1 - iy;   // Y-flip: iy=0 = y_min = bottom
       const k   = (py * gw + ix) * 4;
-      if (val <= 50) {                   /* free  → white */
-        d[k]=255; d[k+1]=255; d[k+2]=255; d[k+3]=255;
-      } else if (val <= 178) {           /* unknown → orange (lidar_map.png) */
-        d[k]=255; d[k+1]=140; d[k+2]=0;  d[k+3]=255;
-      } else {                           /* wall  → black */
-        d[k]=0;   d[k+1]=0;   d[k+2]=0;  d[k+3]=255;
-      }
+      let r, g, b;
+      if      (val < 118) { r = 255; g = 255; b = 255; }   // free  → white
+      else if (val > 138) { r = 0;   g = 0;   b = 0;   }   // wall  → black
+      else                { r = 244; g = 162; b =  97; }   // unknown → orange
+      d[k]=r; d[k+1]=g; d[k+2]=b; d[k+3]=255;
     }
   }
-  oc.putImageData(img, 0, 0);
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+  return createImageBitmap(img);
+}
 
-  if (!carState) return;
+async function handleMap(buf) {
+  const v    = new DataView(buf);
+  // header: type(1) gw(2) gh(2) cellMm(4) xMin(4) yMin(4) = 17 bytes
+  const gw   = v.getUint16(1,  true);
+  const gh   = v.getUint16(3,  true);
+  const cmm  = v.getFloat32(5, true);
+  const xMin = v.getFloat32(9, true);
+  const yMin = v.getFloat32(13, true);
+  if (!gw || !gh || !cmm) return;
 
-  /* mm → canvas px  (col = x/cellMm, row = gh-1 - y/cellMm, then scale) */
-  function toPx(x_mm, y_mm) {
-    return [
-      (x_mm / cellMm) * scale + scale / 2,
-      (gh - 1 - y_mm / cellMm) * scale + scale / 2
-    ];
+  // Keep a mutable copy so delta patches can update it in-place
+  const rawGrid = new Uint8Array(buf.slice(17, 17 + gw * gh));
+  const bitmap  = await buildBitmap(rawGrid, gw, gh);
+  mapState = { gw, gh, cellMm: cmm, xMin, yMin, rawGrid, bitmap, ts: performance.now() };
+
+  nMap++;
+  document.getElementById('sMap').textContent = nMap;
+  if (nMap === 1) fitView();
+}
+
+async function handleMapDelta(buf) {
+  if (!mapState) return;   // no full map yet — ignore stale delta
+  const v     = new DataView(buf);
+  const count = v.getUint16(1, true);
+  const { gw, gh, cellMm, xMin, yMin, rawGrid } = mapState;
+
+  for (let i = 0; i < count; i++) {
+    const off = 3 + i * 3;
+    const idx = v.getUint16(off,     true);
+    const val = v.getUint8 (off + 2);
+    if (idx < rawGrid.length) rawGrid[idx] = val;
   }
 
-  const [cx, cy] = toPx(carState.x, carState.y);
+  const bitmap = await buildBitmap(rawGrid, gw, gh);
+  mapState = { gw, gh, cellMm, xMin, yMin, rawGrid, bitmap, ts: performance.now() };
 
-  /* Frontier: cyan dot + dashed line (SLAMaleykoum C_CYAN) */
-  if (carState.has_frontier) {
-    const [fx, fy] = toPx(carState.fx, carState.fy);
+  nMap++;
+  document.getElementById('sMap').textContent = nMap;
+}
 
-    ctx.fillStyle = '#00ffff';
+function handleScan(buf) {
+  if (!mapState || !lastPose) return;
+  const v     = new DataView(buf);
+  const count = v.getUint16(1, true);   // byte 0 = type
+  const px    = lastPose;
+  const cosT  = Math.cos(px.theta);
+  const sinT  = Math.sin(px.theta);
+
+  for (let i = 0; i < count; i++) {
+    const off = 3 + i * 4;
+    const acd = v.getUint16(off,     true);   // angle centidegrees
+    const rmm = v.getUint16(off + 2, true);   // range mm
+    if (rmm < 100 || rmm > 6000) continue;
+    const arad = acd * Math.PI / 18000;
+    const lx   = rmm * Math.cos(arad);
+    const ly   = rmm * Math.sin(arad);
+    scanAccum.push({
+      wx: px.x + lx * cosT - ly * sinT,
+      wy: px.y + lx * sinT + ly * cosT,
+    });
+  }
+  // circular buffer: drop oldest when full
+  if (scanAccum.length > SCAN_MAX_ACCUM)
+    scanAccum.splice(0, scanAccum.length - SCAN_MAX_ACCUM);
+
+  nScan++;
+  document.getElementById('sScan').textContent = nScan;
+}
+
+function handlePose(buf) {
+  const v     = new DataView(buf);
+  // byte 0 = type
+  const x     = v.getFloat32(1,  true);
+  const y     = v.getFloat32(5,  true);
+  const theta = v.getFloat32(9,  true);
+  const fx    = v.getFloat32(13, true);
+  const fy    = v.getFloat32(17, true);
+  const hf    = v.getUint8(21) !== 0;
+  const ts    = performance.now();
+
+  lastPose = { x, y, theta, ts };
+  poseRing.push(lastPose);
+  if (poseRing.length > 4) poseRing.shift();
+
+  // Path trail
+  const last = trailPts[trailPts.length - 1];
+  if (!last || Math.hypot(x - last.x, y - last.y) >= TRAIL_STEP_MM) {
+    trailPts.push({ x, y });
+    if (trailPts.length > TRAIL_MAX) trailPts.shift();
+  }
+
+  lastFront = { fx, fy, has: hf };
+
+  // Update telemetry panel
+  document.getElementById('tX').textContent     = x.toFixed(0) + ' mm';
+  document.getElementById('tY').textContent     = y.toFixed(0) + ' mm';
+  document.getElementById('tTheta').textContent = (theta * 180 / Math.PI).toFixed(1) + '°';
+  if (hf) {
+    document.getElementById('tHF').textContent  = 'YES';
+    document.getElementById('tHF').style.color  = 'var(--green)';
+    document.getElementById('tFX').textContent  = fx.toFixed(0) + ' mm';
+    document.getElementById('tFY').textContent  = fy.toFixed(0) + ' mm';
+  } else {
+    document.getElementById('tHF').textContent  = 'no';
+    document.getElementById('tHF').style.color  = 'var(--muted)';
+    document.getElementById('tFX').textContent  = '—';
+    document.getElementById('tFY').textContent  = '—';
+  }
+
+  nPose++;
+  document.getElementById('sPose').textContent = nPose;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * handleQuadtree — parse type-0x05 frame into qtNodes[]
+ * Frame: [type:u8][count:u16][{x_min:u16,y_min:u16,size:u16,depth:u8,val:i8}×N]
+ * ════════════════════════════════════════════════════════════════════════════ */
+function handleQuadtree(buf) {
+  const v     = new DataView(buf);
+  const count = v.getUint16(1, true);
+  const nodes = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const off = 3 + i * 8;
+    nodes[i] = {
+      xMin:  v.getUint16(off,     true),
+      yMin:  v.getUint16(off + 2, true),
+      size:  v.getUint16(off + 4, true),
+      depth: v.getUint8 (off + 6),
+      value: v.getInt8  (off + 7),
+    };
+  }
+  qtNodes = nodes;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Pose interpolation (renders at now - RENDER_LAG_MS for smoothness)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function getInterpolatedPose(now) {
+  if (!poseRing.length) return null;
+  const renderT = now - RENDER_LAG_MS;
+
+  // Find the two frames that bracket renderT
+  for (let i = poseRing.length - 1; i >= 1; i--) {
+    const b = poseRing[i], a = poseRing[i - 1];
+    if (a.ts <= renderT && renderT <= b.ts) {
+      const dt = b.ts - a.ts;
+      const t  = dt > 0 ? (renderT - a.ts) / dt : 1;
+      // Wrap angle difference to [-π, π]
+      let dth = b.theta - a.theta;
+      dth = ((dth % (2 * Math.PI)) + 3 * Math.PI) % (2 * Math.PI) - Math.PI;
+      return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, theta: a.theta + dth * t };
+    }
+  }
+  return poseRing[poseRing.length - 1];
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Quadtree wireframe overlay
+ *
+ * Renders a recursive grid where each box is one quadtree node.
+ * Visual encoding:
+ *   depth 1-2  thick  #666  — coarse root division
+ *   depth 3-4  medium #999  — mid-level subdivisions
+ *   depth 5-6  thin   #bbb  — fine-grained splits
+ *   depth 7    hairline #fff — leaf cells (highest resolution)
+ *
+ * Fill:
+ *   value < 0 (free)     — faint blue tint
+ *   value > 0 (occupied) — faint red tint
+ *   value = 0 (unknown)  — no fill (already visible as orange in bitmap)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function drawQuadtreeOverlay() {
+  if (!qtNodes || !mapState) return;
+  const ppm = BASE_PX * cam.zoom / mapState.cellMm;  // pixels per mm
+
+  for (const nd of qtNodes) {
+    // Top-left canvas corner: world point (xMin, yMin+size)
+    const [sx, sy] = w2c(nd.xMin, nd.yMin + nd.size);
+    const spx = nd.size * ppm;
+    if (spx < 0.5) continue;   // too small to see — skip
+
+    // Occupancy fill (subtle tint on top of the bitmap)
+    if (nd.value < 0) {
+      ctx.fillStyle = 'rgba(100,180,255,0.12)';
+      ctx.fillRect(sx, sy, spx, spx);
+    } else if (nd.value > 0) {
+      ctx.fillStyle = 'rgba(255,80,80,0.20)';
+      ctx.fillRect(sx, sy, spx, spx);
+    }
+
+    // Depth-encoded wireframe
+    const d = nd.depth;
+    if      (d <= 2) { ctx.strokeStyle = 'rgba(100,100,100,0.90)'; ctx.lineWidth = 2.0; }
+    else if (d <= 4) { ctx.strokeStyle = 'rgba(153,153,153,0.75)'; ctx.lineWidth = 1.0; }
+    else if (d <= 6) { ctx.strokeStyle = 'rgba(187,187,187,0.55)'; ctx.lineWidth = 0.5; }
+    else             { ctx.strokeStyle = 'rgba(255,255,255,0.40)'; ctx.lineWidth = 0.3; }
+    ctx.strokeRect(sx, sy, spx, spx);
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Robot drawing (RC car top-view)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function drawRobot(cx, cy, theta) {
+  const ppm = BASE_PX * cam.zoom / mapState.cellMm;  // pixels per mm
+  const bL  = 300 * ppm;   // 300 mm body length
+  const bW  = 180 * ppm;   // 180 mm body width
+  const wL  =  60 * ppm;   //  60 mm wheel length
+  const wW  =  30 * ppm;   //  30 mm wheel width
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(-theta);   // canvas Y is down, world Y is up → negate
+
+  // Glow
+  ctx.shadowColor = '#4361ee88';
+  ctx.shadowBlur  = 10;
+
+  // Body
+  ctx.fillStyle   = '#4361ee';
+  ctx.strokeStyle = '#ffffff55';
+  ctx.lineWidth   = 1;
+  ctx.fillRect(-bL / 2, -bW / 2, bL, bW);
+  ctx.strokeRect(-bL / 2, -bW / 2, bL, bW);
+
+  // Front heading stripe
+  ctx.shadowBlur  = 0;
+  ctx.fillStyle   = '#00d4ff';
+  ctx.fillRect(bL / 2 - bL * 0.2, -bW / 2, bL * 0.2, bW);
+
+  // Wheels
+  ctx.fillStyle = '#111';
+  const wox = bL / 2 - wL * 0.55;
+  const woy = bW / 2;
+  ctx.fillRect( wox - wL / 2,  woy,       wL, wW);
+  ctx.fillRect( wox - wL / 2, -woy - wW,  wL, wW);
+  ctx.fillRect(-wox - wL / 2,  woy,       wL, wW);
+  ctx.fillRect(-wox - wL / 2, -woy - wW,  wL, wW);
+
+  ctx.restore();
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Render loop — 60 fps via requestAnimationFrame
+ * ════════════════════════════════════════════════════════════════════════════ */
+function render(now) {
+  requestAnimationFrame(render);
+
+  // FPS counter
+  fpsCnt++;
+  if (now - fpsLast >= 1000) {
+    fpsVal = fpsCnt; fpsCnt = 0; fpsLast = now;
+    document.getElementById('hudFps').textContent = fpsVal;
+  }
+
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (!mapState) {
+    ctx.fillStyle = '#555';
+    ctx.font = '13px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText('Connect and start exploration to see the map', W / 2, H / 2);
+    ctx.textAlign = 'left';
+    return;
+  }
+
+  const { gw, gh, cellMm, bitmap } = mapState;
+  const mW = gw * BASE_PX * cam.zoom;
+  const mH = gh * BASE_PX * cam.zoom;
+
+  /* ── 1. Map bitmap (GPU-cached, only rebuilt on new 0x01 frame) ── */
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(bitmap, cam.tx, cam.ty, mW, mH);
+
+  /* ── 1b. Quadtree wireframe overlay ── */
+  if (document.getElementById('chkQT').checked) drawQuadtreeOverlay();
+
+  /* ── 2. Path trail (cyan) ── */
+  if (document.getElementById('chkTrail').checked && trailPts.length > 1) {
+    ctx.strokeStyle = '#00ffff99';
+    ctx.lineWidth   = Math.max(1, cam.zoom * 0.35);
     ctx.beginPath();
-    ctx.arc(fx, fy, Math.max(5, scale * 0.7), 0, Math.PI * 2);
+    const [sx, sy] = w2c(trailPts[0].x, trailPts[0].y);
+    ctx.moveTo(sx, sy);
+    for (let i = 1; i < trailPts.length; i++) {
+      const [tx, ty] = w2c(trailPts[i].x, trailPts[i].y);
+      ctx.lineTo(tx, ty);
+    }
+    ctx.stroke();
+  }
+
+  /* ── 3. LiDAR scan overlay (persistent amber dots) ── */
+  if (document.getElementById('chkScan').checked && scanAccum.length > 0) {
+    ctx.fillStyle = 'rgba(251,191,36,0.75)';
+    const dotR = Math.max(1.0, cam.zoom * 0.18);
+    for (const pt of scanAccum) {
+      const [px, py] = w2c(pt.wx, pt.wy);
+      ctx.beginPath();
+      ctx.arc(px, py, dotR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  /* ── 4. Frontier target (orange dot + dashed line from robot) ── */
+  const pose = getInterpolatedPose(now);
+  if (lastFront?.has && pose) {
+    const [fx, fy] = w2c(lastFront.fx, lastFront.fy);
+    const [rx, ry] = w2c(pose.x, pose.y);
+    const dotR = Math.max(5, cam.zoom * 0.8);
+
+    ctx.fillStyle = '#f4a261';
+    ctx.beginPath();
+    ctx.arc(fx, fy, dotR, 0, Math.PI * 2);
     ctx.fill();
 
-    ctx.strokeStyle = '#00ffff88';
-    ctx.lineWidth   = 2;
+    ctx.strokeStyle = '#f4a26188';
+    ctx.lineWidth   = 1.5;
     ctx.setLineDash([6, 4]);
     ctx.beginPath();
-    ctx.moveTo(cx, cy);
+    ctx.moveTo(rx, ry);
     ctx.lineTo(fx, fy);
     ctx.stroke();
     ctx.setLineDash([]);
   }
 
-  /* ── Robot: box + wheels sized relative to map (like a real RC car) ──────
-   * Car body ≈ 400 mm × 240 mm in world space.
-   * cellMm converts mm → cells; scale converts cells → px.
-   * Canvas Y is inverted vs world Y, so we rotate by -theta.               */
-  const pxPerMm = scale / cellMm;
-  const bL = 400 * pxPerMm;   /* body length px */
-  const bW = 240 * pxPerMm;   /* body width  px */
-  const wL =  90 * pxPerMm;   /* wheel length px */
-  const wW =  40 * pxPerMm;   /* wheel width  px */
+  /* ── 5. Robot ── */
+  if (pose) {
+    const [rx, ry] = w2c(pose.x, pose.y);
+    drawRobot(rx, ry, pose.theta);
 
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(-carState.theta);   /* canvas +Y is down, world +Y is up */
+    // Follow mode: re-centre when robot gets within 20% of edge
+    if (document.getElementById('chkFollow').checked) {
+      const margin = 0.2;
+      const rl = margin * W, rr = (1 - margin) * W;
+      const rt = margin * H, rb = (1 - margin) * H;
+      if (rx < rl || rx > rr || ry < rt || ry > rb) {
+        const { cellMm: cm, gh: ggh, xMin: xmn, yMin: ymn } = mapState;
+        cam.tx = W / 2 - ((pose.x - xmn) / cm) * BASE_PX * cam.zoom;
+        cam.ty = H / 2 - (ggh - (pose.y - ymn) / cm) * BASE_PX * cam.zoom;
+      }
+    }
+  }
 
-  /* Body */
-  ctx.fillStyle   = '#4361ee';
-  ctx.strokeStyle = '#ffffff';
-  ctx.lineWidth   = Math.max(1, pxPerMm * 10);
-  ctx.fillRect  (-bL / 2, -bW / 2, bL, bW);
-  ctx.strokeRect(-bL / 2, -bW / 2, bL, bW);
+  /* ── HUD ── */
+  const ageS = mapState ? ((performance.now() - mapState.ts) / 1000).toFixed(1) + 's' : '—';
+  document.getElementById('hudZoom').textContent  = cam.zoom.toFixed(1) + '×';
+  document.getElementById('hudMapAge').textContent = ageS;
+  if (latency !== null)
+    document.getElementById('sLat').textContent = latency + ' ms';
+}
+requestAnimationFrame(render);
 
-  /* Front stripe (shows heading direction) */
-  ctx.fillStyle = '#00d4ff';
-  ctx.fillRect(bL / 2 - bL * 0.18, -bW / 2, bL * 0.18, bW);
+/* ════════════════════════════════════════════════════════════════════════════
+ * Pan / Zoom
+ * ════════════════════════════════════════════════════════════════════════════ */
+wrap.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const f    = e.deltaY < 0 ? 1.12 : 0.89;
+  const rect = wrap.getBoundingClientRect();
+  const mx   = e.clientX - rect.left;
+  const my   = e.clientY - rect.top;
+  cam.tx   = mx - (mx - cam.tx) * f;
+  cam.ty   = my - (my - cam.ty) * f;
+  cam.zoom = Math.max(0.5, Math.min(24, cam.zoom * f));
+}, { passive: false });
 
-  /* Wheels — 4 corners, black rectangles */
-  ctx.fillStyle = '#111';
-  const wX = bL / 2 - wL * 0.5;   /* wheel x offset from centre */
-  const wY = bW / 2;               /* wheel y offset from centre */
-  /* front-right */  ctx.fillRect( wX - wL / 2,  wY,       wL, wW);
-  /* front-left  */  ctx.fillRect( wX - wL / 2, -wY - wW,  wL, wW);
-  /* rear-right  */  ctx.fillRect(-wX - wL / 2,  wY,       wL, wW);
-  /* rear-left   */  ctx.fillRect(-wX - wL / 2, -wY - wW,  wL, wW);
+wrap.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  drag = { sx: e.clientX, sy: e.clientY, tx: cam.tx, ty: cam.ty };
+  wrap.classList.add('dragging');
+  document.getElementById('chkFollow').checked = false;
+});
+window.addEventListener('mousemove', (e) => {
+  if (!drag) return;
+  cam.tx = drag.tx + (e.clientX - drag.sx);
+  cam.ty = drag.ty + (e.clientY - drag.sy);
+});
+window.addEventListener('mouseup', () => { drag = null; wrap.classList.remove('dragging'); });
 
-  ctx.restore();
+function fitView() {
+  if (!mapState) return;
+  const W = canvas.width, H = canvas.height;
+  cam.zoom = Math.max(1, Math.min(10, Math.min(W / mapState.gw, H / mapState.gh) / BASE_PX * 0.9));
+  cam.tx   = (W - mapState.gw * BASE_PX * cam.zoom) / 2;
+  cam.ty   = (H - mapState.gh * BASE_PX * cam.zoom) / 2;
 }
 
-/* ─── WebSocket ─────────────────────────────────────────────────────────── */
-let ws = null, frames = 0;
+function resetView() {
+  if (mapState) fitView(); else { cam.zoom = 6; cam.tx = 0; cam.ty = 0; }
+}
 
+/* ════════════════════════════════════════════════════════════════════════════
+ * WebSocket
+ * ════════════════════════════════════════════════════════════════════════════ */
 function setStatus(msg, dotCls) {
   document.getElementById('statusTxt').textContent = msg;
   document.getElementById('dot').className = 'dot ' + (dotCls || '');
 }
 
 function log(txt, cls) {
-  const box  = document.getElementById('logBox');
-  const line = document.createElement('div');
-  if (cls) line.className = cls;
-  line.textContent = `[${new Date().toLocaleTimeString('en-GB',{hour12:false})}] ${txt}`;
-  box.appendChild(line);
+  const box = document.getElementById('logBox');
+  const div = document.createElement('div');
+  if (cls) div.className = cls;
+  const t = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  div.textContent = `[${t}] ${txt}`;
+  box.appendChild(div);
   box.scrollTop = box.scrollHeight;
   while (box.children.length > 200) box.removeChild(box.firstChild);
 }
 
-function clearLog() {
-  document.getElementById('logBox').innerHTML = '';
-  frames = 0;
-  document.getElementById('tFrames').textContent = '0';
-}
+function clearLog() { document.getElementById('logBox').innerHTML = ''; }
 
-function connectWS() {
+function wsConnect() {
+  clearTimeout(wsRetryTimer);
+  /* Close any in-progress or open connection before creating a new one.
+     Without this, the retry timer can fire while CONNECTING, producing two
+     simultaneous sockets — the server does LRU purge and drops both. */
+  if (ws) {
+    ws.onopen = null; ws.onclose = null; ws.onerror = null; ws.onmessage = null;
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)
+      ws.close();
+    ws = null;
+  }
   const ip = document.getElementById('ipInput').value.trim();
   if (!ip) return;
-  setStatus(`Connecting to ${ip}…`, 'orange');
-  log(`Connecting to ws://${ip}/ws …`, 'w');
+  setStatus('Connecting…', 'orange');
+  log('Connecting to ' + ip + ' …', 'w');
 
   ws = new WebSocket(`ws://${ip}/ws`);
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = () => {
     setStatus('Connected', 'green');
-    log(`Connected`, 'ok');
+    log('Connected', 'ok');
     document.getElementById('btnConnect').disabled    = true;
     document.getElementById('btnDisconnect').disabled = false;
     document.getElementById('btnStart').disabled      = false;
     document.getElementById('btnStop').disabled       = true;
+    schedulePing();
   };
 
   ws.onclose = () => {
-    setStatus('Disconnected — retrying…', '');
-    log('Disconnected — retry in 3 s', 'e');
+    setStatus('Disconnected', 'red');
+    log('Connection lost — retry in 3 s', 'e');
     document.getElementById('btnConnect').disabled    = false;
     document.getElementById('btnDisconnect').disabled = true;
     document.getElementById('btnStart').disabled      = true;
     document.getElementById('btnStop').disabled       = true;
     ws = null;
-    setTimeout(() => { if (!ws) connectWS(); }, 3000);
+    wsRetryTimer = setTimeout(wsConnect, 3000);
   };
 
   ws.onerror = () => log('WebSocket error', 'e');
 
   ws.onmessage = (evt) => {
-    /* Binary frame = full occupancy grid */
-    if (evt.data instanceof ArrayBuffer) {
-      const v  = new DataView(evt.data);
-      const gw = v.getUint16(0, true);
-      const gh = v.getUint16(2, true);
-      const mm = v.getFloat32(4, true);
-      if (gw > 0 && gh > 0 && mm > 0) {
-        liveGrid = { gw, gh, cellMm: mm, cells: new Uint8Array(evt.data, 8) };
-        draw();
-        document.getElementById('tFrames').textContent = ++frames;
+    if (typeof evt.data === 'string') {
+      if (evt.data === 'pong') {
+        latency = Math.round(performance.now() - pingTs);
+        return;
       }
+      log(evt.data, 'ok');   // firmware log line
       return;
     }
 
-    /* Text frame = pose + frontier JSON */
-    let d;
-    try { d = JSON.parse(evt.data); } catch(e) { return; }
-    carState = d;
-
-    document.getElementById('tX').textContent     = d.x.toFixed(0);
-    document.getElementById('tY').textContent     = d.y.toFixed(0);
-    document.getElementById('tTheta').textContent = (d.theta * 180 / Math.PI).toFixed(1);
-
-    if (d.has_frontier) {
-      document.getElementById('tFX').textContent  = d.fx.toFixed(0);
-      document.getElementById('tFY').textContent  = d.fy.toFixed(0);
-      document.getElementById('tHF').textContent  = 'YES';
-      document.getElementById('tHF').style.color  = '#52b788';
-      const dist = Math.hypot(d.fx - d.x, d.fy - d.y);
-      log(`→ frontier (${d.fx.toFixed(0)}, ${d.fy.toFixed(0)}) mm  dist=${dist.toFixed(0)} mm`);
-    } else {
-      document.getElementById('tFX').textContent  = '—';
-      document.getElementById('tFY').textContent  = '—';
-      document.getElementById('tHF').textContent  = 'no';
-      document.getElementById('tHF').style.color  = '#888';
-    }
-
-    draw();
+    // Binary — dispatch by type byte
+    const type = new Uint8Array(evt.data, 0, 1)[0];
+    if      (type === MSG_MAP)       handleMap(evt.data);
+    else if (type === MSG_MAP_DELTA) handleMapDelta(evt.data);
+    else if (type === MSG_SCAN)      handleScan(evt.data);
+    else if (type === MSG_POSE)      handlePose(evt.data);
+    else if (type === MSG_QUADTREE)  handleQuadtree(evt.data);
   };
 }
 
-function disconnectWS() {
-  if (!ws) return;
-  ws.onclose = null;
-  ws.close();
-  ws = null;
+function wsDisconnect() {
+  clearTimeout(wsRetryTimer);
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
   setStatus('Disconnected', '');
+  document.getElementById('btnConnect').disabled    = false;
+  document.getElementById('btnDisconnect').disabled = true;
+  document.getElementById('btnStart').disabled      = true;
+  document.getElementById('btnStop').disabled       = true;
 }
 
 function sendCmd(cmd) {
@@ -371,7 +820,7 @@ function sendCmd(cmd) {
   if (cmd === 'start') {
     document.getElementById('btnStart').disabled = true;
     document.getElementById('btnStop').disabled  = false;
-    log('Start sent — exploring', 'ok');
+    log('Exploration started', 'ok');
   } else {
     document.getElementById('btnStop').disabled  = true;
     document.getElementById('btnStart').disabled = false;
@@ -379,11 +828,12 @@ function sendCmd(cmd) {
   }
 }
 
-document.getElementById('zoomSlider').addEventListener('input', function() {
-  scale = parseInt(this.value);
-  document.getElementById('zoomVal').textContent = scale;
-  draw();
-});
+function schedulePing() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  pingTs = performance.now();
+  ws.send('ping');
+  setTimeout(schedulePing, 2000);
+}
 </script>
 </body>
 </html>

@@ -30,7 +30,7 @@ void quadtree_map_insert(quadtree_map_t *map,
 /* ── Query: int8 log-odds → uint8 occupancy ────────────────────────────────── */
 uint8_t quadtree_map_query(const quadtree_map_t *map, float x, float y)
 {
-    int8_t v = qt_query((quadtree_map_t *)(uintptr_t)map, x, y);
+    int8_t v = qt_query_const(map, x, y);
     if (v < 0)  return 20u;    /* free */
     if (v > 0)  return 230u;   /* occupied / wall */
     return 128u;               /* unknown */

@@ -14,10 +14,22 @@
 
 
 
-#define QT_MAX_DEPTH 6
+#define QT_MAX_DEPTH 7   /* depth 7 → 2^6=64 splits/axis → 156 mm leaf cells on 10 m map */
 
-// complete quadtree to depth 6 needs at most 5 461 nodes -> 6 000 gives a comfortable safety marginƒ
-#define QT_POOL_SIZE 6000
+// Node pool size (each QTNode ≈ 12 bytes after alignment).
+// Depth 7: worst-case full tree needs ~5461 nodes (4096 leaves + internal).
+// Wemos (ESP32): 6000 nodes ≈ 72 KB — enough headroom for depth 7 in a real room
+//   (a 10 m × 10 m room scanned from one position uses far fewer than 4096 leaves).
+//   ESP32 has ~300 KB DRAM available after WiFi; 72 KB is comfortably within that.
+// ESP32-S3: more DRAM → 8000 nodes gives comfortable headroom for depth 7.
+// If WiFi init fails on S3, try build_flags = -DQT_POOL_SIZE=5000
+#ifndef QT_POOL_SIZE
+#  ifdef CONFIG_IDF_TARGET_ESP32S3
+#    define QT_POOL_SIZE 8000
+#  else
+#    define QT_POOL_SIZE 6000
+#  endif
+#endif
 #define QT_NULL 0 // no child index 
 
 // Log-odds increments 

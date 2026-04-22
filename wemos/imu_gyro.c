@@ -38,7 +38,7 @@
 #define GYRO_SENS       131.0f
 
 /* ── Bias from SLAMurai calibration (rad/s) ─────────────────────────────── */
-#define GYRO_BIAS_Z     0.00858f
+#define GYRO_BIAS_Z     0.00635f
 
 /* ── Integration poll interval ──────────────────────────────────────────── */
 #define POLL_MS         10u    /* 100 Hz */
@@ -88,10 +88,37 @@ bool imu_gyro_init(void)
         .scl_io_num       = IMU_SCL_PIN,
         .sda_pullup_en    = GPIO_PULLUP_ENABLE,
         .scl_pullup_en    = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 400000,
+        /* I2C clock speed: 400 kHz failed silently on the Wemos (WHO_AM_I
+         * returned 0x00, I2C scan found nothing) even though multimeter
+         * confirmed all four wires were continuous.  Root cause: the soldered
+         * wire runs are long enough that 400 kHz edge times violate the I2C
+         * spec — the ESP-IDF driver returns ESP_OK but the ACK never arrives,
+         * leaving the read buffer zeroed.  Diagnosed by adding return-value
+         * logging to i2c_param_config / i2c_driver_install (both 0x0 = OK),
+         * which ruled out a driver init failure and pointed to a signal-
+         * integrity problem.  Fixed by dropping to 100 kHz standard mode,
+         * which passes comfortably on the same wires (scan finds 0x68,
+         * WHO_AM_I = 0xEA). */
+        .master.clk_speed = 100000,
     };
-    i2c_param_config(IMU_I2C_PORT, &cfg);
-    i2c_driver_install(IMU_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    esp_err_t r;
+    r = i2c_param_config(IMU_I2C_PORT, &cfg);
+    ESP_LOGI(TAG, "i2c_param_config: 0x%x", r);
+
+    r = i2c_driver_install(IMU_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    if (r == ESP_ERR_INVALID_STATE) {
+        /* Driver already installed (e.g. previous boot) — reinstall */
+        ESP_LOGW(TAG, "I2C driver already installed, reinstalling");
+        i2c_driver_delete(IMU_I2C_PORT);
+        r = i2c_driver_install(IMU_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    }
+    ESP_LOGI(TAG, "i2c_driver_install: 0x%x", r);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "I2C init failed — IMU unavailable");
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));   /* let bus settle after driver start */
 
     /* ── Wake up ICM-20948, auto-select clock ────────────────────────────── */
     imu_select_bank(0);
@@ -103,16 +130,6 @@ bool imu_gyro_init(void)
     imu_select_bank(2);
     imu_write(REG_GYRO_CFG1, 0x01);    /* FS_SEL=00 (250 DPS), DLPF on */
     imu_select_bank(0);
-
-    /* ── I2C bus scan — logs every responding address ───────────────────── */
-    ESP_LOGI(TAG, "Scanning I2C bus...");
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        uint8_t dummy;
-        if (i2c_master_read_from_device(IMU_I2C_PORT, addr, &dummy, 1,
-                                         pdMS_TO_TICKS(IMU_TIMEOUT_MS)) == ESP_OK) {
-            ESP_LOGI(TAG, "  Found device at 0x%02X", addr);
-        }
-    }
 
     /* ── Verify WHO_AM_I ─────────────────────────────────────────────────── */
     uint8_t who = 0;

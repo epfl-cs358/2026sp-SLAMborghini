@@ -18,12 +18,10 @@ idf_component_register(
         "${S3_SRC}/frontier_detector.c"
         "${S3_SRC}/command_gen.c"
         "${S3_SRC}/wifi_dashboard.c"
-        "${S3_SRC}/test/test_room.c"
-        "${S3_SRC}/test/room_data.c"
-        "${S3_SRC}/test/simulate_lidar.c"
+        "${S3_SRC}/lidar_driver.c"
+        "${S3_SRC}/lidar_to_map.c"
     INCLUDE_DIRS
         "${WEMOS_ROOT}"
         "${S3_SRC}"
-        "${S3_SRC}/test"
         "${REPO_ROOT}"
 )

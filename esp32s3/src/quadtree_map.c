@@ -2,13 +2,17 @@
  * quadtree_map.c
  * Module: Quadtree occupancy map.
  * Board: ESP32-S3
- * Implementation phase: stub (tree allocation and traversal not yet implemented)
  */
 
 #include "quadtree_map.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(ESP_PLATFORM)
+#include "esp_log.h"
+static const char *TAG_QT = "quadtree_map";
+#endif
 
 
 // clamp an int to the log-odds range
@@ -71,8 +75,16 @@ void qt_init(QuadTreeMap *map,
              float x_min, float x_max,
              float y_min, float y_max)
 {
-    // pool[0] is the null sentinel - never used as a real node.
-    map->pool  = (QTNode *)calloc(QT_POOL_SIZE, sizeof(QTNode));
+    /* Allocate from heap after WiFi has already claimed DMA DRAM.
+     * Regular malloc on ESP32 falls back to D/IRAM (125 KB) when DMA DRAM
+     * is exhausted — keeping WiFi's DMA region intact. */
+    map->pool = (QTNode *)calloc(QT_POOL_SIZE, sizeof(QTNode));
+    if (!map->pool) {
+#if defined(ESP_PLATFORM)
+        ESP_LOGE(TAG_QT, "calloc(%u nodes) failed — map disabled", (unsigned)QT_POOL_SIZE);
+#endif
+        return;
+    }
     map->count = 1; // slot 0 is reserved as QT_NULL
 
     map->x_min = x_min;
@@ -109,7 +121,18 @@ static void _update(QuadTreeMap *map, uint16_t idx,
 
     if (n->children[q] == QT_NULL) {
         uint16_t child = _alloc(map, n->depth + 1);
-        if (child == QT_NULL) return;  // pool full — silently drop
+        if (child == QT_NULL) {
+#if defined(ESP_PLATFORM)
+            static bool s_pool_full_warned;
+            if (!s_pool_full_warned) {
+                s_pool_full_warned = true;
+                ESP_LOGW(TAG_QT,
+                         "node pool full (%u nodes); further qt_update calls are dropped",
+                         (unsigned)QT_POOL_SIZE);
+            }
+#endif
+            return;
+        }
         // Re-read n: _alloc may have changed pool pointer on realloc.
         // (Here pool is fixed size so pointer is stable, but good
         //  practice.)
@@ -151,6 +174,16 @@ static int8_t _query(const QuadTreeMap *map, uint16_t idx,
 }
 
 int8_t qt_query(QuadTreeMap *map, float x, float y)
+{
+    if (!map || !map->pool) return 0;
+    if (x < map->x_min || x >= map->x_max) return 0;
+    if (y < map->y_min || y >= map->y_max) return 0;
+    return _query(map, 1,
+                  map->x_min, map->x_max, map->y_min, map->y_max,
+                  x, y);
+}
+
+int8_t qt_query_const(const QuadTreeMap *map, float x, float y)
 {
     if (!map || !map->pool) return 0;
     if (x < map->x_min || x >= map->x_max) return 0;

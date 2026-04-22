@@ -1,37 +1,31 @@
 /**
-* lidar_driver.h
- * Module: LiDAR driver for RPLiDAR C1 over UART.
+ * lidar_to_map.h
+ * Bridge between raw LiDAR scan and the quadtree occupancy map.
  * Board: ESP32-S3
- * Handles UART initialization, scan acquisition, and motor control for the RPLiDAR C1.
  */
 
-#ifndef LIDAR_DRIVER_H
-#define LIDAR_DRIVER_H
+#ifndef LIDAR_TO_MAP_H
+#define LIDAR_TO_MAP_H
 
-#include <stdbool.h>
 #include "../../types.h"
-
-#ifdef USE_STUBS
-#include "../stubs/lidar_stub.h"
-#endif
+#include "quadtree_map.h"
 
 /**
- * Initialize the UART peripheral and start the RPLiDAR C1 motor and scan.
- * Must be called once before any calls to lidar_driver_read_scan().
+ * Integrate one LiDAR scan into the occupancy map via ray marching (mm units).
+ *
+ * For each beam: marks free cells along the ray (QT_MISS_DEC) then marks the
+ * endpoint as occupied (QT_HIT_INC).  All coordinates in mm; pose->theta in rad.
+ *
+ * @param map         Quadtree occupancy map to update.
+ * @param scan        Raw scan from lidar_driver_read_scan() — r_mm + theta_deg.
+ * @param pose        Robot pose at scan time (x,y in mm, theta in rad).
+ * @param max_range_mm Skip beams beyond this distance (mm).
+ * @param step_mm     Ray-march step size (mm); match to leaf-cell size for efficiency.
  */
-void lidar_driver_init(void);
+void lidar_to_map(quadtree_map_t     *map,
+                  const lidar_scan_t *scan,
+                  const pose_t       *pose,
+                  float               max_range_mm,
+                  float               step_mm);
 
-/**
- * Blocking read of one full 360-degree scan from the RPLiDAR C1.
- * @param out Pointer to a lidar_scan_t struct to populate with scan data.
- * @return true if a complete scan was successfully read, false on error or timeout.
- */
-bool lidar_driver_read_scan(lidar_scan_t *out);
-
-/**
- * Stop the RPLiDAR C1 motor and close the UART peripheral.
- * Should be called on shutdown or before entering deep sleep.
- */
-void lidar_driver_stop(void);
-
-#endif /* LIDAR_DRIVER_H */
+#endif /* LIDAR_TO_MAP_H */

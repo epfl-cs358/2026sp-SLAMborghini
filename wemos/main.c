@@ -1,112 +1,112 @@
 /**
  * wemos/main.c
- * Board: Wemos D1 R32 (ESP32) — temporary standalone SLAM brain + motor controller
+ * Board: Wemos D1 R32 (ESP32)  -  temporary standalone SLAM brain + motor controller
  *
  * Normal two-board architecture:
  *   ESP32-S3 (SLAM brain) ──UART──► Wemos D1 R32 (motor controller)
  *
  * This file collapses both roles onto the Wemos for use when the ESP32-S3 is
  * unavailable.  The SLAM modules from esp32s3/src/ are compiled in unchanged.
- * Motor control is wired directly here — no UART relay.
+ * Motor control is wired directly here  -  no UART relay.
  *
- * What changed vs the two-board setup:
- *   - uart_bridge_init() / uart_bridge_send_control() removed
- *   - drive_for_cmd() replaces uart_bridge_send_control()
- *   - Motor init / PWM identical to the original wemos/main.c
- *   - Everything else (frontier detection, WiFi, WebSocket, dead-reckoning)
- *     is identical to esp32s3/main.c
+ * Two-task architecture (solves synchronisation):
+ *   scan_task  (priority 5)  — reads LiDAR + updates map continuously,
+ *                              even while the robot is driving.
+ *   plan_task  (priority 3)  — frontier detection, dashboard push, drive.
  *
- * When the ESP32-S3 is back:
- *   Flash esp32s3/main.c → ESP32-S3  and  the original wemos/main.c → Wemos.
- *   No module files need to change.
+ * Shared state (s_map, s_pose) is protected by s_mtx:
+ *   scan_task  holds s_mtx only during lidar_to_map() — typically 5–15 ms.
+ *   plan_task  holds s_mtx only during frontier_detector_detect() + pose
+ *              update — releases it before drive_for_cmd() so scan_task
+ *              can continue updating the map while the car is moving.
  *
- * Adjust WIFI_SSID / WIFI_PASSWORD and motor GPIO pins before flashing.
+ * Hardware pin parity with 2025fa-SLAMurai Wemos (same wiring as SLAMurai):
+ *   Motor F/B   — GPIO 13 / 12, LEDC ch 3 / 2
+ *   Servo       — GPIO 23
+ *   LiDAR UART  — RX 17, TX 16, 460800 baud
+ *   IMU I2C     — SDA 21, SCL 22
  */
-
-/* ── Mode flag ──────────────────────────────────────────────────────────── */
-#define USE_FRONTIER_TARGET  1   /* quadtree_map.c is now a functional flat grid —
-                                  * frontier detection works, car drives toward
-                                  * the detected frontier each planning cycle.  */
 
 /* ── Wi-Fi credentials ──────────────────────────────────────────────────── */
 #define WIFI_SSID      "SPOT-iot"
 #define WIFI_PASSWORD  "RacailleSalutaireMigration8052"
 
-/* ── SLAM brain modules (from esp32s3/src/, compiled via platformio.ini) ── */
+/* ── SLAM brain modules (from esp32s3/src/, compiled via CMakeLists.txt) ── */
 #include "quadtree_map.h"
 #include "frontier_detector.h"
 #include "command_gen.h"
 #include "wifi_dashboard.h"
-#include "test/test_room.h"
-#include "test/room_data.h"
-#include "test/simulate_lidar.h"
+#include "lidar_driver.h"
+#include "lidar_to_map.h"
 #include "imu_gyro.h"
 
 /* ── ESP-IDF / FreeRTOS ─────────────────────────────────────────────────── */
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <stdio.h>
 #include <math.h>
 #include <stdbool.h>
+#include <string.h>
 
-/* ── Planning loop constants (must match esp32s3/main.c) ────────────────── */
+/* ── Map dimensions ──────────────────────────────────────────────────────── */
+#define MAP_SIZE_MM    10000.0f
+#define MAP_STEP_MM    50.0f
+#define START_X_MM     5000.0f
+#define START_Y_MM     5000.0f
+#define INIT_FREE_R_MM 500.0f
+
+/* ── Scan integration ────────────────────────────────────────────────────── */
+#define SCAN_MAX_MM   2000.0f
+#define SCAN_STEP_MM   150.0f   /* matches depth-7 leaf cell (~156 mm) */
+
+/* ── Planning loop constants ─────────────────────────────────────────────── */
 #define DEBUG_FORWARD_MM    200.0f
 #define DEBUG_SPEED_MM_S    100.0f
-#define MAX_DRIVE_MS        1200u   /* shorter burst → more frequent replanning */
-#define CYCLE_DELAY_MS      50      /* tighter loop = smoother motion           */
+#define MAX_DRIVE_MS        1200u
+#define CYCLE_DELAY_MS      50
 
-/* If heading error exceeds this, arc toward target before main drive.
- * π/4 = 45° — beyond that the servo saturates and the car barely curves. */
-#define TURN_ARC_THRESH_RAD  0.785f  /* π/4 */
-#define TURN_ARC_MS          800u    /* duration of pre-drive arc at max servo  */
+#define TURN_ARC_THRESH_RAD  0.785f   /* π/4 */
+#define TURN_ARC_MS          800u
 
 /* ════════════════════════════════════════════════════════════════════════════
- * Motor config — matches SLAMurai (2025fa-SLAMurai/code/firmware/wemos/
- *                include/motor_control/config.hpp) which this hardware reuses.
- * GPIO 13 = forward PWM  (MOTOR_F_PIN)
- * GPIO 12 = backward PWM (MOTOR_B_PIN)
- * LEDC channels 3 (forward) and 2 (backward) — same as SLAMurai.
+ * Motor config
  * ════════════════════════════════════════════════════════════════════════════ */
-#define MOTOR_F_PIN        13    /* forward  PWM — matches SLAMurai config.hpp */
-#define MOTOR_B_PIN        12    /* backward PWM — matches SLAMurai config.hpp */
-
+#define MOTOR_F_PIN        13
+#define MOTOR_B_PIN        12
 #define MOTOR_PWM_FREQ_HZ  1000
-#define MOTOR_PWM_RES      LEDC_TIMER_8_BIT   /* 0-255, matches PWM_RES = 8 */
-#define MOTOR_DUTY_FWD     25     /* matches MAX_MOTOR_PWM_SPEED = 25 in SLAMurai */
+#define MOTOR_PWM_RES      LEDC_TIMER_8_BIT
+#define MOTOR_DUTY_FWD     35
 #define MOTOR_DUTY_STOP    0
-
-#define CH_FWD   LEDC_CHANNEL_3   /* PWM_CHANNEL_F = 3 in SLAMurai */
-#define CH_BWD   LEDC_CHANNEL_2   /* PWM_CHANNEL_B = 2 in SLAMurai */
+#define MOTOR_SPEED_MM_S   346.0f
+#define CH_FWD   LEDC_CHANNEL_3
+#define CH_BWD   LEDC_CHANNEL_2
 
 /* ════════════════════════════════════════════════════════════════════════════
- * Servo config — copied from 2025fa-SLAMurai/code/firmware/wemos/include/
- *                servo_control/config.hpp and navigation/config.hpp
- *
- * GPIO 23, 50 Hz PWM, 16-bit LEDC.
- * Angles from SLAMurai: center=94°, max_left=64° (94-30), max_right=124° (94+30)
- * Conversion: pulse_us = 1000 + (angle/180)*1000 ; counts = pulse_us/20000*65536
- *   64°  → 1356 μs → 4442 counts  (max left)
- *   94°  → 1522 μs → 4987 counts  (center / straight)
- *  124°  → 1689 μs → 5533 counts  (max right)
- *
- * Steering gain: 546 counts / (30° = 0.524 rad) ≈ 1042 counts/rad
- * Tune SERVO_STEER_GAIN if the car under/over-steers.
+ * Servo config
  * ════════════════════════════════════════════════════════════════════════════ */
 #define SERVO_PIN          23
 #define SERVO_PWM_FREQ_HZ  50
 #define SERVO_PWM_RES      LEDC_TIMER_16_BIT
 #define SERVO_CH           LEDC_CHANNEL_0
-#define SERVO_DUTY_CENTER  4987u   /* 94°  — straight ahead */
-#define SERVO_DUTY_LEFT    4442u   /* 64°  — max left       */
-#define SERVO_DUTY_RIGHT   5533u   /* 124° — max right      */
-#define SERVO_STEER_GAIN   1042.0f /* counts/rad            */
+#define SERVO_DUTY_CENTER  4987u
+#define SERVO_DUTY_LEFT    4442u
+#define SERVO_DUTY_RIGHT   5533u
+#define SERVO_STEER_GAIN   1042.0f
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Shared state — protected by s_mtx
+ * ════════════════════════════════════════════════════════════════════════════ */
+static quadtree_map_t    s_map;
+static pose_t            s_pose;
+static SemaphoreHandle_t s_mtx;
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Motor helpers
  * ════════════════════════════════════════════════════════════════════════════ */
 static void motor_init(void)
 {
-    /* ── Motor timer (1 kHz, 8-bit) ── */
     ledc_timer_config_t timer = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .duty_resolution = MOTOR_PWM_RES,
@@ -124,7 +124,6 @@ static void motor_init(void)
     };
     for (int i = 0; i < 2; i++) ledc_channel_config(&ch[i]);
 
-    /* ── Servo timer (50 Hz, 16-bit) — separate timer so freq doesn't conflict ── */
     ledc_timer_config_t servo_timer = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .duty_resolution = SERVO_PWM_RES,
@@ -143,7 +142,6 @@ static void motor_init(void)
         .hpoint     = 0,
     };
     ledc_channel_config(&servo_ch);
-    /* Servo centres at init; no extra update needed */
 }
 
 static void set_duty(ledc_channel_t ch, uint32_t duty)
@@ -158,15 +156,12 @@ static void motors_stop(void)
     set_duty(CH_BWD, MOTOR_DUTY_STOP);
 }
 
+
 /* ════════════════════════════════════════════════════════════════════════════
- * drive_for_cmd
- * Steers toward cmd->t_heading then drives forward for the commanded distance.
- * current_heading is pose.theta at the moment the command is issued.
+ * drive_for_cmd — steers then drives; returns actual heading from gyro.
  * ════════════════════════════════════════════════════════════════════════════ */
-/* Returns actual heading after the drive (from gyro integration). */
 static float drive_for_cmd(const control_frame_t *cmd, float current_heading)
 {
-    /* ── Steering ────────────────────────────────────────────────────────── */
     float err = cmd->t_heading - current_heading;
     while (err >  (float)M_PI) err -= 2.0f * (float)M_PI;
     while (err < -(float)M_PI) err += 2.0f * (float)M_PI;
@@ -174,20 +169,27 @@ static float drive_for_cmd(const control_frame_t *cmd, float current_heading)
     int32_t duty = (int32_t)SERVO_DUTY_CENTER + (int32_t)(err * SERVO_STEER_GAIN);
     if (duty < (int32_t)SERVO_DUTY_LEFT)  duty = (int32_t)SERVO_DUTY_LEFT;
     if (duty > (int32_t)SERVO_DUTY_RIGHT) duty = (int32_t)SERVO_DUTY_RIGHT;
-
     set_duty(SERVO_CH, (uint32_t)duty);
-    vTaskDelay(pdMS_TO_TICKS(50));    /* short settle — servo reaches position quickly */
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     float actual_heading = current_heading;
 
-    /* ── Pre-drive arc: if error > 45°, arc at max deflection first ─────── */
     if (fabsf(err) > TURN_ARC_THRESH_RAD) {
+        char tbuf[64];
+        snprintf(tbuf, sizeof(tbuf), "Turning: err=%.1f° (%ums)",
+                 err * 180.0f / (float)M_PI, (unsigned)TURN_ARC_MS);
+        wifi_dashboard_log(tbuf);
+
         set_duty(CH_FWD, MOTOR_DUTY_FWD);
         set_duty(CH_BWD, MOTOR_DUTY_STOP);
         actual_heading = imu_drive_and_track(actual_heading, TURN_ARC_MS);
         motors_stop();
 
-        /* Recompute error and servo duty with updated heading */
+        snprintf(tbuf, sizeof(tbuf), "Turn done: heading=%.1f° stop=%d",
+                 actual_heading * 180.0f / (float)M_PI,
+                 (int)wifi_dashboard_stop_peek());
+        wifi_dashboard_log(tbuf);
+
         float err2 = cmd->t_heading - actual_heading;
         while (err2 >  (float)M_PI) err2 -= 2.0f * (float)M_PI;
         while (err2 < -(float)M_PI) err2 += 2.0f * (float)M_PI;
@@ -198,7 +200,6 @@ static float drive_for_cmd(const control_frame_t *cmd, float current_heading)
         vTaskDelay(pdMS_TO_TICKS(30));
     }
 
-    /* ── Main drive ─────────────────────────────────────────────────────── */
     float dist_mm = sqrtf(cmd->tx * cmd->tx + cmd->ty * cmd->ty);
     if (dist_mm < 50.0f) dist_mm = DEBUG_FORWARD_MM;
 
@@ -207,18 +208,32 @@ static float drive_for_cmd(const control_frame_t *cmd, float current_heading)
     if (drive_ms > MAX_DRIVE_MS) drive_ms = MAX_DRIVE_MS;
     if (drive_ms < 50)           drive_ms = 50;
 
+    {
+        char dbuf[64];
+        snprintf(dbuf, sizeof(dbuf), "Straight: dist=%.0fmm t=%ums",
+                 dist_mm, (unsigned)drive_ms);
+        wifi_dashboard_log(dbuf);
+    }
+
     set_duty(CH_FWD, MOTOR_DUTY_FWD);
     set_duty(CH_BWD, MOTOR_DUTY_STOP);
     actual_heading = imu_drive_and_track(actual_heading, drive_ms);
     motors_stop();
 
-    /* Keep servo pointed at target — don't re-centre between cycles */
+    {
+        char dbuf[64];
+        snprintf(dbuf, sizeof(dbuf), "Straight done: heading=%.1f° stop=%d",
+                 actual_heading * 180.0f / (float)M_PI,
+                 (int)wifi_dashboard_stop_peek());
+        wifi_dashboard_log(dbuf);
+    }
 
     return actual_heading;
 }
 
+
 /* ════════════════════════════════════════════════════════════════════════════
- * dead_reckon_pose  (identical to esp32s3/main.c)
+ * dead_reckon_pose
  * ════════════════════════════════════════════════════════════════════════════ */
 static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
 {
@@ -236,147 +251,218 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
     pose->theta = cmd->t_heading;
 }
 
+
 /* ════════════════════════════════════════════════════════════════════════════
- * app_main
+ * scan_task  (priority 5)
+ *
+ * Runs independently of the planning loop.  Reads the LiDAR continuously —
+ * including during drive_for_cmd() — so the UART FIFO never overflows and
+ * the map is always up-to-date when planning resumes.
+ *
+ * Mutex discipline:
+ *   Takes s_mtx to snapshot the pose (12 bytes, ~1 µs) then releases it.
+ *   Takes s_mtx again for the full lidar_to_map() call so that plan_task
+ *   cannot traverse the tree while new nodes are being allocated.
+ *   The hold time is bounded by lidar_to_map's 100 ms watchdog.
+ * ════════════════════════════════════════════════════════════════════════════ */
+static void scan_task(void *arg)
+{
+    (void)arg;
+    static lidar_scan_t scan;
+    TickType_t last_scan_broadcast = 0;
+
+    while (1) {
+        if (!lidar_driver_read_scan(&scan) || scan.count <= 10) continue;
+
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        pose_t local_pose = s_pose;
+        xSemaphoreGive(s_mtx);
+
+        xSemaphoreTake(s_mtx, portMAX_DELAY);
+        lidar_to_map(&s_map, &scan, &local_pose, SCAN_MAX_MM, SCAN_STEP_MM);
+        xSemaphoreGive(s_mtx);
+
+        /* Rate-limit scan broadcasts to 2 Hz — sending every scan floods the WS */
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_scan_broadcast) >= pdMS_TO_TICKS(500)) {
+            wifi_dashboard_broadcast_scan(&scan, &local_pose);
+            last_scan_broadcast = now;
+        }
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * plan_task  (priority 3)
+ *
+ * Handles frontier detection, dashboard map push, motor commands.
+ * Lower priority than scan_task so the map stays fresh during planning.
+ *
+ * Mutex discipline:
+ *   Takes s_mtx for frontier_detector_detect() (reads tree) + pose snapshot.
+ *   Releases s_mtx BEFORE drive_for_cmd() — drive blocks for up to 1200 ms,
+ *   during which scan_task continues updating the map unimpeded.
+ *   Takes s_mtx again after drive to write the updated pose back.
+ * ════════════════════════════════════════════════════════════════════════════ */
+static void plan_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {   /* outer loop: restart after stop or no-frontier */
+
+        /* ── Wait for browser Start button ───────────────────────────── */
+        printf("[SLAMborghini] Waiting for dashboard Start...\n");
+
+        int idle_tick = 0;
+        while (!wifi_dashboard_exploration_requested()) {
+            pose_t p;
+            xSemaphoreTake(s_mtx, portMAX_DELAY);
+            p = s_pose;
+            xSemaphoreGive(s_mtx);
+            wifi_dashboard_update(&s_map, &p);
+            wifi_dashboard_broadcast_state(&p, 0.0f, 0.0f, false, 0);
+            /* Repeat status every 5 s so a late-connecting browser sees it */
+            if (idle_tick % 25 == 0)
+                wifi_dashboard_log("IMU: ready | LIDAR: running | Waiting for Start...");
+            idle_tick++;
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        /* Drain any stop pressed while we were in the idle loop */
+        wifi_dashboard_stop_requested();
+        printf("[SLAMborghini] Exploration started.\n");
+
+        /* ── Exploration loop ─────────────────────────────────────────── */
+        int cycle = 0;
+        while (1) {
+            cycle++;
+            {
+                char cbuf[32];
+                snprintf(cbuf, sizeof(cbuf), "-- Cycle %d --", cycle);
+                wifi_dashboard_log(cbuf);
+            }
+
+            /* Emergency stop */
+            if (wifi_dashboard_stop_requested()) {
+                motors_stop();
+                wifi_dashboard_log("STOP requested — press Start to resume");
+                printf("[SLAMborghini] Stopped.\n");
+                break;
+            }
+
+            /* ── Read map + pose, run frontier detection ── */
+            pose_t local_pose;
+            frontier_list_t fronts;
+
+            xSemaphoreTake(s_mtx, portMAX_DELAY);
+            local_pose = s_pose;
+            fronts     = frontier_detector_detect(&s_map, &local_pose);
+            xSemaphoreGive(s_mtx);
+
+            /* ── Push map snapshot + quadtree structure to dashboard ── */
+            wifi_dashboard_update(&s_map, &local_pose);
+            wifi_dashboard_broadcast_quadtree(&s_map);
+
+            /* ── Choose frontier and broadcast state ── */
+            frontier_t best   = frontier_detector_best(&fronts, &local_pose);
+            bool has_frontier = (best.size > 0);
+            wifi_dashboard_broadcast_state(&local_pose,
+                                           best.cx, best.cy, has_frontier, 0);
+
+            if (!has_frontier) {
+                wifi_dashboard_log("No frontier — exploration complete");
+                printf("[SLAMborghini] No frontier — exploration complete.\n");
+                motors_stop();
+                break;
+            }
+
+            /* ── Compute command ── */
+            waypoint_t wp = {
+                .x        = best.cx,
+                .y        = best.cy,
+                .theta    = 0.0f,
+                .v_target = MOTOR_SPEED_MM_S,
+            };
+            control_frame_t cmd = command_gen_compute(&local_pose, &wp);
+            cmd.t_speed = MOTOR_SPEED_MM_S;
+
+            /* ── Log drive step ── */
+            {
+                char buf[80];
+                snprintf(buf, sizeof(buf), "Drive → (%.0f, %.0f) fronts=%u",
+                         best.cx, best.cy, (unsigned)fronts.count);
+                wifi_dashboard_log(buf);
+            }
+
+            /* ── Drive (mutex released — scan_task runs freely during this) ── */
+            float new_heading = drive_for_cmd(&cmd, local_pose.theta);
+
+            /* ── Update shared pose with gyro heading + dead-reckoned X/Y ── */
+            xSemaphoreTake(s_mtx, portMAX_DELAY);
+            dead_reckon_pose(&s_pose, &cmd);
+            s_pose.theta = new_heading;
+            pose_t updated_pose = s_pose;
+            xSemaphoreGive(s_mtx);
+
+            {
+                char pbuf[72];
+                snprintf(pbuf, sizeof(pbuf), "Pose: (%.0f, %.0f) θ=%.1f° stop=%d",
+                         updated_pose.x, updated_pose.y,
+                         updated_pose.theta * 180.0f / (float)M_PI,
+                         (int)wifi_dashboard_stop_peek());
+                wifi_dashboard_log(pbuf);
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(CYCLE_DELAY_MS));
+        }
+        /* loop back → wait for Start again */
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * app_main — hardware init, map init, task creation
  * ════════════════════════════════════════════════════════════════════════════ */
 void app_main(void)
 {
-    /* ── Motor + IMU init ───────────────────────────────────────────────── */
+    /* ── Hardware init ──────────────────────────────────────────────────── */
     motor_init();
     motors_stop();
-    vTaskDelay(pdMS_TO_TICKS(500));   /* let power rails settle */
-    bool imu_ok = imu_gyro_init();
-    /* peek (non-consuming) so the stop flag survives for the main loop check */
+    set_duty(SERVO_CH, SERVO_DUTY_CENTER);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    imu_gyro_init();
+    lidar_driver_init();
+
+    /* ── Map init ───────────────────────────────────────────────────────── */
+    quadtree_map_init(&s_map, MAP_SIZE_MM, MAP_SIZE_MM, MAP_STEP_MM);
+
+    s_pose = (pose_t){ .x = START_X_MM, .y = START_Y_MM, .theta = 0.0f };
+
+    /* Seed a free disk so the frontier detector has an initial boundary */
+    for (float ang = 0.0f; ang < 360.0f; ang += 5.0f) {
+        float rad = ang * ((float)M_PI / 180.0f);
+        for (float r = MAP_STEP_MM; r <= INIT_FREE_R_MM; r += MAP_STEP_MM) {
+            quadtree_map_insert(&s_map,
+                                s_pose.x + r * cosf(rad),
+                                s_pose.y + r * sinf(rad),
+                                CLASS_FREE);
+        }
+    }
+
+    /* ── Dashboard ──────────────────────────────────────────────────────── */
+    wifi_dashboard_init(WIFI_SSID, WIFI_PASSWORD);
+    wifi_dashboard_log("IMU: ready");
+    wifi_dashboard_log("LIDAR: started");
+    wifi_dashboard_log("Map: initialized");
     imu_gyro_set_stop_check(wifi_dashboard_stop_peek);
 
-    /* ── Two maps allocated BEFORE Wi-Fi so malloc claims heap first ────── */
-    /* truth_map: full room pre-loaded — ground truth for ray-casting         */
-    /* slam_map:  progressively revealed — shown on dashboard                 */
-    /* Each pool ≈ 60 KB; Wi-Fi needs ~80 KB; total fits in ~260 KB heap.    */
-    quadtree_map_t truth_map;
-    quadtree_map_t slam_map;
-    pose_t pose = {0};
+    /* ── Synchronisation primitive ──────────────────────────────────────── */
+    s_mtx = xSemaphoreCreateMutex();
 
-    build_test_room(&truth_map, &pose);
-    slam_map_init(&slam_map, &pose,
-                  ROOM_WIDTH_MM, ROOM_HEIGHT_MM,
-                  50.0f, BUILD_FREE_DISK_MM);
+    /* ── Launch tasks ───────────────────────────────────────────────────── */
+    /* scan_task: 4 KB stack (scan buffer is static, actual stack use is small) */
+    xTaskCreate(scan_task, "scan", 4096, NULL, 5, NULL);
+    /* plan_task: 8 KB stack (frontier_list_t + path on stack) */
+    xTaskCreate(plan_task, "plan", 8192, NULL, 3, NULL);
 
-    /* ── Wi-Fi + WebSocket dashboard ─────────────────────────────────────── */
-    wifi_dashboard_init(WIFI_SSID, WIFI_PASSWORD);
-
-    /* Initial scan so dashboard shows the first free disk immediately */
-    simulate_and_update_map(&truth_map, &slam_map, &pose, 180, 6000.0f, 50.0f);
-
-    /* ── Wait for browser to send "Start Exploration" ────────────────────── */
-    while (!wifi_dashboard_exploration_requested()) {
-        wifi_dashboard_broadcast_state(&pose, 0.0f, 0.0f, false, 0);
-        wifi_dashboard_update(&slam_map, &pose);
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-
-    /* ── Locked frontier state ───────────────────────────────────────────── */
-    /* The car commits to one frontier until it arrives or the frontier
-     * disappears from the map.  This stops the target from bouncing
-     * around every cycle and wasting all movement on re-steering. */
-#define FRONTIER_REACHED_MM   500.0f   /* close enough → pick next frontier  */
-#define FRONTIER_STALE_MM    1500.0f   /* locked target moved this far → re-pick */
-    float locked_fx = 0.0f, locked_fy = 0.0f;
-    bool  have_lock  = false;
-
-    /* ── Planning loop ───────────────────────────────────────────────────── */
-    while (1) {
-
-        /* Emergency stop — halt motors and wait for Start again */
-        if (wifi_dashboard_stop_requested()) {
-            motors_stop();
-            set_duty(SERVO_CH, SERVO_DUTY_CENTER);
-            have_lock = false;   /* re-pick frontier after resume */
-            while (!wifi_dashboard_exploration_requested()) {
-                wifi_dashboard_broadcast_state(&pose, 0.0f, 0.0f, false, 0);
-                vTaskDelay(pdMS_TO_TICKS(500));
-            }
-        }
-
-        frontier_list_t frontiers = frontier_detector_detect(&slam_map, &pose);
-
-        control_frame_t cmd = {0};
-        bool has_frontier   = false;
-        float fx = 0.0f, fy = 0.0f;
-
-#if USE_FRONTIER_TARGET
-        if (frontiers.count > 0) {
-            /* Check if the locked frontier is still valid */
-            if (have_lock) {
-                float dx = locked_fx - pose.x;
-                float dy = locked_fy - pose.y;
-                float dist = sqrtf(dx*dx + dy*dy);
-
-                /* Reached? — clear lock so we pick a fresh target below */
-                if (dist < FRONTIER_REACHED_MM) have_lock = false;
-
-                /* Still locked? — verify the frontier still exists in the list
-                 * (if all frontiers shifted far from the locked point, re-pick) */
-                if (have_lock) {
-                    bool still_exists = false;
-                    for (uint8_t i = 0; i < frontiers.count; i++) {
-                        float ex = frontiers.items[i].cx - locked_fx;
-                        float ey = frontiers.items[i].cy - locked_fy;
-                        if (sqrtf(ex*ex + ey*ey) < FRONTIER_STALE_MM) {
-                            still_exists = true;
-                            break;
-                        }
-                    }
-                    if (!still_exists) have_lock = false;
-                }
-            }
-
-            /* (Re-)pick a frontier if we don't have a valid lock */
-            if (!have_lock) {
-                frontier_t best = frontier_detector_best(&frontiers, &pose);
-                locked_fx = best.cx;
-                locked_fy = best.cy;
-                have_lock = true;
-            }
-
-            waypoint_t wp = { .x = locked_fx, .y = locked_fy };
-            cmd           = command_gen_compute(&pose, &wp);
-            has_frontier  = true;
-            fx            = locked_fx;
-            fy            = locked_fy;
-        } else {
-            have_lock = false;
-            /* No frontier — forward nudge so the car keeps moving */
-            cmd.tx        = 0.0f;
-            cmd.ty        = DEBUG_FORWARD_MM;
-            cmd.t_heading = pose.theta;
-            cmd.t_speed   = DEBUG_SPEED_MM_S;
-        }
-#else
-        (void)frontiers;
-        cmd.tx        = 0.0f;
-        cmd.ty        = DEBUG_FORWARD_MM;
-        cmd.t_heading = pose.theta;
-        cmd.t_speed   = DEBUG_SPEED_MM_S;
-#endif
-
-        /* Broadcast state to PC dashboard before driving */
-        wifi_dashboard_broadcast_state(&pose, fx, fy, has_frontier, 0);
-
-        /* Drive + integrate gyro → get actual heading */
-        float actual_heading = drive_for_cmd(&cmd, pose.theta);
-        /* Only trust gyro heading when IMU is present; otherwise keep the
-         * commanded heading so dead-reckoning moves toward the frontier. */
-        if (imu_ok) cmd.t_heading = actual_heading;
-
-        /* Update dead-reckoned pose using real (or commanded) heading */
-        dead_reckon_pose(&pose, &cmd);
-
-        /* Simulate LiDAR at new pose, update slam_map */
-        simulate_and_update_map(&truth_map, &slam_map, &pose, 180, 6000.0f, 50.0f);
-
-        wifi_dashboard_update(&slam_map, &pose);
-
-        vTaskDelay(pdMS_TO_TICKS(CYCLE_DELAY_MS));
-    }
+    /* app_main returns — FreeRTOS scheduler keeps the tasks running */
 }

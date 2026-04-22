@@ -1,0 +1,1210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SLAMborghini 2026 — Simulation</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:      #111; --surface: #1a1a2e; --border: #333;
+  --text:    #e0e0e0; --muted: #888;
+  --accent:  #00d4ff; --green: #52b788; --red: #e76f51; --orange: #f4a261; --cyan: #00ffff;
+}
+body { background:var(--bg); color:var(--text); font-family:'Courier New',monospace;
+       font-size:13px; height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+#toolbar { display:flex; align-items:center; gap:8px; padding:7px 12px;
+           background:var(--surface); border-bottom:1px solid var(--border);
+           flex-shrink:0; flex-wrap:wrap; }
+#toolbar label { color:var(--muted); font-size:11px; }
+#titleTxt { color:var(--accent); font-size:12px; letter-spacing:2px; margin-right:4px; }
+#simBadge { background:#1a2e1a; border:1px solid #2a5a2a; color:var(--green);
+            font-size:10px; padding:2px 8px; border-radius:10px; letter-spacing:1px; }
+select { background:var(--bg); border:1px solid var(--border); color:var(--text);
+         padding:3px 6px; border-radius:4px; font-family:inherit; font-size:12px; }
+button { background:var(--bg); border:1px solid var(--border); color:var(--muted);
+         padding:4px 10px; border-radius:4px; cursor:pointer; font-family:inherit; font-size:12px; }
+button:hover:not(:disabled) { border-color:var(--accent); color:var(--text); }
+button:disabled { opacity:.3; cursor:default; }
+#btnSimStart  { border-color:#1d3d2b; color:var(--green); }
+#btnSimPause  { border-color:#2e2e1d; color:var(--orange); }
+#btnSimReset  { border-color:#333; }
+.dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+       background:var(--muted); flex-shrink:0; }
+.dot.green  { background:var(--green);  box-shadow:0 0 5px var(--green); }
+.dot.orange { background:var(--orange); box-shadow:0 0 5px var(--orange);
+              animation:blink 1s ease-in-out infinite; }
+.dot.red    { background:var(--red);    box-shadow:0 0 5px var(--red); }
+@keyframes blink { 50% { opacity:.3; } }
+#statusTxt { font-size:11px; color:var(--muted); }
+#main { display:flex; flex:1; overflow:hidden; min-height:0; }
+#mapWrap { flex:1; position:relative; overflow:hidden; background:#0a0a0a;
+           cursor:grab; user-select:none; }
+#mapWrap.dragging { cursor:grabbing; }
+#mapCanvas { position:absolute; top:0; left:0; display:block; }
+#hud { position:absolute; bottom:8px; left:8px; background:rgba(17,17,17,.88);
+       border:1px solid var(--border); border-radius:4px; padding:5px 9px;
+       font-size:11px; color:var(--muted); line-height:1.9; pointer-events:none; }
+#hud span { color:var(--accent); }
+#panel { width:240px; flex-shrink:0; background:var(--surface);
+         border-left:1px solid var(--border); overflow-y:auto;
+         padding:10px; display:flex; flex-direction:column; gap:10px; }
+.sec-title { color:var(--accent); font-size:10px; letter-spacing:2px;
+             border-bottom:1px solid var(--border); padding-bottom:4px; margin-bottom:4px; }
+.row { display:flex; justify-content:space-between; color:var(--muted); margin:2px 0; font-size:12px; }
+.row span { color:var(--text); } .row .hi { color:var(--orange); }
+.leg { display:flex; align-items:center; gap:7px; margin:3px 0; font-size:11px; color:var(--muted); }
+.sw  { width:13px; height:13px; flex-shrink:0; border:1px solid #555; border-radius:2px; }
+.ck  { display:flex; align-items:center; gap:6px; margin:2px 0; }
+.ck label { color:var(--muted); font-size:11px; cursor:pointer; }
+input[type=checkbox] { accent-color:var(--accent); cursor:pointer; }
+.log { background:var(--bg); border:1px solid var(--border); border-radius:3px;
+       padding:6px; font-size:10px; line-height:1.8; max-height:170px;
+       overflow-y:auto; color:var(--muted); }
+.log .ok { color:var(--green); } .log .w { color:var(--orange); } .log .e { color:var(--red); }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <span id="titleTxt">SLAMBORGHINI 2026</span>
+  <span id="simBadge">SIMULATION</span>
+  <button id="btnSimStart" onclick="simStart()">▶ Start</button>
+  <button id="btnSimPause" onclick="simPause()" disabled>⏸ Pause</button>
+  <button id="btnSimReset" onclick="simReset()">↺ Reset</button>
+  <label>Speed</label>
+  <select id="simSpeed">
+    <option value="1">1×</option>
+    <option value="2">2×</option>
+    <option value="5" selected>5×</option>
+    <option value="10">10×</option>
+  </select>
+  <div style="margin-left:auto;display:flex;align-items:center;gap:7px">
+    <div class="dot" id="dot"></div>
+    <span id="statusTxt">Ready</span>
+  </div>
+</div>
+
+<div id="main">
+  <div id="mapWrap">
+    <canvas id="mapCanvas"></canvas>
+    <div id="hud">
+      Zoom <span id="hudZoom">—</span> &nbsp;|&nbsp;
+      Map  <span id="hudMapAge">—</span> &nbsp;|&nbsp;
+      FPS  <span id="hudFps">—</span>
+    </div>
+  </div>
+
+  <div id="panel">
+    <div>
+      <div class="sec-title">TELEMETRY</div>
+      <div class="row">X       <span id="tX">—</span></div>
+      <div class="row">Y       <span id="tY">—</span></div>
+      <div class="row">θ       <span id="tTheta">—</span></div>
+      <div class="row">Frontier <span id="tHF">—</span></div>
+      <div class="row">Target X <span class="hi" id="tFX">—</span></div>
+      <div class="row">Target Y <span class="hi" id="tFY">—</span></div>
+    </div>
+
+    <div>
+      <div class="sec-title">SIMULATION</div>
+      <div class="row">Sim time  <span id="sSimT">0.0 s</span></div>
+      <div class="row">Cycle     <span id="sSimCyc">0</span></div>
+      <div class="row">QT nodes  <span id="sSimNodes">0</span></div>
+      <div class="row">Map frames  <span id="sMap">0</span></div>
+      <div class="row">Scan frames <span id="sScan">0</span></div>
+      <div class="row">Pose frames <span id="sPose">0</span></div>
+    </div>
+
+    <div>
+      <div class="sec-title">LEGEND</div>
+      <div style="font-size:9px;color:var(--muted);margin-bottom:3px;letter-spacing:1px">QUADTREE CELLS</div>
+      <div class="leg"><div class="sw" style="background:#f4a261"></div>Unknown — large cell = coarse</div>
+      <div class="leg"><div class="sw" style="background:#a0c8ff"></div>Free (barely, value≈−6)</div>
+      <div class="leg"><div class="sw" style="background:#f0f8ff"></div>Free (confident, value=−40)</div>
+      <div class="leg"><div class="sw" style="background:#1a1a20"></div>Wall (confirmed obstacle)</div>
+      <div style="font-size:9px;color:var(--muted);margin:4px 0 3px;letter-spacing:1px">BFS FRONTIER DETECTION</div>
+      <div class="leg"><div class="sw" style="background:rgba(0,200,80,0.5)"></div>BFS wave (robot reachable)</div>
+      <div class="leg"><div class="sw" style="background:rgba(255,215,0,0.7)"></div>Frontier candidates</div>
+      <div style="font-size:9px;color:var(--muted);margin:4px 0 3px;letter-spacing:1px">OVERLAYS</div>
+      <div class="leg"><div class="sw" style="background:#fbbf24;border-radius:50%"></div>LiDAR scan</div>
+      <div class="leg"><div class="sw" style="background:#4361ee"></div>Robot</div>
+      <div class="leg"><div class="sw" style="background:#00ffff;border-radius:50%"></div>Path trail</div>
+      <div class="leg"><div class="sw" style="background:#f4a261;border-radius:50%"></div>Frontier target</div>
+    </div>
+
+    <div>
+      <div class="sec-title">VIEW</div>
+      <div class="ck"><input type="checkbox" id="chkFollow"  checked><label for="chkFollow">Follow robot</label></div>
+      <div class="ck"><input type="checkbox" id="chkScan"    checked><label for="chkScan">LiDAR scan</label></div>
+      <div class="ck"><input type="checkbox" id="chkTrail"   checked><label for="chkTrail">Path trail</label></div>
+      <div class="ck"><input type="checkbox" id="chkQTFill"  checked><label for="chkQTFill">QT cell fills (primary)</label></div>
+      <div class="ck"><input type="checkbox" id="chkQTWire"  checked><label for="chkQTWire">QT wireframe</label></div>
+      <div class="ck"><input type="checkbox" id="chkBFS"     checked><label for="chkBFS">BFS wave flash</label></div>
+      <div class="ck"><input type="checkbox" id="chkWalls"   checked><label for="chkWalls">Room walls</label></div>
+      <button onclick="resetView()" style="width:100%;margin-top:6px">Reset View</button>
+    </div>
+
+    <div>
+      <div class="sec-title">LOG</div>
+      <div class="log" id="logBox"></div>
+      <button onclick="clearLog()" style="width:100%;margin-top:4px;font-size:10px;padding:2px">Clear</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Firmware constants — must match wemos/main.c exactly
+ * ════════════════════════════════════════════════════════════════════════════ */
+const MAP_SIZE_MM    = 10000;
+const MAP_STEP_MM    = 50;
+const START_X_MM     = 5000;
+const START_Y_MM     = 5000;
+const INIT_FREE_R_MM = 500;
+const SCAN_MAX_MM    = 2000;
+const SCAN_STEP_MM   = 50;      // sim: 50 (firmware uses 150) — must be ≤ FD_RES for BFS connectivity
+const MOTOR_SPEED_MM_S = 346;
+const MAX_DRIVE_S    = 3.0;     // longer drive segments so the robot actually reaches frontiers
+
+/* Quadtree parameters — must match quadtree_map.h */
+const QT_HIT_INC   =  15;
+const QT_MISS_DEC  =  -6;
+const QT_VALUE_MAX =  40;
+const QT_VALUE_MIN = -40;
+const QT_MAX_DEPTH =   7;
+
+/* Dashboard grid sent in map frames — must match wifi_dashboard.c DASH_GW/GH */
+const DASH_GW      = 100;
+const DASH_GH      = 100;
+const DASH_CELL_MM = MAP_SIZE_MM / DASH_GW;   // 100 mm per dashboard cell
+
+/* Frontier detector grid resolution — must match frontier_detector.c MAX_GRID_W */
+const FD_RES       = MAP_SIZE_MM / 200;       // 50 mm per BFS cell
+const FD_MW        = 200;
+const FD_MH        = 200;
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Room geometry — walls as [[x0,y0],[x1,y1]] line segments (mm, world frame)
+ * Room: 7 m × 7 m centred in the 10 m map, two internal obstacles.
+ * ════════════════════════════════════════════════════════════════════════════ */
+const WALLS = [
+  /* Outer room */
+  [[1500,1500],[8500,1500]], [[8500,1500],[8500,8500]],
+  [[8500,8500],[1500,8500]], [[1500,8500],[1500,1500]],
+  /* Obstacle A — 1.5 m × 1.5 m block, lower-left quadrant */
+  [[3000,3500],[4500,3500]], [[4500,3500],[4500,5000]],
+  [[4500,5000],[3000,5000]], [[3000,5000],[3000,3500]],
+  /* Obstacle B — 1 m × 1 m column, upper-right quadrant */
+  [[6200,6200],[7200,6200]], [[7200,6200],[7200,7200]],
+  [[7200,7200],[6200,7200]], [[6200,7200],[6200,6200]],
+];
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * QTMap — JavaScript port of quadtree_map.c + quadtree_map_compat.c
+ *
+ * Exact quadrant convention (matches _quadrant in quadtree_map.c):
+ *   east  = x >= cx → 1 : 0
+ *   north = y >= cy → 1 : 0
+ *   q     = north ? east : (2 + east)
+ *   0=NW  1=NE  2=SW  3=SE
+ *
+ * Child bounds match _child_bounds in quadtree_map.c:
+ *   0(NW): xmn,cx,cy,ymx   1(NE): cx,xmx,cy,ymx
+ *   2(SW): xmn,cx,ymn,cy   3(SE): cx,xmx,ymn,cy
+ * ════════════════════════════════════════════════════════════════════════════ */
+class QTMap {
+  constructor(xMin, xMax, yMin, yMax) {
+    this.xMin = xMin; this.xMax = xMax;
+    this.yMin = yMin; this.yMax = yMax;
+    /* pool[0] = null sentinel (QT_NULL = 0)
+       pool[1] = root at depth 1             */
+    this.pool = [null, { v: 0, ch: [0,0,0,0], d: 1 }];
+  }
+
+  _alloc(depth) {
+    this.pool.push({ v: 0, ch: [0,0,0,0], d: depth });
+    return this.pool.length - 1;
+  }
+
+  nodeCount() { return this.pool.length - 2; }   // exclude sentinel + root? count root too
+  allocCount() { return this.pool.length - 1; }  // pool[1..] = all allocated nodes
+
+  _q(xmn, xmx, ymn, ymx, x, y) {
+    const cx = 0.5*(xmn+xmx), cy = 0.5*(ymn+ymx);
+    const east = x >= cx ? 1 : 0, north = y >= cy ? 1 : 0;
+    return north ? east : (2 + east);
+  }
+
+  _cb(xmn, xmx, ymn, ymx, q) {
+    const cx = 0.5*(xmn+xmx), cy = 0.5*(ymn+ymx);
+    switch(q) {
+      case 0: return [xmn,cx, cy, ymx];
+      case 1: return [cx, xmx,cy, ymx];
+      case 2: return [xmn,cx, ymn,cy ];
+      case 3: return [cx, xmx,ymn,cy ];
+    }
+  }
+
+  _update(idx, xmn, xmx, ymn, ymx, x, y, delta) {
+    const n = this.pool[idx];
+    if (n.d >= QT_MAX_DEPTH) {
+      n.v = Math.max(QT_VALUE_MIN, Math.min(QT_VALUE_MAX, n.v + delta));
+      return;
+    }
+    const q = this._q(xmn, xmx, ymn, ymx, x, y);
+    if (!n.ch[q]) n.ch[q] = this._alloc(n.d + 1);
+    const [cxmn,cxmx,cymn,cymx] = this._cb(xmn, xmx, ymn, ymx, q);
+    this._update(n.ch[q], cxmn, cxmx, cymn, cymx, x, y, delta);
+  }
+
+  update(x, y, delta) {
+    if (x < this.xMin || x >= this.xMax || y < this.yMin || y >= this.yMax) return;
+    this._update(1, this.xMin, this.xMax, this.yMin, this.yMax, x, y, delta);
+  }
+
+  _query(idx, xmn, xmx, ymn, ymx, x, y) {
+    if (!idx) return 0;
+    const n = this.pool[idx];
+    if (n.d >= QT_MAX_DEPTH) return n.v;
+    const q = this._q(xmn, xmx, ymn, ymx, x, y);
+    if (!n.ch[q]) return 0;
+    const [cxmn,cxmx,cymn,cymx] = this._cb(xmn, xmx, ymn, ymx, q);
+    return this._query(n.ch[q], cxmn, cxmx, cymn, cymx, x, y);
+  }
+
+  query(x, y) {
+    if (x < this.xMin || x >= this.xMax || y < this.yMin || y >= this.yMax) return 0;
+    return this._query(1, this.xMin, this.xMax, this.yMin, this.yMax, x, y);
+  }
+
+  /* quadtree_map_query equivalent: int8 log-odds → uint8 occupancy */
+  queryCell(x, y) {
+    const v = this.query(x, y);
+    if (v < 0) return 20;    // free  (< OCC_FREE_MAX 50)
+    if (v > 0) return 230;   // wall  (> OCC_UNK_MAX 178)
+    return 128;              // unknown (= centre of unknown range 77-178)
+  }
+
+  /* DFS collect all nodes — same traversal order as _pack_qt in wifi_dashboard.c */
+  _collect(idx, xmn, xmx, ymn, ymx, out, cap) {
+    if (!idx || out.length >= cap) return;
+    const n = this.pool[idx];
+    out.push({ xMin: xmn, yMin: ymn, size: xmx-xmn, depth: n.d, value: n.v });
+    const cx = 0.5*(xmn+xmx), cy = 0.5*(ymn+ymx);
+    if (n.ch[0]) this._collect(n.ch[0], xmn, cx,  cy,  ymx, out, cap);
+    if (n.ch[1]) this._collect(n.ch[1], cx,  xmx, cy,  ymx, out, cap);
+    if (n.ch[2]) this._collect(n.ch[2], xmn, cx,  ymn, cy,  out, cap);
+    if (n.ch[3]) this._collect(n.ch[3], cx,  xmx, ymn, cy,  out, cap);
+  }
+
+  getNodes(cap = 1500) {
+    const out = [];
+    this._collect(1, this.xMin, this.xMax, this.yMin, this.yMax, out, cap);
+    return out;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Ray casting
+ * ════════════════════════════════════════════════════════════════════════════ */
+function raySegIntersect(ox, oy, dx, dy, ax, ay, bx, by) {
+  const bax = bx-ax, bay = by-ay;
+  const denom = dx*bay - dy*bax;
+  if (Math.abs(denom) < 1e-9) return null;
+  const t = ((ax-ox)*bay - (ay-oy)*bax) / denom;
+  const s = ((ax-ox)*dy  - (ay-oy)*dx)  / denom;
+  if (t < 0 || s < 0 || s > 1) return null;
+  return t;
+}
+
+/* Cast one ray from (ox,oy) at worldAngleDeg; return hit distance (mm). */
+function castRay(ox, oy, worldAngleDeg) {
+  const rad = worldAngleDeg * Math.PI / 180;
+  const dx = Math.cos(rad), dy = Math.sin(rad);
+  let minT = SCAN_MAX_MM;
+  for (const [[ax,ay],[bx,by]] of WALLS) {
+    const t = raySegIntersect(ox, oy, dx, dy, ax, ay, bx, by);
+    if (t !== null && t < minT) minT = t;
+  }
+  return minT;
+}
+
+/* Simulate one full 360° LiDAR scan (1° step = 360 beams).
+ * Returns [{angleDeg (robot frame), r, wx, wy}] — matches lidar_scan_t format. */
+function takeScan(pose) {
+  const thetaDeg = pose.theta * 180 / Math.PI;
+  const scan = [];
+  for (let wa = 0; wa < 360; wa++) {
+    const r = castRay(pose.x, pose.y, wa);
+    if (r < 100 || r > SCAN_MAX_MM) continue;
+    const wrad = wa * Math.PI / 180;
+    scan.push({
+      angleDeg: ((wa - thetaDeg) % 360 + 360) % 360,   // robot frame
+      r,
+      wx: pose.x + r * Math.cos(wrad),
+      wy: pose.y + r * Math.sin(wrad),
+    });
+  }
+  return scan;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Map update — port of lidar_to_map.c
+ * ════════════════════════════════════════════════════════════════════════════ */
+function updateMap(qtMap, pose, scan) {
+  /* Robot's own cell is always free (matching the fix in lidar_to_map.c) */
+  qtMap.update(pose.x, pose.y, QT_MISS_DEC);
+
+  for (const { r, wx, wy } of scan) {
+    if (r < 100 || r > SCAN_MAX_MM) continue;
+    const dx = (wx - pose.x) / r;
+    const dy = (wy - pose.y) / r;
+    /* Ray-march free space (matching lidar_to_map.c loop) */
+    for (let t = SCAN_STEP_MM; t < r - SCAN_STEP_MM; t += SCAN_STEP_MM)
+      qtMap.update(pose.x + dx*t, pose.y + dy*t, QT_MISS_DEC);
+    /* Endpoint = wall */
+    qtMap.update(wx, wy, QT_HIT_INC);
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Frontier detection — port of frontier_detector.c (WFD BFS)
+ * ════════════════════════════════════════════════════════════════════════════ */
+/* Returns { frontier: {x,y}|null, bfsFree: [[ix,iy],...], bfsFrontierCells: [[ix,iy],...] }
+ * bfsFree        = free cells visited by the BFS wave (for visualization)
+ * bfsFrontierCells = candidate frontier cells found (for visualization) */
+function detectFrontier(qtMap, pose) {
+  const OCC_FREE_MAX = 50, OCC_UNK_MIN = 77, OCC_UNK_MAX = 178;
+
+  function isFree(ix, iy) {
+    return qtMap.queryCell((ix+0.5)*FD_RES, (iy+0.5)*FD_RES) <= OCC_FREE_MAX;
+  }
+  function isUnknown(ix, iy) {
+    const v = qtMap.queryCell((ix+0.5)*FD_RES, (iy+0.5)*FD_RES);
+    return v >= OCC_UNK_MIN && v <= OCC_UNK_MAX;
+  }
+  function isFrontierCell(ix, iy) {
+    if (!isFree(ix, iy)) return false;
+    for (const [dx,dy] of K4) {
+      const nx=ix+dx, ny=iy+dy;
+      if (nx>=0&&nx<FD_MW&&ny>=0&&ny<FD_MH&&isUnknown(nx,ny)) return true;
+    }
+    return false;
+  }
+
+  const K4 = [[1,0],[-1,0],[0,1],[0,-1]];
+  const rx = Math.floor(pose.x / FD_RES);
+  const ry = Math.floor(pose.y / FD_RES);
+  const noResult = { frontier: null, bfsFree: [], bfsFrontierCells: [] };
+  if (rx<0||rx>=FD_MW||ry<0||ry>=FD_MH) return noResult;
+  if (!isFree(rx, ry)) return noResult;
+
+  const vis    = new Uint8Array(FD_MW * FD_MH);
+  const cluVis = new Uint8Array(FD_MW * FD_MH);
+  const queue  = [[rx, ry]];
+  vis[ry*FD_MW+rx] = 1;
+  let head = 0;
+
+  const bfsFree         = [[rx, ry]];  // free cells the BFS wave touches
+  const bfsFrontierCells = [];          // cells identified as frontier candidates
+
+  while (head < queue.length) {
+    const [cx, cy] = queue[head++];
+
+    if (isFrontierCell(cx, cy) && !cluVis[cy*FD_MW+cx]) {
+      /* Cluster flood-fill */
+      const cells = [], lq = [[cx,cy]];
+      cluVis[cy*FD_MW+cx] = 1;
+      let lh = 0;
+      while (lh < lq.length && cells.length < 128) {
+        const [bx,by] = lq[lh++];
+        cells.push([bx,by]);
+        if (bfsFrontierCells.length < 600) bfsFrontierCells.push([bx, by]);
+        for (const [dx,dy] of K4) {
+          const nx=bx+dx, ny=by+dy;
+          if (nx<0||nx>=FD_MW||ny<0||ny>=FD_MH||cluVis[ny*FD_MW+nx]) continue;
+          if (!isFrontierCell(nx,ny)) continue;
+          cluVis[ny*FD_MW+nx] = 1;
+          lq.push([nx,ny]);
+        }
+      }
+
+      if (cells.length >= 3) {
+        const sumX = cells.reduce((s,[x])=>s+x, 0);
+        const sumY = cells.reduce((s,[,y])=>s+y, 0);
+        const cenX = sumX/cells.length, cenY = sumY/cells.length;
+        let best = cells[0], bestD = Infinity;
+        for (const [px,py] of cells) {
+          const d = (px-cenX)**2+(py-cenY)**2;
+          if (d < bestD) { bestD=d; best=[px,py]; }
+        }
+        return {
+          frontier: { x: (best[0]+0.5)*FD_RES, y: (best[1]+0.5)*FD_RES },
+          bfsFree,
+          bfsFrontierCells,
+        };
+      }
+    }
+
+    for (const [dx,dy] of K4) {
+      const nx=cx+dx, ny=cy+dy;
+      if (nx<0||nx>=FD_MW||ny<0||ny>=FD_MH||vis[ny*FD_MW+nx]||!isFree(nx,ny)) continue;
+      vis[ny*FD_MW+nx] = 1;
+      queue.push([nx,ny]);
+      if (bfsFree.length < 2000) bfsFree.push([nx, ny]);
+    }
+  }
+  return { frontier: null, bfsFree, bfsFrontierCells };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Binary message builders — produce the EXACT same bytes as the ESP32 firmware
+ * ════════════════════════════════════════════════════════════════════════════ */
+function buildMapFrame(qtMap) {
+  const buf = new ArrayBuffer(17 + DASH_GW * DASH_GH);
+  const dv  = new DataView(buf);
+  dv.setUint8(0, 0x01);
+  dv.setUint16(1, DASH_GW, true);
+  dv.setUint16(3, DASH_GH, true);
+  dv.setFloat32(5,  DASH_CELL_MM, true);
+  dv.setFloat32(9,  0, true);   // xMin
+  dv.setFloat32(13, 0, true);   // yMin
+  const cells = new Uint8Array(buf, 17);
+  for (let iy = 0; iy < DASH_GH; iy++)
+    for (let ix = 0; ix < DASH_GW; ix++)
+      cells[iy*DASH_GW+ix] = qtMap.queryCell((ix+0.5)*DASH_CELL_MM, (iy+0.5)*DASH_CELL_MM);
+  return buf;
+}
+
+function buildScanFrame(scan) {
+  const step = scan.length > 180 ? Math.ceil(scan.length/180) : 1;
+  const pts = [];
+  for (let i = 0; i < scan.length && pts.length < 180; i += step) pts.push(scan[i]);
+  const buf = new ArrayBuffer(3 + pts.length*4);
+  const dv  = new DataView(buf);
+  dv.setUint8(0, 0x02);
+  dv.setUint16(1, pts.length, true);
+  for (let i = 0; i < pts.length; i++) {
+    dv.setUint16(3+i*4,   (Math.round(pts[i].angleDeg * 100)) & 0xFFFF, true);
+    dv.setUint16(3+i*4+2, Math.round(pts[i].r) & 0xFFFF, true);
+  }
+  return buf;
+}
+
+function buildPoseFrame(pose, frontier, hasFrontier) {
+  const buf = new ArrayBuffer(24);
+  const dv  = new DataView(buf);
+  dv.setUint8(0, 0x03);
+  dv.setFloat32(1,  pose.x,     true);
+  dv.setFloat32(5,  pose.y,     true);
+  dv.setFloat32(9,  pose.theta, true);
+  dv.setFloat32(13, hasFrontier ? frontier.x : 0, true);
+  dv.setFloat32(17, hasFrontier ? frontier.y : 0, true);
+  dv.setUint8(21,   hasFrontier ? 1 : 0);
+  dv.setUint16(22,  0, true);
+  return buf;
+}
+
+function buildQuadtreeFrame(qtMap) {
+  const nodes = qtMap.getNodes(1500);
+  const buf = new ArrayBuffer(3 + nodes.length*8);
+  const dv  = new DataView(buf);
+  dv.setUint8(0, 0x05);
+  dv.setUint16(1, nodes.length, true);
+  for (let i = 0; i < nodes.length; i++) {
+    const nd = nodes[i], off = 3+i*8;
+    dv.setUint16(off,   Math.round(nd.xMin) & 0xFFFF, true);
+    dv.setUint16(off+2, Math.round(nd.yMin) & 0xFFFF, true);
+    dv.setUint16(off+4, Math.round(nd.size) & 0xFFFF, true);
+    dv.setUint8(off+6,  nd.depth);
+    dv.setInt8(off+7,   Math.max(-128, Math.min(127, nd.value)));
+  }
+  return buf;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Simulation state and control
+ * ════════════════════════════════════════════════════════════════════════════ */
+let qtMap = null;
+
+const sim = {
+  running:  false,
+  done:     false,
+  t:        0,
+  lastScan: -9999,
+  lastPlan: -9999,
+  cycle:    0,
+  pose:     { x: START_X_MM, y: START_Y_MM, theta: 0 },
+  target:   null,
+  driveT:   0,
+};
+
+function simInit() {
+  qtMap = new QTMap(0, MAP_SIZE_MM, 0, MAP_SIZE_MM);
+
+  /* Seed initial free disk — same as app_main() in wemos/main.c */
+  for (let ang = 0; ang < 360; ang += 5) {
+    const r = ang * Math.PI / 180;
+    for (let rad = MAP_STEP_MM; rad <= INIT_FREE_R_MM; rad += MAP_STEP_MM)
+      qtMap.update(START_X_MM + rad*Math.cos(r), START_Y_MM + rad*Math.sin(r), QT_MISS_DEC);
+  }
+  qtMap.update(START_X_MM, START_Y_MM, QT_MISS_DEC);  // robot's own cell
+
+  Object.assign(sim, {
+    running: false, done: false, t: 0,
+    lastScan: -9999, lastPlan: -9999, cycle: 0, target: null, driveT: 0,
+    pose: { x: START_X_MM, y: START_Y_MM, theta: 0 },
+  });
+
+  /* Reset dashboard state */
+  mapState = null; qtNodes = null; bfsFlash = null;
+  poseRing = []; scanAccum = []; trailPts = []; lastFront = null; lastPose = null;
+  nMap = 0; nScan = 0; nPose = 0;
+  document.getElementById('sMap').textContent  = '0';
+  document.getElementById('sScan').textContent = '0';
+  document.getElementById('sPose').textContent = '0';
+  document.getElementById('sSimT').textContent = '0.0 s';
+  document.getElementById('sSimCyc').textContent = '0';
+  document.getElementById('sSimNodes').textContent = '0';
+
+  /* Send initial map so the canvas shows up immediately */
+  handleMap(buildMapFrame(qtMap));
+  qtNodes = qtMap.getNodes(10000);  /* sim: skip binary cap, use all nodes */
+  handlePose(buildPoseFrame(sim.pose, null, false));
+
+  setStatus('Ready', '');
+  log('Simulation initialised — press ▶ Start', 'w');
+}
+
+function simStart() {
+  if (sim.done) { simInit(); }   // auto-reset if finished
+  sim.running = true;
+  document.getElementById('btnSimStart').disabled = true;
+  document.getElementById('btnSimPause').disabled = false;
+  setStatus('Running', 'green');
+  log('Simulation started', 'ok');
+}
+
+function simPause() {
+  sim.running = !sim.running;
+  document.getElementById('btnSimPause').textContent = sim.running ? '⏸ Pause' : '▶ Resume';
+  document.getElementById('btnSimStart').disabled    = sim.running;
+  setStatus(sim.running ? 'Running' : 'Paused', sim.running ? 'green' : 'orange');
+}
+
+function simReset() {
+  simInit();
+  document.getElementById('btnSimStart').disabled = false;
+  document.getElementById('btnSimPause').disabled = true;
+  document.getElementById('btnSimPause').textContent = '⏸ Pause';
+  clearLog();
+}
+
+/* ── Simulation step (called from render loop with scaled dt) ── */
+function simStep(dt) {
+  sim.t += dt;
+
+  /* Move robot toward current target */
+  if (sim.target) {
+    const dx = sim.target.x - sim.pose.x;
+    const dy = sim.target.y - sim.pose.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 80 || (sim.t - sim.driveT) > MAX_DRIVE_S) {
+      sim.target  = null;
+      sim.lastPlan = sim.t - 2.0;  // trigger immediate replan
+    } else {
+      const move = Math.min(MOTOR_SPEED_MM_S * dt, dist);
+      sim.pose.theta = Math.atan2(dy, dx);
+      sim.pose.x += (dx / dist) * move;
+      sim.pose.y += (dy / dist) * move;
+    }
+  }
+
+  /* Scan at 5 Hz simulated */
+  if (sim.t - sim.lastScan >= 0.2) {
+    sim.lastScan = sim.t;
+    const scan = takeScan(sim.pose);
+    updateMap(qtMap, sim.pose, scan);
+    handlePose(buildPoseFrame(sim.pose, sim.target, !!sim.target));
+    handleScan(buildScanFrame(scan));
+  }
+
+  /* Plan at 0.5 Hz simulated (every 2 s) */
+  if (sim.t - sim.lastPlan >= 2.0) {
+    sim.lastPlan = sim.t;
+    sim.cycle++;
+    /* Firmware: scan_task runs at 5 Hz continuously (~10 scans per plan cycle).
+     * Run 5 scans here from the current pose to densify the map before BFS,
+     * matching the firmware's coverage density at planning time. */
+    for (let _i = 0; _i < 5; _i++) {
+      const s = takeScan(sim.pose);
+      updateMap(qtMap, sim.pose, s);
+    }
+    handleScan(buildScanFrame(takeScan(sim.pose)));
+    sim.lastScan = sim.t;
+
+    const det      = detectFrontier(qtMap, sim.pose);
+    const frontier = det.frontier;
+    /* Store BFS snapshot — drawn by drawBFSFlash(), fades over 2 sim-seconds */
+    bfsFlash = { free: det.bfsFree, frontierCells: det.bfsFrontierCells, expiresAt: sim.t + 2.0 };
+    document.getElementById('sSimCyc').textContent = sim.cycle;
+
+    if (!frontier) {
+      sim.done    = true;
+      sim.running = false;
+      motors_stop_sim();
+      log('No frontier — exploration complete', 'ok');
+      setStatus('Complete', 'green');
+      document.getElementById('btnSimStart').disabled = false;
+      document.getElementById('btnSimStart').textContent = '↺ Restart';
+      document.getElementById('btnSimPause').disabled = true;
+    } else {
+      sim.target = frontier;
+      sim.driveT = sim.t;
+      log(`Cycle ${sim.cycle}: Drive → (${Math.round(frontier.x)}, ${Math.round(frontier.y)})`, 'ok');
+    }
+
+    handleMap(buildMapFrame(qtMap));
+    qtNodes = qtMap.getNodes(10000);  /* sim: skip binary cap, use all nodes */
+    handlePose(buildPoseFrame(sim.pose, frontier, !!frontier));
+    document.getElementById('sSimNodes').textContent = qtMap.allocCount();
+  }
+}
+
+function motors_stop_sim() {
+  sim.target = null;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Dashboard rendering constants (identical to live_dashboard.html)
+ * ════════════════════════════════════════════════════════════════════════════ */
+const MSG_MAP       = 0x01;
+const MSG_SCAN      = 0x02;
+const MSG_POSE      = 0x03;
+const MSG_MAP_DELTA = 0x04;
+const MSG_QUADTREE  = 0x05;
+
+const BASE_PX        = 1;
+const SCAN_MAX_ACCUM = 5000;
+const TRAIL_STEP_MM  = 50;
+const TRAIL_MAX      = 300;
+const RENDER_LAG_MS  = 80;
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Dashboard state (identical to live_dashboard.html)
+ * ════════════════════════════════════════════════════════════════════════════ */
+let mapState = null;
+let poseRing = [];
+let scanAccum = [];
+let trailPts  = [];
+let lastFront = null;
+let lastPose  = null;
+let qtNodes   = null;
+let bfsFlash  = null;   // { free, frontierCells, expiresAt } — BFS wave after each plan cycle
+const cam = { zoom: 6, tx: 0, ty: 0 };
+let drag = null;
+let nMap = 0, nScan = 0, nPose = 0;
+let fpsCnt = 0, fpsLast = 0, fpsVal = 0;
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Canvas
+ * ════════════════════════════════════════════════════════════════════════════ */
+const wrap   = document.getElementById('mapWrap');
+const canvas = document.getElementById('mapCanvas');
+const ctx    = canvas.getContext('2d');
+
+function resizeCanvas() { canvas.width = wrap.clientWidth; canvas.height = wrap.clientHeight; }
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * w2c — world mm → canvas px (identical to live_dashboard.html)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function w2c(wx, wy) {
+  if (!mapState) return [0, 0];
+  const { cellMm, gh, xMin, yMin } = mapState;
+  return [
+    ((wx - xMin) / cellMm) * BASE_PX * cam.zoom + cam.tx,
+    (gh - (wy - yMin) / cellMm) * BASE_PX * cam.zoom + cam.ty,
+  ];
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * buildBitmap (identical to live_dashboard.html)
+ * ════════════════════════════════════════════════════════════════════════════ */
+async function buildBitmap(rawGrid, gw, gh) {
+  const img = new ImageData(gw, gh);
+  const d   = img.data;
+  for (let iy = 0; iy < gh; iy++) {
+    for (let ix = 0; ix < gw; ix++) {
+      const val = rawGrid[iy * gw + ix];
+      const py  = gh - 1 - iy;
+      const k   = (py * gw + ix) * 4;
+      let r, g, b;
+      if      (val < 118) { r=255; g=255; b=255; }
+      else if (val > 138) { r=30;  g=30;  b=30;  }
+      else                { r=244; g=162; b=97;  }
+      d[k]=r; d[k+1]=g; d[k+2]=b; d[k+3]=255;
+    }
+  }
+  return await createImageBitmap(img);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Message handlers (identical to live_dashboard.html)
+ * ════════════════════════════════════════════════════════════════════════════ */
+async function handleMap(buf) {
+  const v    = new DataView(buf);
+  const gw   = v.getUint16(1,  true);
+  const gh   = v.getUint16(3,  true);
+  const cmm  = v.getFloat32(5, true);
+  const xMin = v.getFloat32(9, true);
+  const yMin = v.getFloat32(13, true);
+  if (!gw || !gh || !cmm) return;
+  const rawGrid = new Uint8Array(buf.slice(17, 17 + gw * gh));
+  const bitmap  = await buildBitmap(rawGrid, gw, gh);
+  mapState = { gw, gh, cellMm: cmm, xMin, yMin, rawGrid, bitmap, ts: performance.now() };
+  nMap++;
+  document.getElementById('sMap').textContent = nMap;
+  if (nMap === 1) fitView();
+}
+
+function handleScan(buf) {
+  if (!mapState || !lastPose) return;
+  const v     = new DataView(buf);
+  const count = v.getUint16(1, true);
+  const px    = lastPose;
+  const cosT  = Math.cos(px.theta);
+  const sinT  = Math.sin(px.theta);
+  for (let i = 0; i < count; i++) {
+    const off  = 3 + i * 4;
+    const acd  = v.getUint16(off,     true);
+    const rmm  = v.getUint16(off + 2, true);
+    if (rmm < 100 || rmm > 6000) continue;
+    const arad = acd * Math.PI / 18000;
+    const lx   = rmm * Math.cos(arad);
+    const ly   = rmm * Math.sin(arad);
+    scanAccum.push({
+      wx: px.x + lx * cosT - ly * sinT,
+      wy: px.y + lx * sinT + ly * cosT,
+    });
+  }
+  if (scanAccum.length > SCAN_MAX_ACCUM)
+    scanAccum.splice(0, scanAccum.length - SCAN_MAX_ACCUM);
+  nScan++;
+  document.getElementById('sScan').textContent = nScan;
+}
+
+function handlePose(buf) {
+  const v     = new DataView(buf);
+  const x     = v.getFloat32(1,  true);
+  const y     = v.getFloat32(5,  true);
+  const theta = v.getFloat32(9,  true);
+  const fx    = v.getFloat32(13, true);
+  const fy    = v.getFloat32(17, true);
+  const hf    = v.getUint8(21) !== 0;
+  const ts    = performance.now();
+  lastPose = { x, y, theta, ts };
+  poseRing.push(lastPose);
+  if (poseRing.length > 4) poseRing.shift();
+  const last = trailPts[trailPts.length - 1];
+  if (!last || Math.hypot(x - last.x, y - last.y) >= TRAIL_STEP_MM) {
+    trailPts.push({ x, y });
+    if (trailPts.length > TRAIL_MAX) trailPts.shift();
+  }
+  lastFront = { fx, fy, has: hf };
+  document.getElementById('tX').textContent     = x.toFixed(0) + ' mm';
+  document.getElementById('tY').textContent     = y.toFixed(0) + ' mm';
+  document.getElementById('tTheta').textContent = (theta * 180 / Math.PI).toFixed(1) + '°';
+  if (hf) {
+    document.getElementById('tHF').textContent = 'YES';
+    document.getElementById('tHF').style.color = 'var(--green)';
+    document.getElementById('tFX').textContent = fx.toFixed(0) + ' mm';
+    document.getElementById('tFY').textContent = fy.toFixed(0) + ' mm';
+  } else {
+    document.getElementById('tHF').textContent = 'no';
+    document.getElementById('tHF').style.color = 'var(--muted)';
+    document.getElementById('tFX').textContent = '—';
+    document.getElementById('tFY').textContent = '—';
+  }
+  nPose++;
+  document.getElementById('sPose').textContent = nPose;
+}
+
+function handleQuadtree(buf) {
+  const v     = new DataView(buf);
+  const count = v.getUint16(1, true);
+  const nodes = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const off = 3 + i * 8;
+    nodes[i] = {
+      xMin:  v.getUint16(off,     true),
+      yMin:  v.getUint16(off + 2, true),
+      size:  v.getUint16(off + 4, true),
+      depth: v.getUint8 (off + 6),
+      value: v.getInt8  (off + 7),
+    };
+  }
+  qtNodes = nodes;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Pose interpolation (identical to live_dashboard.html)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function getInterpolatedPose(now) {
+  if (!poseRing.length) return null;
+  const renderT = now - RENDER_LAG_MS;
+  for (let i = poseRing.length - 1; i >= 1; i--) {
+    const b = poseRing[i], a = poseRing[i - 1];
+    if (a.ts <= renderT && renderT <= b.ts) {
+      const dt = b.ts - a.ts;
+      const t  = dt > 0 ? (renderT - a.ts) / dt : 1;
+      let dth = b.theta - a.theta;
+      dth = ((dth % (2*Math.PI)) + 3*Math.PI) % (2*Math.PI) - Math.PI;
+      return { x: a.x+(b.x-a.x)*t, y: a.y+(b.y-a.y)*t, theta: a.theta+dth*t };
+    }
+  }
+  return poseRing[poseRing.length - 1];
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * drawQTMapFill — PRIMARY map layer.
+ * Draws each quadtree node as a solid colored rectangle.  Because nodes are
+ * in DFS order (parent before children), children naturally overwrite their
+ * parent, so the deepest (finest) cell always wins at each screen pixel.
+ *
+ * Color encodes occupancy:
+ *   orange (244,162,97) = unknown  (value == 0, same as raster dashboard)
+ *   light blue-white    = free     (value  < 0)
+ *   near-black          = wall     (value  > 0)
+ *
+ * Cell SIZE encodes depth / certainty: large cells = coarse / unexplored,
+ * tiny cells = well-mapped near walls and frontiers.
+ * ════════════════════════════════════════════════════════════════════════════ */
+function drawQTMapFill() {
+  if (!mapState) return;
+  const ppm  = BASE_PX * cam.zoom / mapState.cellMm;
+  const mapW = mapState.gw * ppm * mapState.cellMm;
+  const mapH = mapState.gh * ppm * mapState.cellMm;
+
+  /* Orange background = entire map unknown by default */
+  ctx.fillStyle = 'rgb(244,162,97)';
+  ctx.fillRect(cam.tx, cam.ty, mapW, mapH);
+
+  if (!qtNodes) return;
+
+  /* Overlay only cells with real occupancy data (skip value==0 internal nodes
+   * so the orange background shows through unexplored regions).
+   * Free cells are confidence-encoded: pale blue (barely free, value=-6) →
+   * bright white-blue (very confident, value=-40).
+   * Wall cells are confidence-encoded: dark gray → near-black. */
+  for (const nd of qtNodes) {
+    if (nd.value === 0) continue;
+    const [sx, sy] = w2c(nd.xMin, nd.yMin + nd.size);
+    const spx = nd.size * ppm;
+    if (spx < 0.3) continue;
+    if (nd.value < 0) {
+      const conf = Math.min(1, -nd.value / 40);   // 0=barely free → 1=very confident
+      const r = Math.round(160 + conf * 80);       // 160→240
+      const g = Math.round(200 + conf * 45);       // 200→245
+      ctx.fillStyle = `rgb(${r},${g},255)`;
+    } else {
+      const conf = Math.min(1, nd.value / 40);
+      const v = Math.round(45 - conf * 35);        // 45→10 (lighter→darker)
+      ctx.fillStyle = `rgb(${v},${v},${v + 8})`;
+    }
+    ctx.fillRect(sx, sy, spx, spx);
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * drawQTWireframe — cell border overlay, depth-encoded.
+ * Thicker / more opaque lines = shallower (coarser) nodes.
+ * This shows the quadtree hierarchy directly: the tree subdivides where more
+ * detail is needed.
+ * ════════════════════════════════════════════════════════════════════════════ */
+/* Wireframe: depth 1-2 → bold colored border, depth 3-5 → medium, depth 6-7 → thin/invisible.
+ * This makes the QT hierarchy visually obvious: large bold rectangles are the coarse
+ * nodes covering unexplored territory, fine lines (if visible at all) are the leaf cells. */
+function drawQTWireframe() {
+  if (!qtNodes || !mapState) return;
+  const ppm = BASE_PX * cam.zoom / mapState.cellMm;
+  for (const nd of qtNodes) {
+    const [sx, sy] = w2c(nd.xMin, nd.yMin + nd.size);
+    const spx = nd.size * ppm;
+    const d = nd.depth;
+    let stroke, lw;
+    if      (d <= 2) { stroke = 'rgba(60,60,60,0.95)';   lw = Math.max(1.5, spx * 0.008); }
+    else if (d <= 3) { stroke = 'rgba(90,90,90,0.80)';   lw = 1.2; }
+    else if (d <= 5) { stroke = 'rgba(130,130,130,0.55)'; lw = 0.7; }
+    else if (d <= 6) { stroke = 'rgba(170,170,170,0.30)'; lw = 0.4; }
+    else             { stroke = 'rgba(200,200,200,0.15)'; lw = 0.2; }
+    if (spx < lw * 2) continue;
+    ctx.strokeStyle = stroke; ctx.lineWidth = lw;
+    ctx.strokeRect(sx, sy, spx, spx);
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * drawBFSFlash — visualises the frontier detection step.
+ * After each planning cycle the BFS expansion is frozen and fades out over
+ * ~2 simulated seconds, so you can see exactly which cells were searched and
+ * where the frontier cluster was found.
+ *
+ *   green  = free cells the BFS wave passed through (robot's reachable space)
+ *   gold   = cells identified as frontier candidates (free & adjacent to unknown)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function drawBFSFlash() {
+  if (!bfsFlash || !mapState) return;
+  const age = bfsFlash.expiresAt - sim.t;
+  if (age <= 0) return;
+  const alpha = Math.min(1, age / 1.5);
+  const ppm   = BASE_PX * cam.zoom / mapState.cellMm;
+  const cpx   = FD_RES * ppm;
+  if (cpx < 0.3) return;
+
+  ctx.fillStyle = `rgba(0,200,80,${(alpha * 0.20).toFixed(3)})`;
+  for (const [ix, iy] of bfsFlash.free) {
+    const [sx, sy] = w2c(ix * FD_RES, (iy + 1) * FD_RES);
+    ctx.fillRect(sx, sy, cpx, cpx);
+  }
+
+  ctx.fillStyle = `rgba(255,215,0,${(alpha * 0.65).toFixed(3)})`;
+  for (const [ix, iy] of bfsFlash.frontierCells) {
+    const [sx, sy] = w2c(ix * FD_RES, (iy + 1) * FD_RES);
+    ctx.fillRect(sx, sy, cpx, cpx);
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Robot drawing (identical to live_dashboard.html)
+ * ════════════════════════════════════════════════════════════════════════════ */
+function drawRobot(cx, cy, theta) {
+  const ppm = BASE_PX * cam.zoom / mapState.cellMm;
+  const bL  = 300 * ppm, bW = 180 * ppm;
+  const wL  =  60 * ppm, wW =  30 * ppm;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(-theta);
+  ctx.shadowColor = '#4361ee88'; ctx.shadowBlur = 10;
+  ctx.fillStyle = '#4361ee'; ctx.strokeStyle = '#ffffff55'; ctx.lineWidth = 1;
+  ctx.fillRect(-bL/2, -bW/2, bL, bW);
+  ctx.strokeRect(-bL/2, -bW/2, bL, bW);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#00d4ff';
+  ctx.fillRect(bL/2 - bL*0.2, -bW/2, bL*0.2, bW);
+  ctx.fillStyle = '#111';
+  const wox = bL/2 - wL*0.55, woy = bW/2;
+  ctx.fillRect( wox-wL/2,  woy,      wL, wW);
+  ctx.fillRect( wox-wL/2, -woy-wW,   wL, wW);
+  ctx.fillRect(-wox-wL/2,  woy,      wL, wW);
+  ctx.fillRect(-wox-wL/2, -woy-wW,   wL, wW);
+  ctx.restore();
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * drawWalls — show the known room geometry as a debug overlay
+ * ════════════════════════════════════════════════════════════════════════════ */
+function drawWalls() {
+  if (!mapState) return;
+  ctx.strokeStyle = 'rgba(255,50,50,0.6)';
+  ctx.lineWidth   = 1.5;
+  ctx.setLineDash([4, 3]);
+  for (const [[x0,y0],[x1,y1]] of WALLS) {
+    const [cx0,cy0] = w2c(x0, y0);
+    const [cx1,cy1] = w2c(x1, y1);
+    ctx.beginPath();
+    ctx.moveTo(cx0, cy0);
+    ctx.lineTo(cx1, cy1);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Render loop (adapted from live_dashboard.html — adds sim step + wall overlay)
+ * ════════════════════════════════════════════════════════════════════════════ */
+let lastNow = 0;
+
+function render(now) {
+  requestAnimationFrame(render);
+
+  /* ── Simulation step ── */
+  if (sim.running && !sim.done && lastNow > 0) {
+    const rawDt = (now - lastNow) / 1000;
+    const speed = parseFloat(document.getElementById('simSpeed').value || '5');
+    const dt    = Math.min(rawDt, 0.05) * speed;  // cap at 50 ms real per frame
+    simStep(dt);
+    document.getElementById('sSimT').textContent = sim.t.toFixed(1) + ' s';
+  }
+  lastNow = now;
+
+  /* ── FPS ── */
+  fpsCnt++;
+  if (now - fpsLast >= 1000) {
+    fpsVal = fpsCnt; fpsCnt = 0; fpsLast = now;
+    document.getElementById('hudFps').textContent = fpsVal;
+  }
+
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  if (!mapState) {
+    ctx.fillStyle = '#555'; ctx.font = '13px Courier New'; ctx.textAlign = 'center';
+    ctx.fillText('Press ▶ Start to run the simulation', W/2, H/2);
+    ctx.textAlign = 'left';
+    return;
+  }
+
+  const { gw, gh, cellMm, bitmap } = mapState;
+  const mW = gw * BASE_PX * cam.zoom;
+  const mH = gh * BASE_PX * cam.zoom;
+
+  /* 1a. Primary map layer — QT cell fills (default) or classic raster */
+  if (document.getElementById('chkQTFill').checked) {
+    drawQTMapFill();   // draws its own orange background + value-encoded QT cells
+  } else if (bitmap) {
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(bitmap, cam.tx, cam.ty, mW, mH);
+  }
+
+  /* 1b. QT wireframe (cell borders, depth-encoded) */
+  if (document.getElementById('chkQTWire').checked) drawQTWireframe();
+
+  /* 1c. BFS wave flash — shows the frontier detection sweep */
+  if (document.getElementById('chkBFS').checked) drawBFSFlash();
+
+  /* 1d. Known wall geometry (simulation helper) */
+  if (document.getElementById('chkWalls').checked) drawWalls();
+
+  /* 2. Path trail */
+  if (document.getElementById('chkTrail').checked && trailPts.length > 1) {
+    ctx.strokeStyle = '#00ffff99';
+    ctx.lineWidth   = Math.max(1, cam.zoom * 0.35);
+    ctx.beginPath();
+    const [sx, sy] = w2c(trailPts[0].x, trailPts[0].y);
+    ctx.moveTo(sx, sy);
+    for (let i = 1; i < trailPts.length; i++) {
+      const [tx, ty] = w2c(trailPts[i].x, trailPts[i].y);
+      ctx.lineTo(tx, ty);
+    }
+    ctx.stroke();
+  }
+
+  /* 3. LiDAR scan dots */
+  if (document.getElementById('chkScan').checked && scanAccum.length > 0) {
+    ctx.fillStyle = 'rgba(251,191,36,0.75)';
+    const dotR = Math.max(1.0, cam.zoom * 0.18);
+    for (const pt of scanAccum) {
+      const [px, py] = w2c(pt.wx, pt.wy);
+      ctx.beginPath(); ctx.arc(px, py, dotR, 0, Math.PI*2); ctx.fill();
+    }
+  }
+
+  /* 4. Frontier target */
+  const pose = getInterpolatedPose(now);
+  if (lastFront?.has && pose) {
+    const [fx, fy] = w2c(lastFront.fx, lastFront.fy);
+    const [rx, ry] = w2c(pose.x, pose.y);
+    const dotR = Math.max(5, cam.zoom * 0.8);
+    ctx.fillStyle = '#f4a261';
+    ctx.beginPath(); ctx.arc(fx, fy, dotR, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#f4a26188'; ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(fx, fy); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  /* 5. Robot */
+  if (pose) {
+    const [rx, ry] = w2c(pose.x, pose.y);
+    drawRobot(rx, ry, pose.theta);
+    if (document.getElementById('chkFollow').checked) {
+      const margin = 0.2;
+      const rl = margin*W, rr = (1-margin)*W, rt = margin*H, rb = (1-margin)*H;
+      if (rx < rl || rx > rr || ry < rt || ry > rb) {
+        const { cellMm: cm, gh: ggh, xMin: xmn, yMin: ymn } = mapState;
+        cam.tx = W/2 - ((pose.x-xmn)/cm)*BASE_PX*cam.zoom;
+        cam.ty = H/2 - (ggh-(pose.y-ymn)/cm)*BASE_PX*cam.zoom;
+      }
+    }
+  }
+
+  /* HUD */
+  const ageS = mapState ? ((performance.now()-mapState.ts)/1000).toFixed(1)+'s' : '—';
+  document.getElementById('hudZoom').textContent   = cam.zoom.toFixed(1) + '×';
+  document.getElementById('hudMapAge').textContent = ageS;
+}
+requestAnimationFrame(render);
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Pan / Zoom (identical to live_dashboard.html)
+ * ════════════════════════════════════════════════════════════════════════════ */
+wrap.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const f = e.deltaY < 0 ? 1.12 : 0.89;
+  const rect = wrap.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  cam.tx = mx - (mx - cam.tx)*f;
+  cam.ty = my - (my - cam.ty)*f;
+  cam.zoom = Math.max(0.5, Math.min(24, cam.zoom*f));
+}, { passive: false });
+
+wrap.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  drag = { sx: e.clientX, sy: e.clientY, tx: cam.tx, ty: cam.ty };
+  wrap.classList.add('dragging');
+  document.getElementById('chkFollow').checked = false;
+});
+window.addEventListener('mousemove', (e) => {
+  if (!drag) return;
+  cam.tx = drag.tx + (e.clientX - drag.sx);
+  cam.ty = drag.ty + (e.clientY - drag.sy);
+});
+window.addEventListener('mouseup', () => { drag = null; wrap.classList.remove('dragging'); });
+
+function fitView() {
+  if (!mapState) return;
+  const W = canvas.width, H = canvas.height;
+  /* Fit the room area (1500–8500 mm = 7000 mm), not the full 10000 mm map,
+   * so the quadtree structure is immediately visible at a useful scale. */
+  const roomMm = 7000;
+  const roomPx = (roomMm / mapState.cellMm) * BASE_PX;
+  cam.zoom = Math.max(1, Math.min(20, Math.min(W, H) / roomPx * 0.88));
+  /* Centre on the start position */
+  const [cx, cy] = [
+    ((START_X_MM - mapState.xMin) / mapState.cellMm) * BASE_PX * cam.zoom,
+    ((mapState.gh) - (START_Y_MM - mapState.yMin) / mapState.cellMm) * BASE_PX * cam.zoom,
+  ];
+  cam.tx = W / 2 - cx;
+  cam.ty = H / 2 - cy;
+}
+function resetView() { if (mapState) fitView(); else { cam.zoom=6; cam.tx=0; cam.ty=0; } }
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Helpers
+ * ════════════════════════════════════════════════════════════════════════════ */
+function setStatus(msg, dotCls) {
+  document.getElementById('statusTxt').textContent = msg;
+  document.getElementById('dot').className = 'dot ' + (dotCls || '');
+}
+function log(txt, cls) {
+  const box = document.getElementById('logBox');
+  const div = document.createElement('div');
+  if (cls) div.className = cls;
+  const t = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  div.textContent = `[${t}] ${txt}`;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  while (box.children.length > 200) box.removeChild(box.firstChild);
+}
+function clearLog() { document.getElementById('logBox').innerHTML = ''; }
+
+/* ── Auto-init on load ── */
+simInit();
+</script>
+</body>
+</html>

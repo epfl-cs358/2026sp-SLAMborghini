@@ -10,3 +10,30 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
 # HTTP server tuning
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=512
+
+# ── WiFi DRAM reduction ──────────────────────────────────────────────────────
+# Default WiFi needs ~80-100 KB contiguous DRAM. Wemos only has 106 KB total.
+# These cuts bring WiFi to ~55 KB, leaving room for the pool (24 KB) + stack.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+CONFIG_ESP_WIFI_AMSDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_CSI_ENABLED=n
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+
+# ── WiFi DRAM reduction ────────────────────────────────────────────────────
+# Default config needs ~80-100 KB contiguous DRAM for DMA descriptors and
+# task stacks. Wemos only has 106 KB total DRAM free. These cuts bring the
+# WiFi footprint down to ~55-65 KB, leaving enough room for the quadtree pool.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+CONFIG_ESP_WIFI_AMSDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_CSI_ENABLED=n
+CONFIG_ESP_WIFI_NVS_ENABLED=n
