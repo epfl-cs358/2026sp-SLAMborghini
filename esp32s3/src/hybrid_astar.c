@@ -199,7 +199,7 @@ static void add_neighbor(qt_graph_node_t *nodes, int from, int to)
     nodes[from].neighbors[nodes[from].neighbor_count++] = (uint16_t)to;
 }
 
-static void build_adjacency(qt_graph_node_t *nodes, int count)
+static void build_adjacency(const quadtree_map_t *map, qt_graph_node_t *nodes, int count)
 {
     for (int i = 0; i < count; ++i) {
         nodes[i].neighbor_count = 0;
@@ -207,10 +207,13 @@ static void build_adjacency(qt_graph_node_t *nodes, int count)
 
     for (int i = 0; i < count; ++i) {
         for (int j = i + 1; j < count; ++j) {
-            if (leaves_are_adjacent(&nodes[i], &nodes[j])) {
+            if (leaves_are_adjacent(&nodes[i], &nodes[j]) &&
+                line_is_collision_free_quadtree(map,
+                                    nodes[i].cx, nodes[i].cy,
+                                    nodes[j].cx, nodes[j].cy)) {
                 add_neighbor(nodes, i, j);
-                add_neighbor(nodes, j, i);
-            }
+                 add_neighbor(nodes, j, i);
+                }
         }
     }
 }
@@ -483,7 +486,7 @@ path_t hybrid_astar_plan(const quadtree_map_t *map,
         return path;
     }
 
-    build_adjacency(nodes, node_count);
+    build_adjacency(map, nodes, node_count);
 
     int start_idx = find_containing_free_leaf(nodes, node_count, start->x, start->y);
     if (start_idx < 0) {
