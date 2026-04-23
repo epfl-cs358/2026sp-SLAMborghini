@@ -13,7 +13,7 @@
  *   - uart_bridge_init() / uart_bridge_send_control() removed
  *   - drive_for_cmd() replaces uart_bridge_send_control()
  *   - Motor init / PWM identical to the original wemos/main.c
- *   - Everything else (frontier detection, WiFi, WebSocket, dead-reckoning)
+ *   - Everything else (frontier detection, WiFi, WebSocket, odometry)
  *     is identical to esp32s3/main.c
  *
  * When the ESP32-S3 is back:
@@ -24,15 +24,13 @@
  */
 
 /* ── Mode flag ──────────────────────────────────────────────────────────── */
-#define USE_FRONTIER_TARGET  1   /* quadtree_map.c is now a functional flat grid —
-                                  * frontier detection works, car drives toward
-                                  * the detected frontier each planning cycle.  */
+#define USE_FRONTIER_TARGET  1
 
 /* ── Wi-Fi credentials ──────────────────────────────────────────────────── */
 #define WIFI_SSID      "SPOT-iot"
 #define WIFI_PASSWORD  "RacailleSalutaireMigration8052"
 
-/* ── SLAM brain modules (from esp32s3/src/, compiled via platformio.ini) ── */
+/* ── SLAM brain modules ─────────────────────────────────────────────────── */
 #include "quadtree_map.h"
 #include "frontier_detector.h"
 #include "command_gen.h"
@@ -41,6 +39,8 @@
 #include "test/room_data.h"
 #include "test/simulate_lidar.h"
 #include "imu_gyro.h"
+#include "task_odometry.h"
+#include "imu_encoder_driver.h"
 
 /* ── ESP-IDF / FreeRTOS ─────────────────────────────────────────────────── */
 #include "driver/ledc.h"
@@ -49,64 +49,44 @@
 #include <math.h>
 #include <stdbool.h>
 
-/* ── Planning loop constants (must match esp32s3/main.c) ────────────────── */
+/* ── Planning loop constants ────────────────────────────────────────────── */
 #define DEBUG_FORWARD_MM    200.0f
 #define DEBUG_SPEED_MM_S    100.0f
-#define MAX_DRIVE_MS        1200u   /* shorter burst → more frequent replanning */
-#define CYCLE_DELAY_MS      50      /* tighter loop = smoother motion           */
+#define MAX_DRIVE_MS        1200u
+#define CYCLE_DELAY_MS      50
 
-/* If heading error exceeds this, arc toward target before main drive.
- * π/4 = 45° — beyond that the servo saturates and the car barely curves. */
-#define TURN_ARC_THRESH_RAD  0.785f  /* π/4 */
-#define TURN_ARC_MS          800u    /* duration of pre-drive arc at max servo  */
+#define TURN_ARC_THRESH_RAD  0.785f  /* pi/4 — beyond this, arc before main drive */
+#define TURN_ARC_MS          800u
 
-/* ════════════════════════════════════════════════════════════════════════════
- * Motor config — matches SLAMurai (2025fa-SLAMurai/code/firmware/wemos/
- *                include/motor_control/config.hpp) which this hardware reuses.
- * GPIO 13 = forward PWM  (MOTOR_F_PIN)
- * GPIO 12 = backward PWM (MOTOR_B_PIN)
- * LEDC channels 3 (forward) and 2 (backward) — same as SLAMurai.
- * ════════════════════════════════════════════════════════════════════════════ */
-#define MOTOR_F_PIN        13    /* forward  PWM — matches SLAMurai config.hpp */
-#define MOTOR_B_PIN        12    /* backward PWM — matches SLAMurai config.hpp */
-
+/* ── Motor config ───────────────────────────────────────────────────────── */
+#define MOTOR_F_PIN        13
+#define MOTOR_B_PIN        12
 #define MOTOR_PWM_FREQ_HZ  1000
-#define MOTOR_PWM_RES      LEDC_TIMER_8_BIT   /* 0-255, matches PWM_RES = 8 */
-#define MOTOR_DUTY_FWD     25     /* matches MAX_MOTOR_PWM_SPEED = 25 in SLAMurai */
+#define MOTOR_PWM_RES      LEDC_TIMER_8_BIT
+#define MOTOR_DUTY_FWD     25
 #define MOTOR_DUTY_STOP    0
+#define CH_FWD             LEDC_CHANNEL_3
+#define CH_BWD             LEDC_CHANNEL_2
 
-#define CH_FWD   LEDC_CHANNEL_3   /* PWM_CHANNEL_F = 3 in SLAMurai */
-#define CH_BWD   LEDC_CHANNEL_2   /* PWM_CHANNEL_B = 2 in SLAMurai */
-
-/* ════════════════════════════════════════════════════════════════════════════
- * Servo config — copied from 2025fa-SLAMurai/code/firmware/wemos/include/
- *                servo_control/config.hpp and navigation/config.hpp
- *
- * GPIO 23, 50 Hz PWM, 16-bit LEDC.
- * Angles from SLAMurai: center=94°, max_left=64° (94-30), max_right=124° (94+30)
- * Conversion: pulse_us = 1000 + (angle/180)*1000 ; counts = pulse_us/20000*65536
- *   64°  → 1356 μs → 4442 counts  (max left)
- *   94°  → 1522 μs → 4987 counts  (center / straight)
- *  124°  → 1689 μs → 5533 counts  (max right)
- *
- * Steering gain: 546 counts / (30° = 0.524 rad) ≈ 1042 counts/rad
- * Tune SERVO_STEER_GAIN if the car under/over-steers.
- * ════════════════════════════════════════════════════════════════════════════ */
+/* ── Servo config ───────────────────────────────────────────────────────── */
 #define SERVO_PIN          23
 #define SERVO_PWM_FREQ_HZ  50
 #define SERVO_PWM_RES      LEDC_TIMER_16_BIT
 #define SERVO_CH           LEDC_CHANNEL_0
-#define SERVO_DUTY_CENTER  4987u   /* 94°  — straight ahead */
-#define SERVO_DUTY_LEFT    4442u   /* 64°  — max left       */
-#define SERVO_DUTY_RIGHT   5533u   /* 124° — max right      */
-#define SERVO_STEER_GAIN   1042.0f /* counts/rad            */
+#define SERVO_DUTY_CENTER  4987u
+#define SERVO_DUTY_LEFT    4442u
+#define SERVO_DUTY_RIGHT   5533u
+#define SERVO_STEER_GAIN   1042.0f
+
+/* ── Frontier lock thresholds ───────────────────────────────────────────── */
+#define FRONTIER_REACHED_MM   500.0f
+#define FRONTIER_STALE_MM    1500.0f
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Motor helpers
  * ════════════════════════════════════════════════════════════════════════════ */
 static void motor_init(void)
 {
-    /* ── Motor timer (1 kHz, 8-bit) ── */
     ledc_timer_config_t timer = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .duty_resolution = MOTOR_PWM_RES,
@@ -124,7 +104,7 @@ static void motor_init(void)
     };
     for (int i = 0; i < 2; i++) ledc_channel_config(&ch[i]);
 
-    /* ── Servo timer (50 Hz, 16-bit) — separate timer so freq doesn't conflict ── */
+    /* Separate timer for servo — avoids PWM freq conflict with motors */
     ledc_timer_config_t servo_timer = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .duty_resolution = SERVO_PWM_RES,
@@ -143,7 +123,6 @@ static void motor_init(void)
         .hpoint     = 0,
     };
     ledc_channel_config(&servo_ch);
-    /* Servo centres at init; no extra update needed */
 }
 
 static void set_duty(ledc_channel_t ch, uint32_t duty)
@@ -161,36 +140,37 @@ static void motors_stop(void)
 /* ════════════════════════════════════════════════════════════════════════════
  * drive_for_cmd
  * Steers toward cmd->t_heading then drives forward for the commanded distance.
- * current_heading is pose.theta at the moment the command is issued.
+ * Odometry is handled by task_odometry running in parallel — no pose update here.
  * ════════════════════════════════════════════════════════════════════════════ */
-/* Returns actual heading after the drive (from gyro integration). */
-static float drive_for_cmd(const control_frame_t *cmd, float current_heading)
+static void drive_for_cmd(const control_frame_t *cmd, float current_heading)
 {
-    /* ── Steering ────────────────────────────────────────────────────────── */
+    /* Compute heading error */
     float err = cmd->t_heading - current_heading;
     while (err >  (float)M_PI) err -= 2.0f * (float)M_PI;
     while (err < -(float)M_PI) err += 2.0f * (float)M_PI;
 
+    /* Set servo */
     int32_t duty = (int32_t)SERVO_DUTY_CENTER + (int32_t)(err * SERVO_STEER_GAIN);
     if (duty < (int32_t)SERVO_DUTY_LEFT)  duty = (int32_t)SERVO_DUTY_LEFT;
     if (duty > (int32_t)SERVO_DUTY_RIGHT) duty = (int32_t)SERVO_DUTY_RIGHT;
-
     set_duty(SERVO_CH, (uint32_t)duty);
-    vTaskDelay(pdMS_TO_TICKS(50));    /* short settle — servo reaches position quickly */
+    vTaskDelay(pdMS_TO_TICKS(50));  /* let servo reach position */
 
-    float actual_heading = current_heading;
-
-    /* ── Pre-drive arc: if error > 45°, arc at max deflection first ─────── */
+    /* Pre-drive arc if heading error > 45 deg */
     if (fabsf(err) > TURN_ARC_THRESH_RAD) {
         set_duty(CH_FWD, MOTOR_DUTY_FWD);
         set_duty(CH_BWD, MOTOR_DUTY_STOP);
-        actual_heading = imu_drive_and_track(actual_heading, TURN_ARC_MS);
+        vTaskDelay(pdMS_TO_TICKS(TURN_ARC_MS));
         motors_stop();
 
-        /* Recompute error and servo duty with updated heading */
-        float err2 = cmd->t_heading - actual_heading;
+        /* Recompute servo after arc — task_odometry updated theta already */
+        const odom_pose_t *odom = task_odometry_get_pose();
+        float heading_after_arc = (odom != NULL) ? odom->theta : current_heading;
+
+        float err2 = cmd->t_heading - heading_after_arc;
         while (err2 >  (float)M_PI) err2 -= 2.0f * (float)M_PI;
         while (err2 < -(float)M_PI) err2 += 2.0f * (float)M_PI;
+
         int32_t duty2 = (int32_t)SERVO_DUTY_CENTER + (int32_t)(err2 * SERVO_STEER_GAIN);
         if (duty2 < (int32_t)SERVO_DUTY_LEFT)  duty2 = (int32_t)SERVO_DUTY_LEFT;
         if (duty2 > (int32_t)SERVO_DUTY_RIGHT) duty2 = (int32_t)SERVO_DUTY_RIGHT;
@@ -198,7 +178,7 @@ static float drive_for_cmd(const control_frame_t *cmd, float current_heading)
         vTaskDelay(pdMS_TO_TICKS(30));
     }
 
-    /* ── Main drive ─────────────────────────────────────────────────────── */
+    /* Main drive */
     float dist_mm = sqrtf(cmd->tx * cmd->tx + cmd->ty * cmd->ty);
     if (dist_mm < 50.0f) dist_mm = DEBUG_FORWARD_MM;
 
@@ -209,31 +189,8 @@ static float drive_for_cmd(const control_frame_t *cmd, float current_heading)
 
     set_duty(CH_FWD, MOTOR_DUTY_FWD);
     set_duty(CH_BWD, MOTOR_DUTY_STOP);
-    actual_heading = imu_drive_and_track(actual_heading, drive_ms);
+    vTaskDelay(pdMS_TO_TICKS(drive_ms));
     motors_stop();
-
-    /* Keep servo pointed at target — don't re-centre between cycles */
-
-    return actual_heading;
-}
-
-/* ════════════════════════════════════════════════════════════════════════════
- * dead_reckon_pose  (identical to esp32s3/main.c)
- * ════════════════════════════════════════════════════════════════════════════ */
-static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
-{
-    float dist_mm = sqrtf(cmd->tx * cmd->tx + cmd->ty * cmd->ty);
-    if (dist_mm < 1.0f) return;
-
-    float speed = (cmd->t_speed > 10.0f) ? cmd->t_speed : DEBUG_SPEED_MM_S;
-    float dt_s  = dist_mm / speed;
-    float max_s = MAX_DRIVE_MS / 1000.0f;
-    if (dt_s > max_s) dt_s = max_s;
-
-    float traveled = speed * dt_s;
-    pose->x    += traveled * cosf(cmd->t_heading);
-    pose->y    += traveled * sinf(cmd->t_heading);
-    pose->theta = cmd->t_heading;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -241,18 +198,21 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
  * ════════════════════════════════════════════════════════════════════════════ */
 void app_main(void)
 {
-    /* ── Motor + IMU init ───────────────────────────────────────────────── */
+    /* Init motors and let power rails settle */
     motor_init();
     motors_stop();
-    vTaskDelay(pdMS_TO_TICKS(500));   /* let power rails settle */
-    bool imu_ok = imu_gyro_init();
-    /* peek (non-consuming) so the stop flag survives for the main loop check */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    /* Init IMU + encoder driver */
+    imu_encoder_driver_init();
+
+    /* Stop-check callback for emergency stop during drives */
     imu_gyro_set_stop_check(wifi_dashboard_stop_peek);
 
-    /* ── Two maps allocated BEFORE Wi-Fi so malloc claims heap first ────── */
-    /* truth_map: full room pre-loaded — ground truth for ray-casting         */
-    /* slam_map:  progressively revealed — shown on dashboard                 */
-    /* Each pool ≈ 60 KB; Wi-Fi needs ~80 KB; total fits in ~260 KB heap.    */
+    /* Start odometry task — runs at 100 Hz, updates pose independently */
+    xTaskCreate(task_odometry, "task_odometry", 4096, NULL, 5, NULL);
+
+    /* Allocate maps before Wi-Fi — malloc needs heap before Wi-Fi claims it */
     quadtree_map_t truth_map;
     quadtree_map_t slam_map;
     pose_t pose = {0};
@@ -262,61 +222,59 @@ void app_main(void)
                   ROOM_WIDTH_MM, ROOM_HEIGHT_MM,
                   50.0f, BUILD_FREE_DISK_MM);
 
-    /* ── Wi-Fi + WebSocket dashboard ─────────────────────────────────────── */
+    /* Wi-Fi + WebSocket dashboard */
     wifi_dashboard_init(WIFI_SSID, WIFI_PASSWORD);
 
-    /* Initial scan so dashboard shows the first free disk immediately */
+    /* Initial LiDAR scan so dashboard shows the room immediately */
     simulate_and_update_map(&truth_map, &slam_map, &pose, 180, 6000.0f, 50.0f);
 
-    /* ── Wait for browser to send "Start Exploration" ────────────────────── */
+    /* Wait for "Start Exploration" from browser */
     while (!wifi_dashboard_exploration_requested()) {
         wifi_dashboard_broadcast_state(&pose, 0.0f, 0.0f, false, 0);
         wifi_dashboard_update(&slam_map, &pose);
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    /* ── Locked frontier state ───────────────────────────────────────────── */
-    /* The car commits to one frontier until it arrives or the frontier
-     * disappears from the map.  This stops the target from bouncing
-     * around every cycle and wasting all movement on re-steering. */
-#define FRONTIER_REACHED_MM   500.0f   /* close enough → pick next frontier  */
-#define FRONTIER_STALE_MM    1500.0f   /* locked target moved this far → re-pick */
     float locked_fx = 0.0f, locked_fy = 0.0f;
     bool  have_lock  = false;
 
     /* ── Planning loop ───────────────────────────────────────────────────── */
     while (1) {
 
-        /* Emergency stop — halt motors and wait for Start again */
+        /* Emergency stop */
         if (wifi_dashboard_stop_requested()) {
             motors_stop();
             set_duty(SERVO_CH, SERVO_DUTY_CENTER);
-            have_lock = false;   /* re-pick frontier after resume */
+            have_lock = false;
             while (!wifi_dashboard_exploration_requested()) {
                 wifi_dashboard_broadcast_state(&pose, 0.0f, 0.0f, false, 0);
                 vTaskDelay(pdMS_TO_TICKS(500));
             }
         }
 
+        /* Get latest pose from odometry task */
+        const odom_pose_t *odom = task_odometry_get_pose();
+        if (odom != NULL) {
+            pose.x     = odom->x;
+            pose.y     = odom->y;
+            pose.theta = odom->theta;
+        }
+
         frontier_list_t frontiers = frontier_detector_detect(&slam_map, &pose);
 
         control_frame_t cmd = {0};
-        bool has_frontier   = false;
+        bool  has_frontier  = false;
         float fx = 0.0f, fy = 0.0f;
 
 #if USE_FRONTIER_TARGET
         if (frontiers.count > 0) {
-            /* Check if the locked frontier is still valid */
             if (have_lock) {
-                float dx = locked_fx - pose.x;
-                float dy = locked_fy - pose.y;
+                float dx   = locked_fx - pose.x;
+                float dy   = locked_fy - pose.y;
                 float dist = sqrtf(dx*dx + dy*dy);
 
-                /* Reached? — clear lock so we pick a fresh target below */
                 if (dist < FRONTIER_REACHED_MM) have_lock = false;
 
-                /* Still locked? — verify the frontier still exists in the list
-                 * (if all frontiers shifted far from the locked point, re-pick) */
                 if (have_lock) {
                     bool still_exists = false;
                     for (uint8_t i = 0; i < frontiers.count; i++) {
@@ -331,7 +289,6 @@ void app_main(void)
                 }
             }
 
-            /* (Re-)pick a frontier if we don't have a valid lock */
             if (!have_lock) {
                 frontier_t best = frontier_detector_best(&frontiers, &pose);
                 locked_fx = best.cx;
@@ -345,8 +302,7 @@ void app_main(void)
             fx            = locked_fx;
             fy            = locked_fy;
         } else {
-            have_lock = false;
-            /* No frontier — forward nudge so the car keeps moving */
+            have_lock     = false;
             cmd.tx        = 0.0f;
             cmd.ty        = DEBUG_FORWARD_MM;
             cmd.t_heading = pose.theta;
@@ -360,17 +316,10 @@ void app_main(void)
         cmd.t_speed   = DEBUG_SPEED_MM_S;
 #endif
 
-        /* Broadcast state to PC dashboard before driving */
         wifi_dashboard_broadcast_state(&pose, fx, fy, has_frontier, 0);
 
-        /* Drive + integrate gyro → get actual heading */
-        float actual_heading = drive_for_cmd(&cmd, pose.theta);
-        /* Only trust gyro heading when IMU is present; otherwise keep the
-         * commanded heading so dead-reckoning moves toward the frontier. */
-        if (imu_ok) cmd.t_heading = actual_heading;
-
-        /* Update dead-reckoned pose using real (or commanded) heading */
-        dead_reckon_pose(&pose, &cmd);
+        /* Drive — pose update is handled by task_odometry in parallel */
+        drive_for_cmd(&cmd, pose.theta);
 
         /* Simulate LiDAR at new pose, update slam_map */
         simulate_and_update_map(&truth_map, &slam_map, &pose, 180, 6000.0f, 50.0f);
