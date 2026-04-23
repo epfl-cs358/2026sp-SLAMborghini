@@ -75,4 +75,3 @@ void task_odometry(void *pvParameters)
 
         vTaskDelay(pdMS_TO_TICKS(10));  /* 100 Hz */
     }
-}
