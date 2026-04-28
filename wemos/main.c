@@ -39,6 +39,8 @@
 #include "lidar_driver.h"
 #include "lidar_to_map.h"
 #include "imu_gyro.h"
+#include "motor_pid.h"           /* added — motor PID speed control */
+#include "imu_encoder_driver.h"  /* added — speed measurement for PID */
 
 /* ── ESP-IDF / FreeRTOS ─────────────────────────────────────────────────── */
 #include "driver/ledc.h"
@@ -59,7 +61,7 @@
 
 /* ── Scan integration ────────────────────────────────────────────────────── */
 #define SCAN_MAX_MM   2000.0f
-#define SCAN_STEP_MM   150.0f   /* matches depth-7 leaf cell (~156 mm) */
+#define SCAN_STEP_MM   150.0f
 
 /* ── Planning loop constants ─────────────────────────────────────────────── */
 #define DEBUG_FORWARD_MM    200.0f
@@ -67,7 +69,7 @@
 #define MAX_DRIVE_MS        1200u
 #define CYCLE_DELAY_MS      50
 
-#define TURN_ARC_THRESH_RAD  0.785f   /* π/4 */
+#define TURN_ARC_THRESH_RAD  0.785f
 #define TURN_ARC_MS          800u
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -215,9 +217,12 @@ static float drive_for_cmd(const control_frame_t *cmd, float current_heading)
         wifi_dashboard_log(dbuf);
     }
 
+    /* Start PID speed control for straight drive */
+    motor_pid_set_target(MOTOR_SPEED_MM_S / 1000.0f);
     set_duty(CH_FWD, MOTOR_DUTY_FWD);
     set_duty(CH_BWD, MOTOR_DUTY_STOP);
     actual_heading = imu_drive_and_track(actual_heading, drive_ms);
+    motor_pid_stop();
     motors_stop();
 
     {
@@ -254,16 +259,6 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
 
 /* ════════════════════════════════════════════════════════════════════════════
  * scan_task  (priority 5)
- *
- * Runs independently of the planning loop.  Reads the LiDAR continuously —
- * including during drive_for_cmd() — so the UART FIFO never overflows and
- * the map is always up-to-date when planning resumes.
- *
- * Mutex discipline:
- *   Takes s_mtx to snapshot the pose (12 bytes, ~1 µs) then releases it.
- *   Takes s_mtx again for the full lidar_to_map() call so that plan_task
- *   cannot traverse the tree while new nodes are being allocated.
- *   The hold time is bounded by lidar_to_map's 100 ms watchdog.
  * ════════════════════════════════════════════════════════════════════════════ */
 static void scan_task(void *arg)
 {
@@ -282,7 +277,6 @@ static void scan_task(void *arg)
         lidar_to_map(&s_map, &scan, &local_pose, SCAN_MAX_MM, SCAN_STEP_MM);
         xSemaphoreGive(s_mtx);
 
-        /* Rate-limit scan broadcasts to 2 Hz — sending every scan floods the WS */
         TickType_t now = xTaskGetTickCount();
         if ((now - last_scan_broadcast) >= pdMS_TO_TICKS(500)) {
             wifi_dashboard_broadcast_scan(&scan, &local_pose);
@@ -294,23 +288,13 @@ static void scan_task(void *arg)
 
 /* ════════════════════════════════════════════════════════════════════════════
  * plan_task  (priority 3)
- *
- * Handles frontier detection, dashboard map push, motor commands.
- * Lower priority than scan_task so the map stays fresh during planning.
- *
- * Mutex discipline:
- *   Takes s_mtx for frontier_detector_detect() (reads tree) + pose snapshot.
- *   Releases s_mtx BEFORE drive_for_cmd() — drive blocks for up to 1200 ms,
- *   during which scan_task continues updating the map unimpeded.
- *   Takes s_mtx again after drive to write the updated pose back.
  * ════════════════════════════════════════════════════════════════════════════ */
 static void plan_task(void *arg)
 {
     (void)arg;
 
-    for (;;) {   /* outer loop: restart after stop or no-frontier */
+    for (;;) {
 
-        /* ── Wait for browser Start button ───────────────────────────── */
         printf("[SLAMborghini] Waiting for dashboard Start...\n");
 
         int idle_tick = 0;
@@ -321,17 +305,14 @@ static void plan_task(void *arg)
             xSemaphoreGive(s_mtx);
             wifi_dashboard_update(&s_map, &p);
             wifi_dashboard_broadcast_state(&p, 0.0f, 0.0f, false, 0);
-            /* Repeat status every 5 s so a late-connecting browser sees it */
             if (idle_tick % 25 == 0)
                 wifi_dashboard_log("IMU: ready | LIDAR: running | Waiting for Start...");
             idle_tick++;
             vTaskDelay(pdMS_TO_TICKS(200));
         }
-        /* Drain any stop pressed while we were in the idle loop */
         wifi_dashboard_stop_requested();
         printf("[SLAMborghini] Exploration started.\n");
 
-        /* ── Exploration loop ─────────────────────────────────────────── */
         int cycle = 0;
         while (1) {
             cycle++;
@@ -341,7 +322,6 @@ static void plan_task(void *arg)
                 wifi_dashboard_log(cbuf);
             }
 
-            /* Emergency stop */
             if (wifi_dashboard_stop_requested()) {
                 motors_stop();
                 wifi_dashboard_log("STOP requested — press Start to resume");
@@ -349,7 +329,6 @@ static void plan_task(void *arg)
                 break;
             }
 
-            /* ── Read map + pose, run frontier detection ── */
             pose_t local_pose;
             frontier_list_t fronts;
 
@@ -358,11 +337,9 @@ static void plan_task(void *arg)
             fronts     = frontier_detector_detect(&s_map, &local_pose);
             xSemaphoreGive(s_mtx);
 
-            /* ── Push map snapshot + quadtree structure to dashboard ── */
             wifi_dashboard_update(&s_map, &local_pose);
             wifi_dashboard_broadcast_quadtree(&s_map);
 
-            /* ── Choose frontier and broadcast state ── */
             frontier_t best   = frontier_detector_best(&fronts, &local_pose);
             bool has_frontier = (best.size > 0);
             wifi_dashboard_broadcast_state(&local_pose,
@@ -375,7 +352,6 @@ static void plan_task(void *arg)
                 break;
             }
 
-            /* ── Compute command ── */
             waypoint_t wp = {
                 .x        = best.cx,
                 .y        = best.cy,
@@ -385,7 +361,6 @@ static void plan_task(void *arg)
             control_frame_t cmd = command_gen_compute(&local_pose, &wp);
             cmd.t_speed = MOTOR_SPEED_MM_S;
 
-            /* ── Log drive step ── */
             {
                 char buf[80];
                 snprintf(buf, sizeof(buf), "Drive → (%.0f, %.0f) fronts=%u",
@@ -393,10 +368,8 @@ static void plan_task(void *arg)
                 wifi_dashboard_log(buf);
             }
 
-            /* ── Drive (mutex released — scan_task runs freely during this) ── */
             float new_heading = drive_for_cmd(&cmd, local_pose.theta);
 
-            /* ── Update shared pose with gyro heading + dead-reckoned X/Y ── */
             xSemaphoreTake(s_mtx, portMAX_DELAY);
             dead_reckon_pose(&s_pose, &cmd);
             s_pose.theta = new_heading;
@@ -414,7 +387,6 @@ static void plan_task(void *arg)
 
             vTaskDelay(pdMS_TO_TICKS(CYCLE_DELAY_MS));
         }
-        /* loop back → wait for Start again */
     }
 }
 
@@ -430,6 +402,7 @@ void app_main(void)
     set_duty(SERVO_CH, SERVO_DUTY_CENTER);
     vTaskDelay(pdMS_TO_TICKS(500));
     imu_gyro_init();
+    imu_encoder_driver_init();   /* added — init encoder for PID speed measurement */
     lidar_driver_init();
 
     /* ── Map init ───────────────────────────────────────────────────────── */
@@ -437,7 +410,6 @@ void app_main(void)
 
     s_pose = (pose_t){ .x = START_X_MM, .y = START_Y_MM, .theta = 0.0f };
 
-    /* Seed a free disk so the frontier detector has an initial boundary */
     for (float ang = 0.0f; ang < 360.0f; ang += 5.0f) {
         float rad = ang * ((float)M_PI / 180.0f);
         for (float r = MAP_STEP_MM; r <= INIT_FREE_R_MM; r += MAP_STEP_MM) {
@@ -459,10 +431,10 @@ void app_main(void)
     s_mtx = xSemaphoreCreateMutex();
 
     /* ── Launch tasks ───────────────────────────────────────────────────── */
-    /* scan_task: 4 KB stack (scan buffer is static, actual stack use is small) */
     xTaskCreate(scan_task, "scan", 4096, NULL, 5, NULL);
-    /* plan_task: 8 KB stack (frontier_list_t + path on stack) */
     xTaskCreate(plan_task, "plan", 8192, NULL, 3, NULL);
 
-    /* app_main returns — FreeRTOS scheduler keeps the tasks running */
+    /* Motor PID task — Core 1, realtime priority */        /* added */
+    xTaskCreatePinnedToCore(motor_pid_task, "motor_pid",
+                            2048, NULL, 24, NULL, 1);
 }

@@ -1,42 +1,39 @@
-/**
- * motor_pid.c
- * Module: PID speed controller for left and right DC motors.
- * Board: Wemos D1 R32
- * Implementation phase: stub (PID update equation not yet implemented)
- */
-
 #include "motor_pid.h"
+#include <stdint.h>
 
-void motor_pid_init(pid_state_t *pid, float kp, float ki, float kd)
+static float s_integral = 0.0f;
+static float s_prev_err = 0.0f;
+
+void motor_pid_reset(void)
 {
-    // TODO: implement
-    // Set pid->kp, ki, kd from arguments.
-    // Zero out pid->integral and pid->prev_error.
-    (void)pid;
-    (void)kp;
-    (void)ki;
-    (void)kd;
+    s_integral = 0.0f;
+    s_prev_err = 0.0f;
 }
 
-float motor_pid_step(pid_state_t *pid, float setpoint, float measured, float dt)
+uint32_t motor_pid_update(float target_ms, float measured_ms, float dt_s)
 {
-    // TODO: implement
-    // error      = setpoint - measured
-    // pid->integral += error * (dt / 1000.0f)
-    // derivative = (error - pid->prev_error) / (dt / 1000.0f)
-    // output     = pid->kp * error + pid->ki * pid->integral + pid->kd * derivative
-    // clamp output to [-1.0, 1.0]
-    // pid->prev_error = error
-    (void)pid;
-    (void)setpoint;
-    (void)measured;
-    (void)dt;
-    return 0;
-}
+    if (dt_s <= 0.0f) return MOTOR_DUTY_MIN;
 
-void motor_pid_reset(pid_state_t *pid)
-{
-    // TODO: implement
-    // Zero out pid->integral and pid->prev_error.
-    (void)pid;
+    float err = target_ms - measured_ms;
+
+    /* Integral with anti-windup */
+    s_integral += err * dt_s;
+    if (s_integral >  2.0f) s_integral =  2.0f;
+    if (s_integral < -2.0f) s_integral = -2.0f;
+
+    /* Derivative */
+    float deriv = (err - s_prev_err) / dt_s;
+    s_prev_err  = err;
+
+    /* PID output — base duty + correction */
+    float output = MOTOR_DUTY_FWD
+                   + MOTOR_PID_KP * err
+                   + MOTOR_PID_KI * s_integral
+                   + MOTOR_PID_KD * deriv;
+
+    /* Clamp */
+    if (output < (float)MOTOR_DUTY_MIN) output = (float)MOTOR_DUTY_MIN;
+    if (output > (float)MOTOR_DUTY_MAX) output = (float)MOTOR_DUTY_MAX;
+
+    return (uint32_t)output;
 }
