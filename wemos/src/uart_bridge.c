@@ -50,8 +50,8 @@
  * UART configuration
  * ------------------------------------------------------------ */
 #define BRIDGE_UART_PORT   UART_NUM_1
-#define BRIDGE_RX_PIN      GPIO_NUM_4
-#define BRIDGE_TX_PIN      GPIO_NUM_5
+#define BRIDGE_TX_PIN      GPIO_NUM_22   // TX → S3 RX
+#define BRIDGE_RX_PIN      GPIO_NUM_16   // RX ← S3 TX
 #define BRIDGE_BAUD        115200
 #define BRIDGE_RX_BUF      512
 

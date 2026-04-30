@@ -39,6 +39,7 @@
 #include "lidar_driver.h"
 #include "lidar_to_map.h"
 #include "imu_gyro.h"
+#include "uart_bridge.h"
 
 /* ── ESP-IDF / FreeRTOS ─────────────────────────────────────────────────── */
 #include "driver/ledc.h"
@@ -418,6 +419,22 @@ static void plan_task(void *arg)
     }
 }
 
+static void uart_debug_task(void *arg)
+{
+    (void)arg;
+
+    control_frame_t cmd;
+
+    while (1) {
+        if (uart_bridge_recv_control(&cmd)) {
+            printf("[UART DEBUG] RX control: tx=%.2f ty=%.2f heading=%.2f speed=%.2f\n",
+                   cmd.tx, cmd.ty, cmd.t_heading, cmd.t_speed);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 
 /* ════════════════════════════════════════════════════════════════════════════
  * app_main — hardware init, map init, task creation
@@ -427,10 +444,14 @@ void app_main(void)
     /* ── Hardware init ──────────────────────────────────────────────────── */
     motor_init();
     motors_stop();
+
+    uart_bridge_init();
+    printf("[UART DEBUG] Wemos UART bridge initialized\n");
+    
     set_duty(SERVO_CH, SERVO_DUTY_CENTER);
     vTaskDelay(pdMS_TO_TICKS(500));
-    imu_gyro_init();
-    lidar_driver_init();
+    // imu_gyro_init();
+    // lidar_driver_init();
 
     /* ── Map init ───────────────────────────────────────────────────────── */
     quadtree_map_init(&s_map, MAP_SIZE_MM, MAP_SIZE_MM, MAP_STEP_MM);
@@ -449,20 +470,22 @@ void app_main(void)
     }
 
     /* ── Dashboard ──────────────────────────────────────────────────────── */
-    wifi_dashboard_init(WIFI_SSID, WIFI_PASSWORD);
-    wifi_dashboard_log("IMU: ready");
-    wifi_dashboard_log("LIDAR: started");
-    wifi_dashboard_log("Map: initialized");
-    imu_gyro_set_stop_check(wifi_dashboard_stop_peek);
+    // wifi_dashboard_init(WIFI_SSID, WIFI_PASSWORD);
+    // wifi_dashboard_log("IMU: ready");
+    // wifi_dashboard_log("LIDAR: started");
+    // wifi_dashboard_log("Map: initialized");
+    // imu_gyro_set_stop_check(wifi_dashboard_stop_peek);
 
     /* ── Synchronisation primitive ──────────────────────────────────────── */
     s_mtx = xSemaphoreCreateMutex();
 
     /* ── Launch tasks ───────────────────────────────────────────────────── */
     /* scan_task: 4 KB stack (scan buffer is static, actual stack use is small) */
-    xTaskCreate(scan_task, "scan", 4096, NULL, 5, NULL);
+   //xTaskCreate(scan_task, "scan", 4096, NULL, 5, NULL);
     /* plan_task: 8 KB stack (frontier_list_t + path on stack) */
-    xTaskCreate(plan_task, "plan", 8192, NULL, 3, NULL);
+    
+   //xTaskCreate(plan_task, "plan", 8192, NULL, 3, NULL);
+    xTaskCreate(uart_debug_task, "uart_debug", 4096, NULL, 2, NULL);
 
     /* app_main returns — FreeRTOS scheduler keeps the tasks running */
 }

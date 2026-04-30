@@ -7,9 +7,9 @@
 #include "driver/gpio.h"
 #endif
 
-#define BRIDGE_UART_PORT   UART_NUM_2
-#define BRIDGE_TX_PIN      GPIO_NUM_17
-#define BRIDGE_RX_PIN      GPIO_NUM_16
+#define BRIDGE_UART_PORT   UART_NUM_1
+#define BRIDGE_TX_PIN      GPIO_NUM_15   // TX → Wemos RX (GPIO16)
+#define BRIDGE_RX_PIN      GPIO_NUM_16   // RX ← Wemos TX (GPIO22)
 #define BRIDGE_BAUD        115200
 #define BRIDGE_RX_BUF      512
 

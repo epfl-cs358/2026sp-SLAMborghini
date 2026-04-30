@@ -22,9 +22,10 @@
  * USE_WAYPOINT_PLAYBACK  0,
  * USE_FRONTIER_TARGET    0  →  UART + motor smoke test (hardcoded 200 mm fwd).
  * ─────────────────────────────────────────────────────────────────────────── */
-#define USE_REAL_LIDAR         1   /* ← SET TO 1 FOR REAL LIDAR HARDWARE        */
-#define USE_WAYPOINT_PLAYBACK  0   /* ← SET TO 1 FOR ROOM.LOG PLAYBACK          */
-#define USE_FRONTIER_TARGET    0   /* ← SET TO 1 FOR FRONTIER EXPLORATION        */
+#define USE_REAL_LIDAR         0
+#define USE_WAYPOINT_PLAYBACK  0
+#define USE_FRONTIER_TARGET    0
+#define UART_SMOKE_TEST        1
 
 /* ── Wi-Fi credentials — fill in before flashing ───────────────────────── */
 #define WIFI_SSID      "YOUR_SSID"
@@ -47,7 +48,8 @@
 #include "src/wifi_dashboard.h"
 #include "src/test/test_room.h"         /* build_test_room() */
 #include "src/test/room_data.h"         /* ROOM_WIDTH_MM, ROOM_HEIGHT_MM */
-#include "src/test/simulate_lidar.h"    /* slam_map_init(), simulate_and_update_map() */
+#include "src/test/simulate_lidar.h"
+#include "src/uart_bridge.h"   /* slam_map_init(), simulate_and_update_map() */
 
 #if USE_WAYPOINT_PLAYBACK
 #include "src/test/room_waypoints.h"    /* ROOM_WAYPOINTS[], ROOM_WP_START_POSE */
@@ -97,11 +99,23 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
  * ════════════════════════════════════════════════════════════════════════════ */
 void app_main(void)
 {
-    /* ── Hardware init ───────────────────────────────────────────────────── */
     uart_bridge_init();
     vTaskDelay(pdMS_TO_TICKS(1000));   /* let Wemos boot */
 
-    /* ── Wi-Fi + WebSocket dashboard ─────────────────────────────────────── */
+#if UART_SMOKE_TEST
+    while (1) {
+        control_frame_t test_cmd = {
+            .tx = 100.0f,
+            .ty = 0.0f,
+            .t_heading = 0.0f,
+            .t_speed = 100.0f,
+        };
+
+        uart_bridge_send_control(&test_cmd);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
+
     wifi_dashboard_init(WIFI_SSID, WIFI_PASSWORD);
 
 

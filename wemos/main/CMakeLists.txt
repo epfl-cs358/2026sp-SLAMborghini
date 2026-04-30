@@ -12,6 +12,7 @@ set(S3_SRC       "${REPO_ROOT}/esp32s3/src")            # esp32s3/src/
 idf_component_register(
     SRCS
         "${WEMOS_ROOT}/main.c"
+        "${WEMOS_ROOT}/src/uart_bridge.c"
         "${WEMOS_ROOT}/imu_gyro.c"
         "${S3_SRC}/quadtree_map.c"
         "${S3_SRC}/quadtree_map_compat.c"
@@ -21,7 +22,8 @@ idf_component_register(
         "${S3_SRC}/lidar_driver.c"
         "${S3_SRC}/lidar_to_map.c"
     INCLUDE_DIRS
-        "${WEMOS_ROOT}"
-        "${S3_SRC}"
-        "${REPO_ROOT}"
+     "${WEMOS_ROOT}/src"
+     "${WEMOS_ROOT}"
+     "${S3_SRC}"
+     "${REPO_ROOT}"
 )
