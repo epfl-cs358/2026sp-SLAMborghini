@@ -8,9 +8,9 @@
 #endif
 
 #define BRIDGE_UART_PORT   UART_NUM_1
-#define BRIDGE_TX_PIN      GPIO_NUM_15   // TX → Wemos RX (GPIO16)
-#define BRIDGE_RX_PIN      GPIO_NUM_16   // RX ← Wemos TX (GPIO22)
-#define BRIDGE_BAUD        115200
+#define BRIDGE_TX_PIN GPIO_NUM_17
+#define BRIDGE_RX_PIN GPIO_NUM_16  // RX ← Wemos TX GPIO17
+#define BRIDGE_UART_BAUD 115200
 #define BRIDGE_RX_BUF      512
 
 #define SYNC_A             0xAAu
@@ -35,7 +35,7 @@ void uart_bridge_init(void)
 {
 #ifdef ESP_PLATFORM
     uart_config_t cfg = {
-        .baud_rate = BRIDGE_BAUD,
+        .baud_rate = BRIDGE_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -49,7 +49,7 @@ void uart_bridge_init(void)
                  BRIDGE_RX_PIN,
                  UART_PIN_NO_CHANGE,
                  UART_PIN_NO_CHANGE);
-    uart_driver_install(BRIDGE_UART_PORT, BRIDGE_RX_BUF, 0, 0, NULL, 0);
+    uart_driver_install(BRIDGE_UART_PORT, BRIDGE_RX_BUF, 512, 0, NULL, 0);
 #endif
 }
 

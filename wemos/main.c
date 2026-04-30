@@ -486,6 +486,12 @@ void app_main(void)
     
    //xTaskCreate(plan_task, "plan", 8192, NULL, 3, NULL);
     xTaskCreate(uart_debug_task, "uart_debug", 4096, NULL, 2, NULL);
+    xTaskCreate(uart_debug_task, "uart_debug", 4096, NULL, 2, NULL);
+
+    // ADD THIS — prevent app_main from returning, keep scheduler alive
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 
     /* app_main returns — FreeRTOS scheduler keeps the tasks running */
 }

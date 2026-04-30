@@ -46,13 +46,17 @@
 #include "driver/gpio.h"
 #endif
 
-/* ------------------------------------------------------------
- * UART configuration
- * ------------------------------------------------------------ */
+/*
+ * Wiring:
+ *   Wemos RX GPIO16 <- ESP32-S3 TX GPIO17
+ *   Wemos TX GPIO17 -> ESP32-S3 RX GPIO16
+ *   GND shared between boards
+ */
+
 #define BRIDGE_UART_PORT   UART_NUM_1
-#define BRIDGE_TX_PIN      GPIO_NUM_22   // TX → S3 RX
-#define BRIDGE_RX_PIN      GPIO_NUM_16   // RX ← S3 TX
-#define BRIDGE_BAUD        115200
+#define BRIDGE_TX_PIN GPIO_NUM_17   // TX → S3 RX (GPIO16)
+#define BRIDGE_RX_PIN GPIO_NUM_16   // RX ← S3 TX (GPIO17)
+#define BRIDGE_UART_BAUD   115200
 #define BRIDGE_RX_BUF      512
 
 /* ------------------------------------------------------------
@@ -89,13 +93,15 @@ void uart_bridge_init(void)
 {
 #ifdef ESP_PLATFORM
     uart_config_t cfg = {
-        .baud_rate = BRIDGE_BAUD,
+        .baud_rate = BRIDGE_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
+
+    uart_driver_delete(BRIDGE_UART_PORT);
 
     uart_param_config(BRIDGE_UART_PORT, &cfg);
 
@@ -107,7 +113,14 @@ void uart_bridge_init(void)
         UART_PIN_NO_CHANGE
     );
 
-    uart_driver_install(BRIDGE_UART_PORT, BRIDGE_RX_BUF, 0, 0, NULL, 0);
+    uart_driver_install(BRIDGE_UART_PORT, BRIDGE_RX_BUF, BRIDGE_RX_BUF, 0, NULL, 0);
+
+    uart_flush_input(BRIDGE_UART_PORT);
+    printf("[UART DEBUG] init: UART%d TX=%d RX=%d baud=%d\n",
+       BRIDGE_UART_PORT,
+       BRIDGE_TX_PIN,
+       BRIDGE_RX_PIN,
+       BRIDGE_UART_BAUD);
 #endif
 }
 

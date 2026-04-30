@@ -99,10 +99,13 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
  * ════════════════════════════════════════════════════════════════════════════ */
 void app_main(void)
 {
+    printf("[ESP32-S3] app_main started\n");   // ADD THIS
     uart_bridge_init();
-    vTaskDelay(pdMS_TO_TICKS(1000));   /* let Wemos boot */
+    printf("[ESP32-S3] uart_bridge_init done\n");  // ADD THIS
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
 #if UART_SMOKE_TEST
+    printf("[ESP32-S3] entering smoke test loop\n");  // ADD THIS
     while (1) {
         control_frame_t test_cmd = {
             .tx = 100.0f,
@@ -110,7 +113,7 @@ void app_main(void)
             .t_heading = 0.0f,
             .t_speed = 100.0f,
         };
-
+        printf("[ESP32-S3] sending control frame\n");  // ADD THIS
         uart_bridge_send_control(&test_cmd);
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
