@@ -1,4 +1,5 @@
 #include "uart_bridge.h"
+#include "../../hardware_pins.h"
 
 #include <string.h>
 
@@ -7,10 +8,7 @@
 #include "driver/gpio.h"
 #endif
 
-#define BRIDGE_UART_PORT   UART_NUM_1
-#define BRIDGE_TX_PIN GPIO_NUM_17
-#define BRIDGE_RX_PIN GPIO_NUM_16  // RX ← Wemos TX GPIO17
-#define BRIDGE_UART_BAUD 115200
+/* BRIDGE_UART_PORT, BRIDGE_TX_PIN, BRIDGE_RX_PIN, BRIDGE_BAUD from hardware_pins.h */
 #define BRIDGE_RX_BUF      512
 
 #define SYNC_A             0xAAu
@@ -35,7 +33,7 @@ void uart_bridge_init(void)
 {
 #ifdef ESP_PLATFORM
     uart_config_t cfg = {
-        .baud_rate = BRIDGE_UART_BAUD,
+        .baud_rate = BRIDGE_BAUD,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,

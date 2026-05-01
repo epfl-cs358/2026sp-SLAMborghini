@@ -1,27 +1,6 @@
-# esp32s3/src/CMakeLists.txt
+# This file was automatically generated for projects
+# without default 'CMakeLists.txt' file.
 
-set(app_sources
-    ../main.c
-    command_gen.c
-    frontier_detector.c
-    hybrid_astar.c
-    lidar_driver.c
-    lidar_to_map.c
-    map_consistency.c
-    map_updater.c
-    obstacle_classifier.c
-    path_refiner.c
-    polar_to_cart.c
-    quadtree_map.c
-    quadtree_map_compat.c
-    rbpf.c
-    uart_bridge.c
-)
+FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
 
-idf_component_register(
-    SRCS ${app_sources}
-    INCLUDE_DIRS
-        "."
-        ".."
-        "../.."
-)
+idf_component_register(SRCS ${app_sources} ${CMAKE_SOURCE_DIR}/main.c)

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include "lidar_driver.h"   /* lidar_scan_t */
-#include "types.h"          /* pose_t, point2f_t */
+#include "../../types.h"    /* pose_t, point2f_t */
 
 /* Convert a full LiDAR scan from polar to global Cartesian coordinates.
  * Output points are in the same unit as pose->x/y (mm). */

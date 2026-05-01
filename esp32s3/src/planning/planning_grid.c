@@ -132,8 +132,8 @@ bool planning_grid_build_from_quadtree(
             planner_cell_t cell_value;
 
             /* If the planning grid exceeds map bounds, mark blocked/unknown */
-            if (x_mm < 0.0f || x_mm >= map->width_mm ||
-                y_mm < 0.0f || y_mm >= map->height_mm) {
+            if (x_mm < map->x_min || x_mm >= map->x_max ||
+                y_mm < map->y_min || y_mm >= map->y_max) {
                 cell_value = CELL_OCCUPIED;
             } else {
                 uint8_t occ = quadtree_map_query(map, x_mm, y_mm);

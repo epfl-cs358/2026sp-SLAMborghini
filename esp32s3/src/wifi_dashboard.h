@@ -18,6 +18,7 @@
 
 #include "../../types.h"
 #include "quadtree_map.h"
+#include "lidar_to_map.h"
 
 /**
  * Connect to Wi-Fi and start the HTTP + WebSocket server.
@@ -87,6 +88,23 @@ void wifi_dashboard_broadcast_scan(const lidar_scan_t *scan, const pose_t *pose)
  * @param msg Null-terminated string (max ~200 chars).
  */
 void wifi_dashboard_log(const char *msg);
+
+/**
+ * Returns the number of messages currently waiting in the dash task queue
+ * (0–24).  Use this to verify architecture health at runtime.
+ * Values consistently above 12 indicate backpressure — reduce caller rate.
+ * Safe to call from any task.
+ */
+uint8_t wifi_dashboard_queue_depth(void);
+
+/**
+ * Accumulate a dirty bounding box from one lidar_to_map() call into the
+ * pending dirty rect.  Thread-safe (mutex-protected).  Call immediately
+ * after lidar_to_map() from scan_task; wifi_dashboard_update() snapshots
+ * and clears the accumulator when it queues the next map frame.
+ * @param rect  Dirty rect filled by lidar_to_map(); ignored if rect->valid == false.
+ */
+void wifi_dashboard_mark_dirty(const map_dirty_rect_t *rect);
 
 /**
  * Broadcast the full quadtree structure as a type-0x05 binary frame.

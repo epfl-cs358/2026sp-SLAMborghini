@@ -22,8 +22,8 @@ idf_component_register(
         "${S3_SRC}/lidar_driver.c"
         "${S3_SRC}/lidar_to_map.c"
     INCLUDE_DIRS
-     "${WEMOS_ROOT}/src"
-     "${WEMOS_ROOT}"
-     "${S3_SRC}"
-     "${REPO_ROOT}"
+        "${WEMOS_ROOT}/src"
+        "${WEMOS_ROOT}"
+        "${S3_SRC}"
+        "${REPO_ROOT}"
 )
