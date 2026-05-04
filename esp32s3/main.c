@@ -345,8 +345,47 @@ void app_main(void)
             cmd.t_speed   = DEBUG_SPEED_MM_S;
         }
 
-        /* ── Transmit command to Wemos ───────────────────────────────────── */
-        uart_bridge_send_control(&cmd);
+        /* ── Transmit path/command to Wemos ──────────────────────────────── */
+        bool sent_path = false;
+
+#if USE_LOCAL_PLANNER
+        /*
+         * New Pure Pursuit protocol:
+         * If Hybrid A* produced a valid path, send a short path_frame_t
+         * to the Wemos. Wemos will run Pure Pursuit on this path.
+         */
+        if (has_frontier && hybrid_astar_is_valid(&lp_path)) {
+            path_frame_t path_frame = {0};
+
+            uint8_t n = (lp_path.length > MAX_SHARED_PATH_POINTS)
+                        ? MAX_SHARED_PATH_POINTS
+                        : (uint8_t)lp_path.length;
+
+            path_frame.length = n;
+
+            for (uint8_t i = 0; i < n; i++) {
+                path_frame.waypoints[i] = lp_path.waypoints[i];
+
+                if (path_frame.waypoints[i].v_target <= 10.0f) {
+                    path_frame.waypoints[i].v_target = cmd.t_speed;
+                }
+            }
+
+            sent_path = uart_bridge_send_path(&path_frame);
+
+            printf("[S3] sent path: length=%u status=%s\n",
+                   (unsigned)path_frame.length,
+                   sent_path ? "OK" : "FAIL");
+        }
+#endif
+
+        /*
+         * Old fallback protocol:
+         * If no valid path exists, send the single control_frame_t.
+         */
+        if (!sent_path) {
+            uart_bridge_send_control(&cmd);
+        }
 
         /* ── Broadcast state ─────────────────────────────────────────────── */
         wifi_dashboard_broadcast_state(&pose, fx, fy, has_frontier, 0);
