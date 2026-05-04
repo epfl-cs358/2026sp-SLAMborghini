@@ -148,7 +148,7 @@ void app_main(void)
 #elif defined(TEST_BRIDGE_TX)
 
     uart_bridge_init();
-    printf("[TEST_BRIDGE_TX] Sending frames every 2 s on UART%d"
+    printf("[TEST_BRIDGE_TX] Sending curved path every 500 ms on UART%d"
            "  TX=GPIO%d  RX=GPIO%d  %d baud\n",
            (int)BRIDGE_UART_PORT,
            (int)BRIDGE_TX_PIN, (int)BRIDGE_RX_PIN,
@@ -159,7 +159,7 @@ void app_main(void)
     while (1) {
         path_frame_t path_frame = {0};
 
-        path_frame.length = 3;
+        path_frame.length = 5;
 
         path_frame.waypoints[0].x = 0.0f;
         path_frame.waypoints[0].y = 0.0f;
@@ -172,9 +172,19 @@ void app_main(void)
         path_frame.waypoints[1].v_target = 150.0f;
 
         path_frame.waypoints[2].x = 600.0f;
-        path_frame.waypoints[2].y = 200.0f;
-        path_frame.waypoints[2].theta = 0.3f;
+        path_frame.waypoints[2].y = 150.0f;
+        path_frame.waypoints[2].theta = 0.2f;
         path_frame.waypoints[2].v_target = 150.0f;
+
+        path_frame.waypoints[3].x = 850.0f;
+        path_frame.waypoints[3].y = 350.0f;
+        path_frame.waypoints[3].theta = 0.4f;
+        path_frame.waypoints[3].v_target = 150.0f;
+
+        path_frame.waypoints[4].x = 1000.0f;
+        path_frame.waypoints[4].y = 600.0f;
+        path_frame.waypoints[4].theta = 0.6f;
+        path_frame.waypoints[4].v_target = 150.0f;
 
         bool ok = uart_bridge_send_path(&path_frame);
 
@@ -183,7 +193,7 @@ void app_main(void)
                (unsigned)path_frame.length,
                ok ? "sent" : "UART FAIL");
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
 

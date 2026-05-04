@@ -41,10 +41,19 @@ static waypoint_t to_robot_frame(const pose_t *robot_pose, waypoint_t point_glob
     float dx = point_global.x - robot_pose->x;
     float dy = point_global.y - robot_pose->y;
 
+    /*
+     * SLAMborghini convention:
+     * - theta = 0 means robot faces +X
+     * - robot-frame y = forward
+     * - robot-frame x = lateral/right
+     */
+    float forward = dx * cosf(robot_pose->theta) + dy * sinf(robot_pose->theta);
+    float left    = -dx * sinf(robot_pose->theta) + dy * cosf(robot_pose->theta);
+
     waypoint_t point_robot = point_global;
 
-    point_robot.x = dx * cosf(robot_pose->theta) + dy * sinf(robot_pose->theta);
-    point_robot.y = -dx * sinf(robot_pose->theta) + dy * cosf(robot_pose->theta);
+    point_robot.x = -left;
+    point_robot.y = forward;
 
     return point_robot;
 }

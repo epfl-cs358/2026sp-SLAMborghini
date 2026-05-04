@@ -1017,11 +1017,12 @@ static void bridge_slave_task(void *arg)
             speed = cmd.t_speed;
         }
 
-        uint32_t drive_ms =
-            (uint32_t)((dist_mm / speed) * 1000.0f);
-
-        if (drive_ms > MAX_DRIVE_MS) drive_ms = MAX_DRIVE_MS;
-        if (drive_ms < 50)           drive_ms = 50;
+               /*
+         * Real-life path-following test:
+         * Drive only a short step each time a path frame arrives.
+         * This lets us see the robot follow the path gradually.
+         */
+        uint32_t drive_ms = 800;
 
         set_duty(CH_FWD, MOTOR_DUTY_FWD);
         set_duty(CH_BWD, MOTOR_DUTY_STOP);
@@ -1035,9 +1036,11 @@ static void bridge_slave_task(void *arg)
          * Dead-reckon local pose after the movement.
          * This is temporary until proper EKF/odometry feedback is connected.
          */
-        local_pose.x += dist_mm * cosf(cmd.t_heading);
-        local_pose.y += dist_mm * sinf(cmd.t_heading);
+        float moved_mm = speed * ((float)drive_ms / 1000.0f);
+
         local_pose.theta = new_heading;
+        local_pose.x += moved_mm * cosf(local_pose.theta);
+        local_pose.y += moved_mm * sinf(local_pose.theta);
 
         printf("[PP] updated pose: x=%.0f y=%.0f theta=%.2f rad\n",
                (double)local_pose.x,
