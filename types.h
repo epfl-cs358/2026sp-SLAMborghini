@@ -62,6 +62,16 @@ typedef struct {
     float v_target; /**< Target speed at waypoint (mm/s) */
 } waypoint_t;
 
+/** Maximum number of waypoints sent over UART in one path frame. */
+#define MAX_SHARED_PATH_POINTS 15
+
+/** A short navigation path transmitted from ESP32-S3 to Wemos. */
+typedef struct {
+    uint8_t length;      /**< Number of valid waypoints */
+    uint8_t reserved;    /**< Padding/reserved for alignment */
+    waypoint_t waypoints[MAX_SHARED_PATH_POINTS];
+} path_frame_t;
+
 /** Control command transmitted from ESP32-S3 to Wemos D1 R32. */
 typedef struct {
     float tx;        /**< Target X in mm (absolute or relative) */

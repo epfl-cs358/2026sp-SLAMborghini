@@ -51,11 +51,21 @@
 #define OCC_UNK_MIN      77u
 #define OCC_UNK_MAX     178u
 
+/* ── Robot footprint ─────────────────────────────────────────────────────────
+ * Body: 394 mm long × 295 mm wide.  Half-diagonal = sqrt(197²+147.5²) ≈ 246 mm.
+ * Grid resolution ≈ 156 mm per leaf cell.  246/156 = 1.58 → ceil = 2 cells.
+ * A 2-cell Chebyshev radius (5×5 box) guarantees clearance on all sides.
+ * SPIRAL_STEPS must exceed ROBOT_CLEAR_CELLS so the spiral has enough room to
+ * find a passing candidate in narrow corridors. ──────────────────────────── */
+#define ROBOT_CLEAR_CELLS  2    /* Chebyshev clearance radius in grid cells  */
+
 /* ── Tuning constants ────────────────────────────────────────────────────── */
 #define MIN_CLUSTER_SIZE   3    /* discard clusters with fewer cells (noise) */
 #define BFS_QUEUE_CAP   2048    /* WFD BFS ring-buffer capacity              */
 #define CLUSTER_CAP      128    /* max cells collected per frontier cluster  */
-#define SPIRAL_STEPS       5    /* safety spiral max search radius (cells)   */
+#define SPIRAL_STEPS       8    /* safety spiral max search radius — must be */
+                                /* > ROBOT_CLEAR_CELLS so narrow corridors   */
+                                /* can still find a safe cell                */
 
 /* ── Grid dimension limits  (10 000 mm / 50 mm = 200 cells per axis) ─────── */
 #define MAX_GRID_W  200
@@ -81,9 +91,6 @@ static cell_t   s_cbuf[CLUSTER_CAP];
 static const int8_t K4X[4] = {  1, -1,  0,  0 };
 static const int8_t K4Y[4] = {  0,  0,  1, -1 };
 
-/* ── 8-connected neighbour offsets (safety spiral) ──────────────────────── */
-static const int8_t K8X[8] = {  1, -1,  0,  0,  1,  1, -1, -1 };
-static const int8_t K8Y[8] = {  0,  0,  1, -1,  1, -1,  1, -1 };
 
 /* ═══════════════════════ BIT-ARRAY HELPERS ════════════════════════════════ */
 
@@ -143,17 +150,21 @@ static bool is_frontier(const quadtree_map_t *m, int ix, int iy,
 }
 
 /* ═══════════════════════ is_safe_cell ═════════════════════════════════════
- * Returns true if all 8 neighbours of (ix, iy) are free.
- * Used by safety_spiral: the target must not sit right next to a wall.
+ * Returns true if every cell within ROBOT_CLEAR_CELLS Chebyshev radius of
+ * (ix, iy) is free — i.e., the full (2R+1)² box is obstacle-free.
+ * This guarantees the robot body (394×295 mm, half-diagonal ≈ 246 mm) clears
+ * walls when the navigation target is placed at this cell.
  * ══════════════════════════════════════════════════════════════════════════ */
 static bool is_safe_cell(const quadtree_map_t *m, int ix, int iy,
                           float res, int mw, int mh)
 {
-    for (int k = 0; k < 8; k++) {
-        int nx = ix + K8X[k];
-        int ny = iy + K8Y[k];
-        if (!in_bounds(nx, ny, mw, mh)) continue;
-        if (!cell_is_free(m, cx_mm(nx, res), cy_mm(ny, res))) return false;
+    for (int dy = -ROBOT_CLEAR_CELLS; dy <= ROBOT_CLEAR_CELLS; dy++) {
+        for (int dx = -ROBOT_CLEAR_CELLS; dx <= ROBOT_CLEAR_CELLS; dx++) {
+            int nx = ix + dx;
+            int ny = iy + dy;
+            if (!in_bounds(nx, ny, mw, mh)) continue;
+            if (!cell_is_free(m, cx_mm(nx, res), cy_mm(ny, res))) return false;
+        }
     }
     return true;
 }

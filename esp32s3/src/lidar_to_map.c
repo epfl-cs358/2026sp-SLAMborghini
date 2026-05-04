@@ -22,8 +22,11 @@ void lidar_to_map(quadtree_map_t     *map,
                   const lidar_scan_t *scan,
                   const pose_t       *pose,
                   float               max_range_mm,
-                  float               step_mm)
+                  float               step_mm,
+                  map_dirty_rect_t   *out_dirty)
 {
+    if (out_dirty) out_dirty->valid = false;
+
     if (!map || !scan || !pose) return;
     if (scan->count == 0 || step_mm <= 0.0f) return;
 
@@ -47,6 +50,15 @@ void lidar_to_map(quadtree_map_t     *map,
      * position stays unknown (ray marching starts at t=step_mm, not t=0)
      * and the BFS exits immediately. */
     qt_update(map, x0, y0, QT_MISS_DEC);
+
+    /* Seed dirty rect with robot position */
+    if (out_dirty) {
+        out_dirty->x_min = x0;
+        out_dirty->y_min = y0;
+        out_dirty->x_max = x0;
+        out_dirty->y_max = y0;
+        out_dirty->valid = true;
+    }
 
     for (uint16_t i = 0; i < scan->count; i++) {
 
@@ -72,6 +84,16 @@ void lidar_to_map(quadtree_map_t     *map,
         float ey  = y0 + lx * sin_t + ly * cos_t;
 
         if (!_valid(ex) || !_valid(ey)) continue;
+
+        /* Expand dirty rect to include this beam's endpoint.
+         * All ray-step cells lie on the segment (x0,y0)→(ex,ey) so
+         * the endpoints already bound the entire beam geometrically. */
+        if (out_dirty) {
+            if (ex < out_dirty->x_min) out_dirty->x_min = ex;
+            if (ey < out_dirty->y_min) out_dirty->y_min = ey;
+            if (ex > out_dirty->x_max) out_dirty->x_max = ex;
+            if (ey > out_dirty->y_max) out_dirty->y_max = ey;
+        }
 
         /* Unit vector along beam */
         float dx = (ex - x0) / r;

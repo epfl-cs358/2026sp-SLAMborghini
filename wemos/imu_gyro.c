@@ -2,14 +2,12 @@
  * imu_gyro.c
  * Minimal ICM-20948 gyro-Z driver for ESP-IDF.
  *
- * Wiring (from 2025fa-SLAMurai icm_control/config.hpp):
- *   SDA = GPIO 21,  SCL = GPIO 22,  I2C addr = 0x68
- *
- * Only gyro Z is used — we integrate it during each drive to get the
- * actual heading change and feed it back into dead_reckon_pose().
+ * In the two-board layout the ICM-20948 is wired to the ESP32-S3 — see
+ * hardware_pins.h for the current pin assignments (SDA=GPIO8, SCL=GPIO9).
  */
 
 #include "imu_gyro.h"
+#include "hardware_pins.h"
 
 #include "driver/i2c.h"
 #include "freertos/FreeRTOS.h"
@@ -17,10 +15,6 @@
 #include "esp_log.h"
 #include <math.h>
 
-/* ── I2C config (from SLAMurai) ─────────────────────────────────────────── */
-#define IMU_I2C_PORT    I2C_NUM_0
-#define IMU_SDA_PIN     21
-#define IMU_SCL_PIN     22
 #define IMU_ADDR        0x68
 #define IMU_TIMEOUT_MS  10
 
@@ -44,7 +38,8 @@
 #define POLL_MS         10u    /* 100 Hz */
 
 static const char *TAG = "imu_gyro";
-static bool (*s_stop_check)(void) = NULL;
+static bool  (*s_stop_check)(void) = NULL;
+static volatile float s_live_heading = 0.0f;
 
 /* ── Low-level I2C helpers ───────────────────────────────────────────────── */
 static esp_err_t imu_write(uint8_t reg, uint8_t val)
@@ -73,6 +68,15 @@ static void imu_select_bank(uint8_t bank)
 void imu_gyro_set_stop_check(bool (*fn)(void))
 {
     s_stop_check = fn;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * imu_gyro_get_heading
+ * ════════════════════════════════════════════════════════════════════════════ */
+float imu_gyro_get_heading(void)
+{
+    return s_live_heading;
 }
 
 
@@ -167,6 +171,7 @@ float imu_gyro_read_z(void)
 float imu_drive_and_track(float start_heading_rad, uint32_t drive_ms)
 {
     float heading = start_heading_rad;
+    s_live_heading = heading;   /* publish before first tick so scan_task sees it */
     uint32_t elapsed = 0;
 
     while (elapsed < drive_ms) {
@@ -174,6 +179,7 @@ float imu_drive_and_track(float start_heading_rad, uint32_t drive_ms)
         uint32_t step = (drive_ms - elapsed < POLL_MS) ? (drive_ms - elapsed) : POLL_MS;
         float gz = imu_gyro_read_z();
         heading += gz * ((float)step / 1000.0f);
+        s_live_heading = heading;   /* publish each integration step (~100 Hz) */
         vTaskDelay(pdMS_TO_TICKS(step));
         elapsed += step;
     }
@@ -182,5 +188,6 @@ float imu_drive_and_track(float start_heading_rad, uint32_t drive_ms)
     while (heading >  (float)M_PI) heading -= 2.0f * (float)M_PI;
     while (heading < -(float)M_PI) heading += 2.0f * (float)M_PI;
 
+    s_live_heading = heading;   /* publish normalised final value */
     return heading;
 }

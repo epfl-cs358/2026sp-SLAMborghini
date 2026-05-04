@@ -225,7 +225,7 @@ input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
       <div class="ck"><input type="checkbox" id="chkFollow" checked><label for="chkFollow">Follow robot</label></div>
       <div class="ck"><input type="checkbox" id="chkScan"   checked><label for="chkScan">LiDAR scan</label></div>
       <div class="ck"><input type="checkbox" id="chkTrail"  checked><label for="chkTrail">Path trail</label></div>
-      <div class="ck"><input type="checkbox" id="chkQT"><label for="chkQT">Quadtree grid</label></div>
+      <div class="ck"><input type="checkbox" id="chkQT" checked><label for="chkQT">Quadtree view</label></div>
       <button onclick="resetView()" style="width:100%;margin-top:6px">Reset View</button>
     </div>
 
@@ -530,6 +530,55 @@ function drawQuadtreeOverlay() {
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
+ * drawQuadtreeMap — primary map renderer using quadtree node rectangles
+ *
+ * Draws nodes in DFS pre-order (message arrival order): parent fills its
+ * area first, then children overwrite their sub-areas. This naturally gives:
+ *   - one big square for unexplored regions (root node, depth 1)
+ *   - progressively smaller squares where the robot has scanned
+ *
+ * Color encoding (matches the grid legend):
+ *   value = 0  (unknown) → orange  #f4a261
+ *   value < 0  (free)    → white   #ffffff
+ *   value > 0  (occupied)→ dark gray → black  scaled by value/40
+ *
+ * Border: depth-encoded strokes show the tree hierarchy.
+ * ════════════════════════════════════════════════════════════════════════════ */
+function drawQuadtreeMap() {
+  if (!qtNodes || !mapState) return;
+  const ppm = BASE_PX * cam.zoom / mapState.cellMm;  // canvas pixels per mm
+
+  for (const nd of qtNodes) {
+    // canvas top-left of this node (world Y increases upward, canvas Y downward)
+    const [sx, sy] = w2c(nd.xMin, nd.yMin + nd.size);
+    const spx = nd.size * ppm;
+    if (spx < 0.5) continue;
+
+    // Fill by occupancy
+    if (nd.value < 0) {
+      ctx.fillStyle = '#ffffff';
+    } else if (nd.value > 0) {
+      const t = Math.min(1, nd.value / 40);
+      const g = Math.round(200 * (1 - t));
+      ctx.fillStyle = `rgb(${g},${g},${g})`;
+    } else {
+      ctx.fillStyle = '#f4a261';
+    }
+    ctx.fillRect(sx, sy, spx, spx);
+
+    // Depth-encoded border (skip hairline on tiny cells)
+    if (spx >= 2) {
+      const d = nd.depth;
+      if      (d <= 2) { ctx.strokeStyle = 'rgba(100,100,100,0.85)'; ctx.lineWidth = 1.5; }
+      else if (d <= 4) { ctx.strokeStyle = 'rgba(153,153,153,0.65)'; ctx.lineWidth = 0.8; }
+      else if (d <= 6) { ctx.strokeStyle = 'rgba(187,187,187,0.45)'; ctx.lineWidth = 0.4; }
+      else             { ctx.strokeStyle = 'rgba(255,255,255,0.30)'; ctx.lineWidth = 0.2; }
+      ctx.strokeRect(sx, sy, spx, spx);
+    }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
  * Robot drawing (RC car top-view)
  * ════════════════════════════════════════════════════════════════════════════ */
 function drawRobot(cx, cy, theta) {
@@ -600,12 +649,17 @@ function render(now) {
   const mW = gw * BASE_PX * cam.zoom;
   const mH = gh * BASE_PX * cam.zoom;
 
-  /* ── 1. Map bitmap (GPU-cached, only rebuilt on new 0x01 frame) ── */
+  /* ── 1. Map layer ── */
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(bitmap, cam.tx, cam.ty, mW, mH);
-
-  /* ── 1b. Quadtree wireframe overlay ── */
-  if (document.getElementById('chkQT').checked) drawQuadtreeOverlay();
+  if (document.getElementById('chkQT').checked && qtNodes) {
+    /* Quadtree-native view: filled rectangles sized by node, DFS order */
+    drawQuadtreeMap();
+  } else {
+    /* Flat grid fallback (bitmap, delta-patched) */
+    ctx.drawImage(bitmap, cam.tx, cam.ty, mW, mH);
+    /* Wireframe overlay if quadtree checked but no data yet */
+    if (document.getElementById('chkQT').checked) drawQuadtreeOverlay();
+  }
 
   /* ── 2. Path trail (cyan) ── */
   if (document.getElementById('chkTrail').checked && trailPts.length > 1) {

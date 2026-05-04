@@ -50,6 +50,10 @@ typedef struct {
     int parent;
 } astar_state_t;
 
+static bool line_is_collision_free_quadtree(const quadtree_map_t *map,
+                                            float x0, float y0,
+                                            float x1, float y1);
+
 static path_t hybrid_astar_empty_path(void)
 {
     path_t path;

@@ -22,14 +22,22 @@
  * USE_WAYPOINT_PLAYBACK  0,
  * USE_FRONTIER_TARGET    0  →  UART + motor smoke test (hardcoded 200 mm fwd).
  * ─────────────────────────────────────────────────────────────────────────── */
+/* ── Hardware test modes — uncomment exactly one; all USE_* flags are ignored ── */
+// #define TEST_LIDAR           /* read scans and print point count + samples   */
+#define TEST_BRIDGE_TX       /* send test control frames to Wemos every 2 s  */
+// #define TEST_BRIDGE_PING     /* interactive: press ENTER → send "hey1", print replies */
+/* NOTE: TEST_IMU lives in wemos/main.c — IMU is on the Wemos I2C bus.      */
+
 #define USE_REAL_LIDAR         1   /* ← SET TO 1 FOR REAL LIDAR HARDWARE        */
 #define USE_WAYPOINT_PLAYBACK  0   /* ← SET TO 1 FOR ROOM.LOG PLAYBACK          */
 #define USE_FRONTIER_TARGET    0   /* ← SET TO 1 FOR FRONTIER EXPLORATION        */
+#define USE_LOCAL_PLANNER      0   /* ← SET TO 1 TO ENABLE HYBRID A* + LOCAL PLANNER */
 
 /* ── Wi-Fi credentials — fill in before flashing ───────────────────────── */
-#define WIFI_SSID      "YOUR_SSID"
-#define WIFI_PASSWORD  "YOUR_PASSWORD"
+#define WIFI_SSID      "SPOT-iot"
+#define WIFI_PASSWORD  "RacailleSalutaireMigration8052"
 
+#include "../hardware_pins.h"
 #include "src/lidar_driver.h"
 #include "src/lidar_to_map.h"
 #include "src/polar_to_cart.h"
@@ -45,6 +53,9 @@
 #include "src/command_gen.h"
 #include "src/uart_bridge.h"
 #include "src/wifi_dashboard.h"
+#if USE_LOCAL_PLANNER
+#include "src/local_planner.h"
+#endif
 #include "src/test/test_room.h"         /* build_test_room() */
 #include "src/test/room_data.h"         /* ROOM_WIDTH_MM, ROOM_HEIGHT_MM */
 #include "src/test/simulate_lidar.h"    /* slam_map_init(), simulate_and_update_map() */
@@ -97,6 +108,152 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
  * ════════════════════════════════════════════════════════════════════════════ */
 void app_main(void)
 {
+/* ════════════════════════════════════════════════════════════════════════════
+ * TEST_LIDAR — read scans in a loop and print stats to serial.
+ * ════════════════════════════════════════════════════════════════════════════ */
+#if defined(TEST_LIDAR)
+
+    lidar_driver_init();
+    printf("[TEST_LIDAR] Waiting for scans on UART%d RX=GPIO%d TX=GPIO%d...\n",
+           (int)LIDAR_UART_PORT, LIDAR_UART_RX, LIDAR_UART_TX);
+
+    static lidar_scan_t scan;   /* ~4 KB — too large for stack, put in BSS */
+    while (1) {
+        if (!lidar_driver_read_scan(&scan) || scan.count == 0) {
+            printf("[TEST_LIDAR] No scan — LiDAR not responding\n");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        float min_d = 99999.0f, max_d = 0.0f;
+        for (int i = 0; i < (int)scan.count; i++) {
+            if (scan.points[i].r_mm < min_d) min_d = scan.points[i].r_mm;
+            if (scan.points[i].r_mm > max_d) max_d = scan.points[i].r_mm;
+        }
+        printf("[TEST_LIDAR] pts=%u  min=%.0f mm  max=%.0f mm\n",
+               (unsigned)scan.count, (double)min_d, (double)max_d);
+        for (int s = 0; s < 5; s++) {
+            int idx = (int)scan.count * s / 5;
+            printf("  [%3d] %6.1f deg  %6.0f mm\n",
+                   idx,
+                   (double)scan.points[idx].theta_deg,
+                   (double)scan.points[idx].r_mm);
+        }
+    }
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * TEST_BRIDGE_TX — send test control frames to Wemos every 2 s.
+ * Flash Wemos with TEST_BRIDGE_RX to see the decoded frames on its serial.
+ * ════════════════════════════════════════════════════════════════════════════ */
+#elif defined(TEST_BRIDGE_TX)
+
+    uart_bridge_init();
+    printf("[TEST_BRIDGE_TX] Sending curved path every 500 ms on UART%d"
+           "  TX=GPIO%d  RX=GPIO%d  %d baud\n",
+           (int)BRIDGE_UART_PORT,
+           (int)BRIDGE_TX_PIN, (int)BRIDGE_RX_PIN,
+           BRIDGE_BAUD);
+
+       uint32_t n = 0;
+
+    while (1) {
+        path_frame_t path_frame = {0};
+
+        path_frame.length = 5;
+
+        path_frame.waypoints[0].x = 0.0f;
+        path_frame.waypoints[0].y = 0.0f;
+        path_frame.waypoints[0].theta = 0.0f;
+        path_frame.waypoints[0].v_target = 150.0f;
+
+        path_frame.waypoints[1].x = 300.0f;
+        path_frame.waypoints[1].y = 0.0f;
+        path_frame.waypoints[1].theta = 0.0f;
+        path_frame.waypoints[1].v_target = 150.0f;
+
+        path_frame.waypoints[2].x = 600.0f;
+        path_frame.waypoints[2].y = 150.0f;
+        path_frame.waypoints[2].theta = 0.2f;
+        path_frame.waypoints[2].v_target = 150.0f;
+
+        path_frame.waypoints[3].x = 850.0f;
+        path_frame.waypoints[3].y = 350.0f;
+        path_frame.waypoints[3].theta = 0.4f;
+        path_frame.waypoints[3].v_target = 150.0f;
+
+        path_frame.waypoints[4].x = 1000.0f;
+        path_frame.waypoints[4].y = 600.0f;
+        path_frame.waypoints[4].theta = 0.6f;
+        path_frame.waypoints[4].v_target = 150.0f;
+
+        bool ok = uart_bridge_send_path(&path_frame);
+
+        printf("[TEST_BRIDGE_TX] Path #%u  length=%u  %s\n",
+               (unsigned)++n,
+               (unsigned)path_frame.length,
+               ok ? "sent" : "UART FAIL");
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * TEST_BRIDGE_PING — interactive bidirectional raw UART test.
+ * Press ENTER here → sends "hey1 #N" to Wemos.
+ * Anything received from Wemos is printed immediately.
+ * Flash Wemos with TEST_BRIDGE_PONG to close the loop.
+ * ════════════════════════════════════════════════════════════════════════════ */
+#elif defined(TEST_BRIDGE_PING)
+
+    uart_config_t ping_cfg = {
+        .baud_rate  = BRIDGE_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_param_config(BRIDGE_UART_PORT, &ping_cfg);
+    uart_set_pin(BRIDGE_UART_PORT, BRIDGE_TX_PIN, BRIDGE_RX_PIN,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(BRIDGE_UART_PORT, 512, 512, 0, NULL, 0);
+
+    printf("[ESP32-S3] Ping test on UART%d  TX=GPIO%d  RX=GPIO%d  %d baud\n",
+           (int)BRIDGE_UART_PORT, (int)BRIDGE_TX_PIN, (int)BRIDGE_RX_PIN,
+           BRIDGE_BAUD);
+    printf("[ESP32-S3] Press ENTER to send 'hey1' to Wemos\n");
+
+    uint32_t ping_n = 0;
+    while (1) {
+        /* Print anything that arrived from Wemos */
+        size_t avail = 0;
+        uart_get_buffered_data_len(BRIDGE_UART_PORT, &avail);
+        if (avail > 0) {
+            uint8_t rbuf[64] = {0};
+            int got = uart_read_bytes(BRIDGE_UART_PORT, rbuf,
+                                      avail < 63 ? (int)avail : 63, 0);
+            if (got > 0) {
+                if (rbuf[got - 1] == '\n') rbuf[got - 1] = '\0';
+                printf("[ESP32-S3] Received: %s\n", (char *)rbuf);
+            }
+        }
+
+        /* Send on ENTER keypress */
+        int c = getchar();
+        if (c != EOF && c != '\r' && c != '\n') {
+            while (getchar() != EOF);
+            ping_n++;
+            char msg[32];
+            int mlen = snprintf(msg, sizeof(msg), "hey1 #%u\n", (unsigned)ping_n);
+            uart_write_bytes(BRIDGE_UART_PORT, msg, mlen);
+            printf("[ESP32-S3] Sent: hey1 #%u\n", (unsigned)ping_n);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+
+#else  /* ── Normal SLAM operation ───────────────────────────────────────── */
+
     /* ── Hardware init ───────────────────────────────────────────────────── */
     uart_bridge_init();
     vTaskDelay(pdMS_TO_TICKS(1000));   /* let Wemos boot */
@@ -123,23 +280,58 @@ void app_main(void)
     quadtree_map_init(&slam_map, 10000.0f, 10000.0f, 50.0f);
 
     pose_t pose = { .x = 5000.0f, .y = 5000.0f, .theta = 0.0f };
-    lidar_scan_t scan;
+    static lidar_scan_t scan;   /* ~4 KB — too large for stack, put in BSS */
 
-    /* Wait for browser to send {"cmd":"start"} before driving */
+    /* Wait for browser to send {"cmd":"start"} before driving.
+     * Keep scanning so the map populates live even while stationary. */
     while (!wifi_dashboard_exploration_requested()) {
+        if (lidar_driver_read_scan(&scan) && scan.count > 10) {
+            map_dirty_rect_t dr;
+            lidar_to_map(&slam_map, &scan, &pose, 6000.0f, 150.0f, &dr);
+            wifi_dashboard_mark_dirty(&dr);
+            wifi_dashboard_broadcast_scan(&scan, &pose);
+        }
         wifi_dashboard_update(&slam_map, &pose);
         wifi_dashboard_broadcast_state(&pose, 0.0f, 0.0f, false, 0);
-        vTaskDelay(pdMS_TO_TICKS(200));
     }
+
+    /* prev_cmd / prev_drv_ms track the command that was just dispatched so
+     * we can (a) wait for it to finish at the TOP of the next iteration and
+     * (b) dead-reckon the pose BEFORE integrating the fresh scan.
+     *
+     * Correct ordering mirrors the simulation pipeline:
+     *   wait → dead_reckon (post-drive pose) → scan → map → frontier → drive
+     *
+     * First iteration: prev_drv_ms == 0 (no wait), prev_cmd zeroed (no-op
+     * dead_reckon), so the robot's initial pose is used for the first scan. */
+    control_frame_t prev_cmd    = {0};
+    uint32_t        prev_drv_ms = 0;
+
+#if USE_LOCAL_PLANNER
+    path_t lp_path = {0};
+    local_planner_init(120.0f);
+#endif
 
     while (1) {
 
-        /* ── Acquire scan, integrate into map ───────────────────────────── */
+        /* ── Wait for the previous drive to complete ─────────────────────── */
+        if (prev_drv_ms > 0)
+            vTaskDelay(pdMS_TO_TICKS(prev_drv_ms + CYCLE_DELAY_MS));
+
+        /* ── Dead-reckon to post-drive pose ──────────────────────────────────
+         * Done BEFORE lidar_to_map so the scan integrates at the position the
+         * robot actually occupies when stationary.  Mirrors the simulation's
+         * integrate_scan(qt, scan, scan_rx, scan_ry) call order. */
+        dead_reckon_pose(&pose, &prev_cmd);
+
+        /* ── Acquire scan, integrate at post-drive pose ──────────────────── */
         if (lidar_driver_read_scan(&scan) && scan.count > 10) {
-            lidar_to_map(&slam_map, &scan, &pose, 6000.0f, 50.0f);
+            map_dirty_rect_t dr;
+            lidar_to_map(&slam_map, &scan, &pose, 6000.0f, 150.0f, &dr);
+            wifi_dashboard_mark_dirty(&dr);
         }
 
-        /* ── Push updated map to dashboard ──────────────────────────────── */
+        /* ── Push map + quadtree to dashboard ───────────────────────────── */
         wifi_dashboard_update(&slam_map, &pose);
 
         /* ── Frontier detection ──────────────────────────────────────────── */
@@ -151,35 +343,85 @@ void app_main(void)
 
         if (frontiers.count > 0) {
             frontier_t best = frontier_detector_best(&frontiers, &pose);
-            waypoint_t wp   = { .x = best.cx, .y = best.cy };
-            cmd             = command_gen_compute(&pose, &wp);
             has_frontier    = true;
             fx              = best.cx;
             fy              = best.cy;
+#if USE_LOCAL_PLANNER
+            /* Replan when requested or path expired */
+            if (local_planner_replan_needed() || !hybrid_astar_is_valid(&lp_path)) {
+                lp_path = hybrid_astar_plan(&slam_map, &pose, &best);
+                if (hybrid_astar_is_valid(&lp_path)) {
+                    local_planner_reset_waypoint();
+                    local_planner_clear_replan();
+                }
+            }
+            if (!local_planner_update(&slam_map, &pose, &lp_path, false, &cmd)) {
+                waypoint_t wp = { .x = best.cx, .y = best.cy };
+                cmd           = command_gen_compute(&pose, &wp);
+            }
+#else
+            waypoint_t wp = { .x = best.cx, .y = best.cy };
+            cmd           = command_gen_compute(&pose, &wp);
+#endif
         } else {
-            /* No frontier yet — nudge forward slowly */
             cmd.tx        = 0.0f;
             cmd.ty        = DEBUG_FORWARD_MM;
             cmd.t_heading = pose.theta;
             cmd.t_speed   = DEBUG_SPEED_MM_S;
         }
 
-        /* ── Transmit command to Wemos ───────────────────────────────────── */
-        uart_bridge_send_control(&cmd);
+        /* ── Transmit path/command to Wemos ──────────────────────────────── */
+        bool sent_path = false;
+
+#if USE_LOCAL_PLANNER
+        /*
+         * New Pure Pursuit protocol:
+         * If Hybrid A* produced a valid path, send a short path_frame_t
+         * to the Wemos. Wemos will run Pure Pursuit on this path.
+         */
+        if (has_frontier && hybrid_astar_is_valid(&lp_path)) {
+            path_frame_t path_frame = {0};
+
+            uint8_t n = (lp_path.length > MAX_SHARED_PATH_POINTS)
+                        ? MAX_SHARED_PATH_POINTS
+                        : (uint8_t)lp_path.length;
+
+            path_frame.length = n;
+
+            for (uint8_t i = 0; i < n; i++) {
+                path_frame.waypoints[i] = lp_path.waypoints[i];
+
+                if (path_frame.waypoints[i].v_target <= 10.0f) {
+                    path_frame.waypoints[i].v_target = cmd.t_speed;
+                }
+            }
+
+            sent_path = uart_bridge_send_path(&path_frame);
+
+            printf("[S3] sent path: length=%u status=%s\n",
+                   (unsigned)path_frame.length,
+                   sent_path ? "OK" : "FAIL");
+        }
+#endif
+
+        /*
+         * Old fallback protocol:
+         * If no valid path exists, send the single control_frame_t.
+         */
+        if (!sent_path) {
+            uart_bridge_send_control(&cmd);
+        }
 
         /* ── Broadcast state ─────────────────────────────────────────────── */
         wifi_dashboard_broadcast_state(&pose, fx, fy, has_frontier, 0);
 
-        /* ── Dead-reckon pose from command ───────────────────────────────── */
-        dead_reckon_pose(&pose, &cmd);
-
-        /* ── Wait for Wemos to finish driving ────────────────────────────── */
-        float dist_mm = sqrtf(cmd.tx * cmd.tx + cmd.ty * cmd.ty);
-        float speed   = (cmd.t_speed > 10.0f) ? cmd.t_speed : DEBUG_SPEED_MM_S;
-        uint32_t drive_ms = (uint32_t)((dist_mm / speed) * 1000.0f);
-        if (drive_ms > MAX_DRIVE_MS) drive_ms = MAX_DRIVE_MS;
-        if (drive_ms < 50u)          drive_ms = 50u;
-        vTaskDelay(pdMS_TO_TICKS(drive_ms + CYCLE_DELAY_MS));
+        /* ── Compute drive duration; save command for next iteration ──────── */
+        float    dist_mm = sqrtf(cmd.tx * cmd.tx + cmd.ty * cmd.ty);
+        float    spd     = (cmd.t_speed > 10.0f) ? cmd.t_speed : DEBUG_SPEED_MM_S;
+        prev_drv_ms      = (uint32_t)((dist_mm / spd) * 1000.0f);
+        if (prev_drv_ms > MAX_DRIVE_MS) prev_drv_ms = MAX_DRIVE_MS;
+        if (prev_drv_ms < 50u)          prev_drv_ms = 50u;
+        prev_cmd = cmd;
     }
 
 
@@ -345,4 +587,6 @@ void app_main(void)
     }
 
 #endif  /* USE_REAL_LIDAR / USE_WAYPOINT_PLAYBACK */
+
+#endif  /* TEST_LIDAR / TEST_IMU / TEST_BRIDGE_TX / else (normal SLAM) */
 }
