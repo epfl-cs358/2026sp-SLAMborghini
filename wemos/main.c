@@ -910,10 +910,48 @@ static void bridge_slave_task(void *arg)
         .cov = {0}
     };
 
-    for (;;) {
-        control_frame_t cmd;
+        for (;;) {
+        control_frame_t cmd = {0};
+        bool have_command = false;
 
-        if (uart_bridge_recv_control(&cmd)) {
+        /*
+         * New protocol:
+         * Try to receive a real path from ESP32-S3.
+         */
+        path_frame_t path_frame;
+
+        if (uart_bridge_recv_path(&path_frame)) {
+            printf("[SLAVE] path received: length=%u\n",
+                   (unsigned)path_frame.length);
+
+            pp_set_path(&pp,
+                        path_frame.waypoints,
+                        path_frame.length);
+
+            /*
+             * For now, use the final path point only to estimate how long
+             * to drive. The steering itself comes from Pure Pursuit.
+             */
+            waypoint_t final_wp =
+                path_frame.waypoints[path_frame.length - 1];
+
+            cmd.tx = final_wp.x - local_pose.x;
+            cmd.ty = final_wp.y - local_pose.y;
+            cmd.t_heading = final_wp.theta;
+            cmd.t_speed = final_wp.v_target;
+
+            if (cmd.t_speed <= 10.0f) {
+                cmd.t_speed = 150.0f;
+            }
+
+            have_command = true;
+        }
+
+        /*
+         * Old protocol fallback:
+         * If no path packet arrived, receive the old single control_frame_t.
+         */
+        if (!have_command && uart_bridge_recv_control(&cmd)) {
             printf("[SLAVE] cmd: hdg=%.2f rad  spd=%.0f mm/s  tx=%.0f  ty=%.0f\n",
                    (double)cmd.t_heading,
                    (double)cmd.t_speed,
@@ -922,12 +960,9 @@ static void bridge_slave_task(void *arg)
 
             /*
              * Temporary path adapter:
-             * Current UART protocol sends one control_frame_t, not a full path.
+             * Current old UART protocol sends one control_frame_t, not a full path.
              * So we create a small 2-point path from the current local pose
              * to the received target displacement.
-             *
-             * Assumption for now:
-             * cmd.tx/cmd.ty are relative displacement commands in mm.
              */
             waypoint_t path[2];
 
@@ -943,58 +978,71 @@ static void bridge_slave_task(void *arg)
 
             pp_set_path(&pp, path, 2);
 
-            pp_motion_command_t pp_cmd = pp_compute_command(&pp, &local_pose);
-
-            printf("[PP] speed=%.0f mm/s  servo=%.1f deg  stop=%d\n",
-                   (double)pp_cmd.speed_mm_s,
-                   (double)pp_cmd.steering_deg,
-                   (int)pp_cmd.stop);
-
-            if (pp_cmd.stop) {
-                motors_stop();
-                set_duty(SERVO_CH, SERVO_DUTY_CENTER);
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-
-            uint32_t servo_duty = servo_deg_to_duty(pp_cmd.steering_deg);
-            set_duty(SERVO_CH, servo_duty);
-            vTaskDelay(pdMS_TO_TICKS(50));
-
-            float dist_mm = sqrtf(cmd.tx * cmd.tx + cmd.ty * cmd.ty);
-            if (dist_mm < 50.0f) {
-                dist_mm = DEBUG_FORWARD_MM;
-            }
-
-            float speed = pp_cmd.speed_mm_s;
-            if (cmd.t_speed > 10.0f) {
-                speed = cmd.t_speed;
-            }
-
-            uint32_t drive_ms = (uint32_t)((dist_mm / speed) * 1000.0f);
-            if (drive_ms > MAX_DRIVE_MS) drive_ms = MAX_DRIVE_MS;
-            if (drive_ms < 50)           drive_ms = 50;
-
-            set_duty(CH_FWD, MOTOR_DUTY_FWD);
-            set_duty(CH_BWD, MOTOR_DUTY_STOP);
-
-            float new_heading = imu_drive_and_track(local_pose.theta, drive_ms);
-
-            motors_stop();
-
-            /*
-             * Dead-reckon local pose after the movement.
-             * This is temporary until the proper EKF/odometry loop is connected.
-             */
-            local_pose.x += dist_mm * cosf(cmd.t_heading);
-            local_pose.y += dist_mm * sinf(cmd.t_heading);
-            local_pose.theta = new_heading;
-
-            printf("[PP] updated pose: x=%.0f y=%.0f theta=%.2f rad\n",
-                   (double)local_pose.x,
-                   (double)local_pose.y,
-                   (double)local_pose.theta);
+            have_command = true;
         }
+
+        if (!have_command) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        pp_motion_command_t pp_cmd =
+            pp_compute_command(&pp, &local_pose);
+
+        printf("[PP] speed=%.0f mm/s  servo=%.1f deg  stop=%d\n",
+               (double)pp_cmd.speed_mm_s,
+               (double)pp_cmd.steering_deg,
+               (int)pp_cmd.stop);
+
+        if (pp_cmd.stop) {
+            motors_stop();
+            set_duty(SERVO_CH, SERVO_DUTY_CENTER);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        uint32_t servo_duty =
+            servo_deg_to_duty(pp_cmd.steering_deg);
+
+        set_duty(SERVO_CH, servo_duty);
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        float dist_mm = sqrtf(cmd.tx * cmd.tx + cmd.ty * cmd.ty);
+        if (dist_mm < 50.0f) {
+            dist_mm = DEBUG_FORWARD_MM;
+        }
+
+        float speed = pp_cmd.speed_mm_s;
+        if (cmd.t_speed > 10.0f) {
+            speed = cmd.t_speed;
+        }
+
+        uint32_t drive_ms =
+            (uint32_t)((dist_mm / speed) * 1000.0f);
+
+        if (drive_ms > MAX_DRIVE_MS) drive_ms = MAX_DRIVE_MS;
+        if (drive_ms < 50)           drive_ms = 50;
+
+        set_duty(CH_FWD, MOTOR_DUTY_FWD);
+        set_duty(CH_BWD, MOTOR_DUTY_STOP);
+
+        float new_heading =
+            imu_drive_and_track(local_pose.theta, drive_ms);
+
+        motors_stop();
+
+        /*
+         * Dead-reckon local pose after the movement.
+         * This is temporary until proper EKF/odometry feedback is connected.
+         */
+        local_pose.x += dist_mm * cosf(cmd.t_heading);
+        local_pose.y += dist_mm * sinf(cmd.t_heading);
+        local_pose.theta = new_heading;
+
+        printf("[PP] updated pose: x=%.0f y=%.0f theta=%.2f rad\n",
+               (double)local_pose.x,
+               (double)local_pose.y,
+               (double)local_pose.theta);
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }

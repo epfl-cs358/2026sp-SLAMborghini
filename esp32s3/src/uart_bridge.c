@@ -16,9 +16,10 @@
 
 #define MSG_CONTROL        0x01u
 #define MSG_ODOM           0x02u
+#define MSG_PATH           0x03u
 
 #define HEADER_LEN         4u
-#define MAX_PAYLOAD_LEN    128u
+#define MAX_PAYLOAD_LEN    256u
 
 static uint8_t checksum_xor(const uint8_t *data, uint8_t len)
 {
@@ -93,6 +94,24 @@ bool uart_bridge_send_control(const control_frame_t *frame)
     return send_packet(MSG_CONTROL,
                        frame,
                        (uint8_t)sizeof(control_frame_t));
+}
+
+bool uart_bridge_send_path(const path_frame_t *path_frame)
+{
+    if (!path_frame) {
+        return false;
+    }
+
+    if (path_frame->length == 0 ||
+        path_frame->length > MAX_SHARED_PATH_POINTS) {
+        return false;
+    }
+
+    return send_packet(
+        MSG_PATH,
+        path_frame,
+        (uint8_t)sizeof(path_frame_t)
+    );
 }
 
 bool uart_bridge_recv_odom(odom_t *out)

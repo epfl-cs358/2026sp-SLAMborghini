@@ -67,9 +67,10 @@
 
 #define MSG_CONTROL        0x01u
 #define MSG_ODOM           0x02u
+#define MSG_PATH           0x03u
 
 #define HEADER_LEN         4u
-#define MAX_PAYLOAD_LEN    128u
+#define MAX_PAYLOAD_LEN    256u
 
 /* ------------------------------------------------------------
  * Compute XOR checksum over byte array
@@ -195,6 +196,7 @@ bool uart_bridge_recv_control(control_frame_t *out)
         return false;
     }
 
+
 #ifdef ESP_PLATFORM
     size_t available = 0;
     uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
@@ -276,6 +278,105 @@ bool uart_bridge_recv_control(control_frame_t *out)
         }
 
         memcpy(out, payload, sizeof(control_frame_t));
+        return true;
+    }
+#endif
+
+    return false;
+}
+
+bool uart_bridge_recv_path(path_frame_t *out)
+{
+    if (!out) {
+        return false;
+    }
+
+#ifdef ESP_PLATFORM
+    size_t available = 0;
+    uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
+
+    if (available < HEADER_LEN + 1) {
+        return false;
+    }
+
+    while (available >= HEADER_LEN + 1) {
+        uint8_t byte = 0;
+
+        /* Search sync byte A */
+        uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, 0);
+
+        if (byte != SYNC_A) {
+            uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
+            continue;
+        }
+
+        /* Search sync byte B */
+        uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, 0);
+
+        if (byte != SYNC_B) {
+            uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
+            continue;
+        }
+
+        uint8_t msg_type = 0;
+        uint8_t payload_len = 0;
+
+        if (uart_read_bytes(BRIDGE_UART_PORT, &msg_type, 1, 0) != 1) {
+            return false;
+        }
+
+        if (uart_read_bytes(BRIDGE_UART_PORT, &payload_len, 1, 0) != 1) {
+            return false;
+        }
+
+        /* Must be path packet */
+        if (msg_type != MSG_PATH) {
+            return false;
+        }
+
+        if (payload_len != sizeof(path_frame_t) ||
+            payload_len > MAX_PAYLOAD_LEN) {
+            return false;
+        }
+
+        uint8_t payload[MAX_PAYLOAD_LEN];
+        uint8_t received_ck = 0;
+
+        if (uart_read_bytes(BRIDGE_UART_PORT,
+                            payload,
+                            payload_len,
+                            0) != payload_len) {
+            return false;
+        }
+
+        if (uart_read_bytes(BRIDGE_UART_PORT,
+                            &received_ck,
+                            1,
+                            0) != 1) {
+            return false;
+        }
+
+        uint8_t check_buf[2 + MAX_PAYLOAD_LEN];
+
+        check_buf[0] = msg_type;
+        check_buf[1] = payload_len;
+
+        memcpy(&check_buf[2], payload, payload_len);
+
+        uint8_t computed_ck =
+            checksum_xor(check_buf, payload_len + 2);
+
+        if (computed_ck != received_ck) {
+            return false;
+        }
+
+        memcpy(out, payload, sizeof(path_frame_t));
+
+        if (out->length == 0 ||
+            out->length > MAX_SHARED_PATH_POINTS) {
+            return false;
+        }
+
         return true;
     }
 #endif
