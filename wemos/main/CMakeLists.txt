@@ -13,6 +13,7 @@ idf_component_register(
     SRCS
         "${WEMOS_ROOT}/main.c"
         "${WEMOS_ROOT}/src/uart_bridge.c"
+        "${WEMOS_ROOT}/src/pure_pursuit_controller.c"
         "${WEMOS_ROOT}/imu_gyro.c"
         "${S3_SRC}/quadtree_map.c"
         "${S3_SRC}/quadtree_map_compat.c"
