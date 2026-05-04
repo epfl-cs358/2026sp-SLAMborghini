@@ -24,7 +24,7 @@
  * ─────────────────────────────────────────────────────────────────────────── */
 /* ── Hardware test modes — uncomment exactly one; all USE_* flags are ignored ── */
 // #define TEST_LIDAR           /* read scans and print point count + samples   */
-// #define TEST_BRIDGE_TX       /* send test control frames to Wemos every 2 s  */
+#define TEST_BRIDGE_TX       /* send test control frames to Wemos every 2 s  */
 // #define TEST_BRIDGE_PING     /* interactive: press ENTER → send "hey1", print replies */
 /* NOTE: TEST_IMU lives in wemos/main.c — IMU is on the Wemos I2C bus.      */
 
@@ -154,20 +154,35 @@ void app_main(void)
            (int)BRIDGE_TX_PIN, (int)BRIDGE_RX_PIN,
            BRIDGE_BAUD);
 
-    float heading = 0.0f;
-    uint32_t n = 0;
+       uint32_t n = 0;
+
     while (1) {
-        control_frame_t cmd = {
-            .tx        = 300.0f,
-            .ty        = 0.0f,
-            .t_heading = heading,
-            .t_speed   = 346.0f,
-        };
-        bool ok = uart_bridge_send_control(&cmd);
-        printf("[TEST_BRIDGE_TX] Frame #%u  hdg=%.2f rad  %s\n",
-               (unsigned)++n, (double)heading, ok ? "sent" : "UART FAIL");
-        heading += 0.5f;
-        if (heading > (float)M_PI) heading -= 2.0f * (float)M_PI;
+        path_frame_t path_frame = {0};
+
+        path_frame.length = 3;
+
+        path_frame.waypoints[0].x = 0.0f;
+        path_frame.waypoints[0].y = 0.0f;
+        path_frame.waypoints[0].theta = 0.0f;
+        path_frame.waypoints[0].v_target = 150.0f;
+
+        path_frame.waypoints[1].x = 300.0f;
+        path_frame.waypoints[1].y = 0.0f;
+        path_frame.waypoints[1].theta = 0.0f;
+        path_frame.waypoints[1].v_target = 150.0f;
+
+        path_frame.waypoints[2].x = 600.0f;
+        path_frame.waypoints[2].y = 200.0f;
+        path_frame.waypoints[2].theta = 0.3f;
+        path_frame.waypoints[2].v_target = 150.0f;
+
+        bool ok = uart_bridge_send_path(&path_frame);
+
+        printf("[TEST_BRIDGE_TX] Path #%u  length=%u  %s\n",
+               (unsigned)++n,
+               (unsigned)path_frame.length,
+               ok ? "sent" : "UART FAIL");
+
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 

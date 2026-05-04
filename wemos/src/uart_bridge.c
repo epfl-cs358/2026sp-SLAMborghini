@@ -44,6 +44,7 @@
 #ifdef ESP_PLATFORM
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
 #endif
 
 /*
@@ -248,17 +249,25 @@ bool uart_bridge_recv_control(control_frame_t *out)
         uint8_t payload[MAX_PAYLOAD_LEN];
         uint8_t received_ck = 0;
 
-        if (uart_read_bytes(BRIDGE_UART_PORT,
-                            payload,
-                            payload_len,
-                            0) != payload_len) {
+                int got_payload = uart_read_bytes(BRIDGE_UART_PORT,
+                                          payload,
+                                          payload_len,
+                                          pdMS_TO_TICKS(100));
+
+        if (got_payload != payload_len) {
+            printf("[UART DEBUG] payload read failed: got=%d expected=%u\n",
+                   got_payload,
+                   (unsigned)payload_len);
             return false;
         }
 
-        if (uart_read_bytes(BRIDGE_UART_PORT,
-                            &received_ck,
-                            1,
-                            0) != 1) {
+        int got_ck = uart_read_bytes(BRIDGE_UART_PORT,
+                                     &received_ck,
+                                     1,
+                                     pdMS_TO_TICKS(20));
+
+        if (got_ck != 1) {
+            printf("[UART DEBUG] checksum read failed: got=%d\n", got_ck);
             return false;
         }
 
@@ -329,30 +338,49 @@ bool uart_bridge_recv_path(path_frame_t *out)
             return false;
         }
 
+        printf("[UART DEBUG] rx msg_type=0x%02X payload_len=%u\n",
+               (unsigned)msg_type,
+               (unsigned)payload_len);
+
         /* Must be path packet */
         if (msg_type != MSG_PATH) {
+            printf("[UART DEBUG] not a path packet\n");
             return false;
         }
 
+                printf("[UART DEBUG] sizeof(path_frame_t)=%u\n",
+               (unsigned)sizeof(path_frame_t));
+
         if (payload_len != sizeof(path_frame_t) ||
             payload_len > MAX_PAYLOAD_LEN) {
+            printf("[UART DEBUG] bad path size: payload_len=%u expected=%u\n",
+                   (unsigned)payload_len,
+                   (unsigned)sizeof(path_frame_t));
             return false;
         }
 
         uint8_t payload[MAX_PAYLOAD_LEN];
         uint8_t received_ck = 0;
 
-        if (uart_read_bytes(BRIDGE_UART_PORT,
-                            payload,
-                            payload_len,
-                            0) != payload_len) {
+                int got_payload = uart_read_bytes(BRIDGE_UART_PORT,
+                                          payload,
+                                          payload_len,
+                                          pdMS_TO_TICKS(100));
+
+        if (got_payload != payload_len) {
+            printf("[UART DEBUG] payload read failed: got=%d expected=%u\n",
+                   got_payload,
+                   (unsigned)payload_len);
             return false;
         }
 
-        if (uart_read_bytes(BRIDGE_UART_PORT,
-                            &received_ck,
-                            1,
-                            0) != 1) {
+                int got_ck = uart_read_bytes(BRIDGE_UART_PORT,
+                                     &received_ck,
+                                     1,
+                                     pdMS_TO_TICKS(20));
+
+        if (got_ck != 1) {
+            printf("[UART DEBUG] checksum read failed: got=%d\n", got_ck);
             return false;
         }
 
@@ -367,13 +395,21 @@ bool uart_bridge_recv_path(path_frame_t *out)
             checksum_xor(check_buf, payload_len + 2);
 
         if (computed_ck != received_ck) {
+            printf("[UART DEBUG] checksum mismatch: computed=0x%02X received=0x%02X\n",
+                   (unsigned)computed_ck,
+                   (unsigned)received_ck);
             return false;
         }
 
         memcpy(out, payload, sizeof(path_frame_t));
 
+        printf("[UART DEBUG] path payload decoded: length=%u\n",
+               (unsigned)out->length);
+
         if (out->length == 0 ||
             out->length > MAX_SHARED_PATH_POINTS) {
+            printf("[UART DEBUG] invalid path length: %u\n",
+                   (unsigned)out->length);
             return false;
         }
 
