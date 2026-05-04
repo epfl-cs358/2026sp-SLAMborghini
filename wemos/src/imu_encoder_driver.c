@@ -18,8 +18,8 @@ static const char *TAG = "imu_encoder_driver";
 #define AS5600_RESOLUTION   4096        /* 12-bit absolute encoder */
 #define AS5600_TIMEOUT_MS   10
 
-/* TODO: measure real wheel diameter */
-#define WHEEL_CIRCUMFERENCE_M  0.204f   /* pi * 0.065 m */
+#define GEAR_RATIO  10.69f   /* calibrated */
+#define WHEEL_CIRCUMFERENCE_M  0.308f   /* measured — diameter 9.8 cm */
 
 /* Internal state */
 static imu_encoder_sample_t s_sample = {
@@ -28,8 +28,10 @@ static imu_encoder_sample_t s_sample = {
     .timestamp_ms = 0U
 };
 
-static float   s_yaw_integrated = 0.0f;
-static int64_t s_last_time_us   = 0;
+static float   s_yaw_integrated  = 0.0f;
+static int64_t s_last_time_us    = 0;
+static float   s_speed_ms        = 0.0f;
+static float   s_prev_distance   = 0.0f;
 
 /* Encoder rollover tracking */
 static int32_t s_cumulative_ticks = 0;
@@ -76,6 +78,8 @@ esp_err_t imu_encoder_driver_init(void)
     s_sample.yaw_rad      = 0.0f;
     s_yaw_integrated      = 0.0f;
     s_cumulative_ticks    = 0;
+    s_speed_ms            = 0.0f;
+    s_prev_distance       = 0.0f;
     s_last_time_us        = esp_timer_get_time();
     s_sample.timestamp_ms = (uint32_t)(s_last_time_us / 1000ULL);
 
@@ -113,9 +117,18 @@ esp_err_t imu_encoder_driver_update(void)
         s_cumulative_ticks += delta;
         s_last_angle_raw    = current;
 
+        /* Apply gear ratio — encoder is on motor shaft not wheel */
         s_sample.distance_m = (float)s_cumulative_ticks
                               / (float)AS5600_RESOLUTION
+                              / GEAR_RATIO
                               * WHEEL_CIRCUMFERENCE_M;
+    }
+
+    /* 3. Speed — finite difference on distance */
+    if (dt_s > 0.0f) {
+        float delta_dist = s_sample.distance_m - s_prev_distance;
+        s_speed_ms       = delta_dist / dt_s;
+        s_prev_distance  = s_sample.distance_m;
     }
 
     s_sample.timestamp_ms = (uint32_t)(now_us / 1000ULL);
@@ -136,4 +149,9 @@ float imu_encoder_driver_get_distance_m(void)
 float imu_encoder_driver_get_yaw_rad(void)
 {
     return s_sample.yaw_rad;
+}
+
+float imu_encoder_driver_get_speed_ms(void)
+{
+    return s_speed_ms;
 }

@@ -16,9 +16,9 @@ static const char *TAG = "task_odometry";
 /* Shared odometry state — written by task, read by main loop */
 static encoder_ackermann_odom_t s_odom;
 
-/* Ackermann config — TODO: measure real wheelbase */
+/* Ackermann config */
 static const odom_config_t k_cfg = {
-    .wheelbase_m         = 0.26f,   /* distance between front and rear axle */
+    .wheelbase_m         = 0.258f,  /* measured — front to rear axle */
     .imu_correction_gain = 0.05f,   /* blending weight: 0=encoder only, 1=IMU only */
     .max_delta_dist_m    = 0.08f,   /* max plausible distance per 10 ms cycle */
     .max_yaw_jump_rad    = 0.35f    /* max plausible yaw jump (~20 deg) per cycle */
@@ -75,3 +75,4 @@ void task_odometry(void *pvParameters)
 
         vTaskDelay(pdMS_TO_TICKS(10));  /* 100 Hz */
     }
+}

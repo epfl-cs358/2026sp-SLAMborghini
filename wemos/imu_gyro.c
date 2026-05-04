@@ -25,23 +25,18 @@
 #define IMU_TIMEOUT_MS  10
 
 /* ── ICM-20948 registers (User Bank 0 unless noted) ─────────────────────── */
-#define REG_WHO_AM_I    0x00    /* expected: 0xEA */
+#define REG_WHO_AM_I    0x00
 #define REG_PWR_MGMT_1  0x06
 #define REG_PWR_MGMT_2  0x07
 #define REG_GYRO_ZOUT_H 0x37
 #define REG_BANK_SEL    0x7F
 
 /* Bank 2 */
-#define REG_GYRO_CFG1   0x01   /* GYRO_CONFIG_1 */
+#define REG_GYRO_CFG1   0x01
 
-/* ── Gyro sensitivity at 250 DPS: 131 LSB / (°/s) ──────────────────────── */
 #define GYRO_SENS       131.0f
-
-/* ── Bias from SLAMurai calibration (rad/s) ─────────────────────────────── */
 #define GYRO_BIAS_Z     0.00635f
-
-/* ── Integration poll interval ──────────────────────────────────────────── */
-#define POLL_MS         10u    /* 100 Hz */
+#define POLL_MS         10u
 
 static const char *TAG = "imu_gyro";
 static bool (*s_stop_check)(void) = NULL;
@@ -66,39 +61,21 @@ static void imu_select_bank(uint8_t bank)
     imu_write(REG_BANK_SEL, (uint8_t)(bank << 4));
 }
 
-
-/* ════════════════════════════════════════════════════════════════════════════
- * imu_gyro_set_stop_check
- * ════════════════════════════════════════════════════════════════════════════ */
 void imu_gyro_set_stop_check(bool (*fn)(void))
 {
     s_stop_check = fn;
 }
 
-
-/* ════════════════════════════════════════════════════════════════════════════
- * imu_gyro_init
- * ════════════════════════════════════════════════════════════════════════════ */
 bool imu_gyro_init(void)
 {
-    /* ── I2C master init ─────────────────────────────────────────────────── */
     i2c_config_t cfg = {
         .mode             = I2C_MODE_MASTER,
         .sda_io_num       = IMU_SDA_PIN,
         .scl_io_num       = IMU_SCL_PIN,
         .sda_pullup_en    = GPIO_PULLUP_ENABLE,
         .scl_pullup_en    = GPIO_PULLUP_ENABLE,
-        /* I2C clock speed: 400 kHz failed silently on the Wemos (WHO_AM_I
-         * returned 0x00, I2C scan found nothing) even though multimeter
-         * confirmed all four wires were continuous.  Root cause: the soldered
-         * wire runs are long enough that 400 kHz edge times violate the I2C
-         * spec — the ESP-IDF driver returns ESP_OK but the ACK never arrives,
-         * leaving the read buffer zeroed.  Diagnosed by adding return-value
-         * logging to i2c_param_config / i2c_driver_install (both 0x0 = OK),
-         * which ruled out a driver init failure and pointed to a signal-
-         * integrity problem.  Fixed by dropping to 100 kHz standard mode,
-         * which passes comfortably on the same wires (scan finds 0x68,
-         * WHO_AM_I = 0xEA). */
+        /* 100 kHz — 400 kHz failed on long wires (WHO_AM_I returned 0x00
+         * even with correct wiring, signal integrity issue on long runs) */
         .master.clk_speed = 100000,
     };
     esp_err_t r;
@@ -107,7 +84,6 @@ bool imu_gyro_init(void)
 
     r = i2c_driver_install(IMU_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
     if (r == ESP_ERR_INVALID_STATE) {
-        /* Driver already installed (e.g. previous boot) — reinstall */
         ESP_LOGW(TAG, "I2C driver already installed, reinstalling");
         i2c_driver_delete(IMU_I2C_PORT);
         r = i2c_driver_install(IMU_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
@@ -118,17 +94,27 @@ bool imu_gyro_init(void)
         return false;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(100));   /* let bus settle after driver start */
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* ── Wake up ICM-20948, auto-select clock ────────────────────────────── */
+    /* ── I2C bus scan — temporary debug, remove after capteurs confirmed ── */
+    ESP_LOGI(TAG, "Scanning I2C bus...");
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        uint8_t dummy;
+        if (i2c_master_read_from_device(IMU_I2C_PORT, addr, &dummy, 1,
+                                         pdMS_TO_TICKS(10)) == ESP_OK) {
+            ESP_LOGI(TAG, "  Found device at 0x%02X", addr);
+        }
+    }
+
+    /* ── Wake up ICM-20948 ───────────────────────────────────────────────── */
     imu_select_bank(0);
-    imu_write(REG_PWR_MGMT_1, 0x01);   /* CLKSEL = auto */
+    imu_write(REG_PWR_MGMT_1, 0x01);
     vTaskDelay(pdMS_TO_TICKS(50));
-    imu_write(REG_PWR_MGMT_2, 0x00);   /* enable accel + gyro */
+    imu_write(REG_PWR_MGMT_2, 0x00);
 
-    /* ── Set gyro full-scale to 250 DPS (matches SLAMurai) ──────────────── */
+    /* ── Set gyro full-scale to 250 DPS ─────────────────────────────────── */
     imu_select_bank(2);
-    imu_write(REG_GYRO_CFG1, 0x01);    /* FS_SEL=00 (250 DPS), DLPF on */
+    imu_write(REG_GYRO_CFG1, 0x01);
     imu_select_bank(0);
 
     /* ── Verify WHO_AM_I ─────────────────────────────────────────────────── */
@@ -142,10 +128,6 @@ bool imu_gyro_init(void)
     return true;
 }
 
-
-/* ════════════════════════════════════════════════════════════════════════════
- * imu_gyro_read_z
- * ════════════════════════════════════════════════════════════════════════════ */
 float imu_gyro_read_z(void)
 {
     uint8_t buf[2] = {0};
@@ -157,20 +139,13 @@ float imu_gyro_read_z(void)
     return gz_rad_s - GYRO_BIAS_Z;
 }
 
-
-/* ════════════════════════════════════════════════════════════════════════════
- * imu_drive_and_track
- * Drives forward for drive_ms while integrating gyro Z at POLL_MS intervals.
- * Called by drive_for_cmd() — motors must already have servo set before this.
- * Returns the actual heading after the drive.
- * ════════════════════════════════════════════════════════════════════════════ */
 float imu_drive_and_track(float start_heading_rad, uint32_t drive_ms)
 {
     float heading = start_heading_rad;
     uint32_t elapsed = 0;
 
     while (elapsed < drive_ms) {
-        if (s_stop_check && s_stop_check()) break;   /* emergency stop */
+        if (s_stop_check && s_stop_check()) break;
         uint32_t step = (drive_ms - elapsed < POLL_MS) ? (drive_ms - elapsed) : POLL_MS;
         float gz = imu_gyro_read_z();
         heading += gz * ((float)step / 1000.0f);
@@ -178,7 +153,6 @@ float imu_drive_and_track(float start_heading_rad, uint32_t drive_ms)
         elapsed += step;
     }
 
-    /* Normalise to (-π, π] */
     while (heading >  (float)M_PI) heading -= 2.0f * (float)M_PI;
     while (heading < -(float)M_PI) heading += 2.0f * (float)M_PI;
 

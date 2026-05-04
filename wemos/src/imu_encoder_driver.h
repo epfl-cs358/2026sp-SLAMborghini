@@ -26,4 +26,7 @@ float imu_encoder_driver_get_distance_m(void);
 /* Get current yaw in radians */
 float imu_encoder_driver_get_yaw_rad(void);
 
+/* Get current speed in m/s — derived from encoder distance delta */
+float imu_encoder_driver_get_speed_ms(void);
+
 #endif /* IMU_ENCODER_DRIVER_H */
