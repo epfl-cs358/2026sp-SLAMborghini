@@ -1,29 +1,29 @@
-/**
- * imu_encoder_driver.h
- * Module: IMU and wheel encoder driver.
- * Board: Wemos D1 R32
- * Reads angular velocity and linear acceleration from an MPU6050-compatible IMU
- * over I2C, and counts wheel encoder pulses via GPIO interrupts. Combines these
- * into an odom_t for the EKF fusion module.
- */
-
 #ifndef IMU_ENCODER_DRIVER_H
 #define IMU_ENCODER_DRIVER_H
 
-#include "../../types.h"
+#include "esp_err.h"
+#include <stdint.h>
 
-/**
- * Initialize the I2C peripheral for the IMU and configure GPIO pins for
- * the left and right wheel encoder interrupts.
- * Must be called once before imu_encoder_read().
- */
-void imu_encoder_init(void);
+/* Latest sensor sample */
+typedef struct {
+    float    distance_m;    /* cumulative traveled distance in meters */
+    float    yaw_rad;       /* current yaw in radians */
+    uint32_t timestamp_ms;
+} imu_encoder_sample_t;
 
-/**
- * Read the current IMU and encoder state and return a fused odometry measurement.
- * Integrates encoder ticks since the last call to compute linear displacement.
- * @return odom_t with linear_disp_mm, yaw_rate_imu (rad/s), and dt_ms filled in.
- */
-odom_t imu_encoder_read(void);
+/* Initialize IMU and AS5600 encoder */
+esp_err_t imu_encoder_driver_init(void);
+
+/* Read IMU and encoder, update internal sample — call every 10 ms */
+esp_err_t imu_encoder_driver_update(void);
+
+/* Get full latest sample */
+imu_encoder_sample_t imu_encoder_driver_get_sample(void);
+
+/* Get cumulative distance in meters */
+float imu_encoder_driver_get_distance_m(void);
+
+/* Get current yaw in radians */
+float imu_encoder_driver_get_yaw_rad(void);
 
 #endif /* IMU_ENCODER_DRIVER_H */
