@@ -44,7 +44,6 @@
 #ifdef ESP_PLATFORM
 #include "driver/uart.h"
 #include "driver/gpio.h"
-#include "freertos/FreeRTOS.h"
 #endif
 
 /*
@@ -58,7 +57,7 @@
 #define BRIDGE_TX_PIN GPIO_NUM_17   // TX → S3 RX (GPIO16)
 #define BRIDGE_RX_PIN GPIO_NUM_16   // RX ← S3 TX (GPIO17)
 #define BRIDGE_UART_BAUD   115200
-#define BRIDGE_RX_BUF      512
+#define BRIDGE_RX_BUF      1024
 
 /* ------------------------------------------------------------
  * Protocol constants
@@ -69,6 +68,7 @@
 #define MSG_CONTROL        0x01u
 #define MSG_ODOM           0x02u
 #define MSG_PATH           0x03u
+#define MSG_PATH_DONE      0x04u
 
 #define HEADER_LEN         4u
 #define MAX_PAYLOAD_LEN    256u
@@ -185,237 +185,103 @@ bool uart_bridge_send_odom(const odom_t *odom)
 }
 
 /* ------------------------------------------------------------
+ * Pending-slot state — one slot per inbound message type.
+ * drain_pending_packets() is the sole UART reader for inbound
+ * traffic; both recv_control and recv_path just check their slot.
+ * ------------------------------------------------------------ */
+static bool            s_have_control  = false;
+static control_frame_t s_pending_control;
+static bool            s_have_path     = false;
+static path_frame_t    s_pending_path;
+
+/* Read every complete, valid packet currently in the UART FIFO.
+ * Latest-wins per message type — older packets are overwritten. */
+static void drain_pending_packets(void)
+{
+#ifdef ESP_PLATFORM
+    for (;;) {
+        size_t avail = 0;
+        uart_get_buffered_data_len(BRIDGE_UART_PORT, &avail);
+        if (avail == 0) return;
+
+        /* Scan for SYNC_A */
+        uint8_t b = 0;
+        if (uart_read_bytes(BRIDGE_UART_PORT, &b, 1, 0) != 1) return;
+        if (b != SYNC_A) continue;
+
+        /* Expect SYNC_B immediately after */
+        if (uart_read_bytes(BRIDGE_UART_PORT, &b, 1, pdMS_TO_TICKS(5)) != 1) return;
+        if (b != SYNC_B) continue;
+
+        uint8_t msg_type = 0, payload_len = 0;
+        if (uart_read_bytes(BRIDGE_UART_PORT, &msg_type,    1, pdMS_TO_TICKS(5)) != 1) return;
+        if (uart_read_bytes(BRIDGE_UART_PORT, &payload_len, 1, pdMS_TO_TICKS(5)) != 1) return;
+
+        uint8_t payload[MAX_PAYLOAD_LEN];
+        if (uart_read_bytes(BRIDGE_UART_PORT, payload, payload_len,
+                            pdMS_TO_TICKS(50)) != (int)payload_len) return;
+
+        uint8_t received_ck = 0;
+        if (uart_read_bytes(BRIDGE_UART_PORT, &received_ck, 1,
+                            pdMS_TO_TICKS(10)) != 1) return;
+
+        uint8_t check_buf[2 + MAX_PAYLOAD_LEN];
+        check_buf[0] = msg_type;
+        check_buf[1] = payload_len;
+        memcpy(&check_buf[2], payload, payload_len);
+        if (checksum_xor(check_buf, (uint8_t)(payload_len + 2u)) != received_ck) continue;
+
+        if (msg_type == MSG_CONTROL && payload_len == sizeof(control_frame_t)) {
+            memcpy(&s_pending_control, payload, sizeof(control_frame_t));
+            s_have_control = true;
+        } else if (msg_type == MSG_PATH && payload_len == sizeof(path_frame_t)) {
+            path_frame_t tmp;
+            memcpy(&tmp, payload, sizeof(path_frame_t));
+            if (tmp.length > 0 && tmp.length <= MAX_SHARED_PATH_POINTS) {
+                s_pending_path = tmp;
+                s_have_path    = true;
+            }
+        }
+        /* Unknown types are silently dropped (already consumed). */
+    }
+#endif
+}
+
+/* ------------------------------------------------------------
  * Receive control packet from ESP32-S3
- *
- * Returns:
- *   true  = new valid packet received
- *   false = no packet / bad checksum / incomplete frame
  * ------------------------------------------------------------ */
 bool uart_bridge_recv_control(control_frame_t *out)
 {
-    if (!out) {
-        return false;
-    }
-
-
-#ifdef ESP_PLATFORM
-    size_t available = 0;
-    uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
-
-    if (available < HEADER_LEN + 1) {
-        return false;
-    }
-
-    while (available >= HEADER_LEN + 1) {
-        uint8_t byte = 0;
-
-        /* Search sync byte A */
-        uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, 0);
-
-        if (byte != SYNC_A) {
-            uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
-            continue;
-        }
-
-        /* Search sync byte B */
-        uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, 0);
-
-        if (byte != SYNC_B) {
-            uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
-            continue;
-        }
-
-        uint8_t msg_type = 0;
-        uint8_t payload_len = 0;
-
-        if (uart_read_bytes(BRIDGE_UART_PORT, &msg_type, 1, 0) != 1) {
-            return false;
-        }
-
-        if (uart_read_bytes(BRIDGE_UART_PORT, &payload_len, 1, 0) != 1) {
-            return false;
-        }
-
-        /* Must be control packet */
-        if (msg_type != MSG_CONTROL) {
-            return false;
-        }
-
-        if (payload_len != sizeof(control_frame_t) ||
-            payload_len > MAX_PAYLOAD_LEN) {
-            return false;
-        }
-
-        uint8_t payload[MAX_PAYLOAD_LEN];
-        uint8_t received_ck = 0;
-
-                int got_payload = uart_read_bytes(BRIDGE_UART_PORT,
-                                          payload,
-                                          payload_len,
-                                          pdMS_TO_TICKS(100));
-
-        if (got_payload != payload_len) {
-            printf("[UART DEBUG] payload read failed: got=%d expected=%u\n",
-                   got_payload,
-                   (unsigned)payload_len);
-            return false;
-        }
-
-        int got_ck = uart_read_bytes(BRIDGE_UART_PORT,
-                                     &received_ck,
-                                     1,
-                                     pdMS_TO_TICKS(20));
-
-        if (got_ck != 1) {
-            printf("[UART DEBUG] checksum read failed: got=%d\n", got_ck);
-            return false;
-        }
-
-        /* Recompute checksum */
-        uint8_t check_buf[2 + MAX_PAYLOAD_LEN];
-
-        check_buf[0] = msg_type;
-        check_buf[1] = payload_len;
-
-        memcpy(&check_buf[2], payload, payload_len);
-
-        uint8_t computed_ck =
-            checksum_xor(check_buf, payload_len + 2);
-
-        if (computed_ck != received_ck) {
-            return false;
-        }
-
-        memcpy(out, payload, sizeof(control_frame_t));
+    if (!out) return false;
+    drain_pending_packets();
+    if (s_have_control) {
+        *out           = s_pending_control;
+        s_have_control = false;
         return true;
     }
-#endif
-
     return false;
 }
 
+/* ------------------------------------------------------------
+ * Receive path frame from ESP32-S3
+ * ------------------------------------------------------------ */
 bool uart_bridge_recv_path(path_frame_t *out)
 {
-    if (!out) {
-        return false;
-    }
-
-#ifdef ESP_PLATFORM
-    size_t available = 0;
-    uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
-
-    if (available < HEADER_LEN + 1) {
-        return false;
-    }
-
-    while (available >= HEADER_LEN + 1) {
-        uint8_t byte = 0;
-
-        /* Search sync byte A */
-        uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, 0);
-
-        if (byte != SYNC_A) {
-            uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
-            continue;
-        }
-
-        /* Search sync byte B */
-        uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, 0);
-
-        if (byte != SYNC_B) {
-            uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
-            continue;
-        }
-
-        uint8_t msg_type = 0;
-        uint8_t payload_len = 0;
-
-        if (uart_read_bytes(BRIDGE_UART_PORT, &msg_type, 1, 0) != 1) {
-            return false;
-        }
-
-        if (uart_read_bytes(BRIDGE_UART_PORT, &payload_len, 1, 0) != 1) {
-            return false;
-        }
-
-        printf("[UART DEBUG] rx msg_type=0x%02X payload_len=%u\n",
-               (unsigned)msg_type,
-               (unsigned)payload_len);
-
-        /* Must be path packet */
-        if (msg_type != MSG_PATH) {
-            printf("[UART DEBUG] not a path packet\n");
-            return false;
-        }
-
-                printf("[UART DEBUG] sizeof(path_frame_t)=%u\n",
-               (unsigned)sizeof(path_frame_t));
-
-        if (payload_len != sizeof(path_frame_t) ||
-            payload_len > MAX_PAYLOAD_LEN) {
-            printf("[UART DEBUG] bad path size: payload_len=%u expected=%u\n",
-                   (unsigned)payload_len,
-                   (unsigned)sizeof(path_frame_t));
-            return false;
-        }
-
-        uint8_t payload[MAX_PAYLOAD_LEN];
-        uint8_t received_ck = 0;
-
-                int got_payload = uart_read_bytes(BRIDGE_UART_PORT,
-                                          payload,
-                                          payload_len,
-                                          pdMS_TO_TICKS(100));
-
-        if (got_payload != payload_len) {
-            printf("[UART DEBUG] payload read failed: got=%d expected=%u\n",
-                   got_payload,
-                   (unsigned)payload_len);
-            return false;
-        }
-
-                int got_ck = uart_read_bytes(BRIDGE_UART_PORT,
-                                     &received_ck,
-                                     1,
-                                     pdMS_TO_TICKS(20));
-
-        if (got_ck != 1) {
-            printf("[UART DEBUG] checksum read failed: got=%d\n", got_ck);
-            return false;
-        }
-
-        uint8_t check_buf[2 + MAX_PAYLOAD_LEN];
-
-        check_buf[0] = msg_type;
-        check_buf[1] = payload_len;
-
-        memcpy(&check_buf[2], payload, payload_len);
-
-        uint8_t computed_ck =
-            checksum_xor(check_buf, payload_len + 2);
-
-        if (computed_ck != received_ck) {
-            printf("[UART DEBUG] checksum mismatch: computed=0x%02X received=0x%02X\n",
-                   (unsigned)computed_ck,
-                   (unsigned)received_ck);
-            return false;
-        }
-
-        memcpy(out, payload, sizeof(path_frame_t));
-
-        printf("[UART DEBUG] path payload decoded: length=%u\n",
-               (unsigned)out->length);
-
-        if (out->length == 0 ||
-            out->length > MAX_SHARED_PATH_POINTS) {
-            printf("[UART DEBUG] invalid path length: %u\n",
-                   (unsigned)out->length);
-            return false;
-        }
-
+    if (!out) return false;
+    drain_pending_packets();
+    if (s_have_path) {
+        *out        = s_pending_path;
+        s_have_path = false;
         return true;
     }
-#endif
-
     return false;
+}
+
+/* ------------------------------------------------------------
+ * Send path-done notification to ESP32-S3
+ * ------------------------------------------------------------ */
+bool uart_bridge_send_path_done(void)
+{
+    uint8_t done = 1u;
+    return send_packet(MSG_PATH_DONE, &done, 1u);
 }

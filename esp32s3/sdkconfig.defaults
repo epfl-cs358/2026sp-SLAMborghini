@@ -11,3 +11,6 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
 # Increase HTTP server task stack (WebSocket frames can be large)
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=512
+
+# Main task stack — WiFi init + SLAM locals need more than the 8 KB default
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384

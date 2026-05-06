@@ -13,4 +13,7 @@ bool uart_bridge_send_path(const path_frame_t *path_frame);
 
 bool uart_bridge_recv_odom(odom_t *out);
 
+/* Returns true (once) when Wemos signals that the current path is complete. */
+bool uart_bridge_recv_path_done(void);
+
 #endif /* UART_BRIDGE_H */

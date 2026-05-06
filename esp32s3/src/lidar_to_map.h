@@ -10,6 +10,14 @@
 #include "../../types.h"
 #include "quadtree_map.h"
 
+/* ── LiDAR extrinsic calibration (sensor origin relative to robot centre) ─── *
+ * Set to measured values once the sensor is mounted and measured.             *
+ * Positive X_MM = sensor is forward of centre; positive Y_MM = port side.    *
+ * THETA_RAD: sensor yaw relative to robot forward axis (positive = CCW).     */
+#define LIDAR_OFFSET_X_MM    0.0f
+#define LIDAR_OFFSET_Y_MM    0.0f
+#define LIDAR_OFFSET_THETA_RAD 0.0f
+
 /**
  * World-coordinate bounding box of cells written during one lidar_to_map() call.
  * Populated by lidar_to_map() when out_dirty != NULL.
@@ -26,6 +34,7 @@ typedef struct {
  *
  * For each beam: marks free cells along the ray (QT_MISS_DEC) then marks the
  * endpoint as occupied (QT_HIT_INC).  All coordinates in mm; pose->theta in rad.
+ * Extrinsic offsets (LIDAR_OFFSET_*) are applied automatically.
  *
  * @param map          Quadtree occupancy map to update.
  * @param scan         Raw scan from lidar_driver_read_scan() — r_mm + theta_deg.
@@ -41,5 +50,32 @@ void lidar_to_map(quadtree_map_t     *map,
                   float               max_range_mm,
                   float               step_mm,
                   map_dirty_rect_t   *out_dirty);
+
+/**
+ * De-skew and integrate a scan using two-point pose interpolation.
+ *
+ * Each beam is assigned a world pose interpolated between pre_pose (at
+ * pre_time_us) and post_pose (at post_time_us) using the per-point timestamp
+ * stored by lidar_driver_read_scan().  Extrinsic offsets are applied per beam.
+ *
+ * @param map           Quadtree occupancy map to update.
+ * @param scan          Scan with per-point timestamp_us set by lidar_driver.
+ * @param pre_pose      Robot pose just before the scan (mm, rad).
+ * @param pre_time_us   esp_timer_get_time() when pre_pose was captured.
+ * @param post_pose     Robot pose just after the scan (mm, rad).
+ * @param post_time_us  esp_timer_get_time() when post_pose was captured.
+ * @param max_range_mm  Skip beams beyond this distance.
+ * @param step_mm       Ray-march step size.
+ * @param out_dirty     If non-NULL, filled with bbox of all written cells.
+ */
+void lidar_deskew_and_map(quadtree_map_t     *map,
+                           const lidar_scan_t *scan,
+                           const pose_t       *pre_pose,
+                           int64_t             pre_time_us,
+                           const pose_t       *post_pose,
+                           int64_t             post_time_us,
+                           float               max_range_mm,
+                           float               step_mm,
+                           map_dirty_rect_t   *out_dirty);
 
 #endif /* LIDAR_TO_MAP_H */

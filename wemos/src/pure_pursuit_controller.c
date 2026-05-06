@@ -32,28 +32,24 @@ static float dist_sq_pose_waypoint(const pose_t *pose, const waypoint_t *wp) {
 /*
  * Transform a global waypoint into the robot frame.
  *
- * Convention used here:
- * - robot-frame X is lateral/right
+ * Convention:
+ * - robot-frame X is lateral RIGHT  (forward rotated 90° CW)
  * - robot-frame Y is forward
- * - pose->theta is the robot heading in radians
+ * - pose->theta is the robot heading in radians (0 = East / +X world)
+ *
+ * Derivation:
+ *   forward_dir = (cos θ,  sin θ)          right_dir = (sin θ, −cos θ)
+ *   x_right  = dot((dx,dy), right_dir)  = dx·sin θ − dy·cos θ
+ *   y_forward = dot((dx,dy), forward_dir) = dx·cos θ + dy·sin θ
  */
 static waypoint_t to_robot_frame(const pose_t *robot_pose, waypoint_t point_global) {
     float dx = point_global.x - robot_pose->x;
     float dy = point_global.y - robot_pose->y;
 
-    /*
-     * SLAMborghini convention:
-     * - theta = 0 means robot faces +X
-     * - robot-frame y = forward
-     * - robot-frame x = lateral/right
-     */
-    float forward = dx * cosf(robot_pose->theta) + dy * sinf(robot_pose->theta);
-    float left    = -dx * sinf(robot_pose->theta) + dy * cosf(robot_pose->theta);
-
     waypoint_t point_robot = point_global;
 
-    point_robot.x = -left;
-    point_robot.y = forward;
+    point_robot.x =  dx * sinf(robot_pose->theta) - dy * cosf(robot_pose->theta); /* right */
+    point_robot.y =  dx * cosf(robot_pose->theta) + dy * sinf(robot_pose->theta); /* forward */
 
     return point_robot;
 }

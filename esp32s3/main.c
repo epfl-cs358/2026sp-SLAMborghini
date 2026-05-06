@@ -31,7 +31,7 @@
 #define USE_REAL_LIDAR         1   /* ← SET TO 1 FOR REAL LIDAR HARDWARE        */
 #define USE_WAYPOINT_PLAYBACK  0   /* ← SET TO 1 FOR ROOM.LOG PLAYBACK          */
 #define USE_FRONTIER_TARGET    0   /* ← SET TO 1 FOR FRONTIER EXPLORATION        */
-#define USE_LOCAL_PLANNER      0   /* ← SET TO 1 TO ENABLE HYBRID A* + LOCAL PLANNER */
+#define USE_LOCAL_PLANNER      0   /* disabled — pipeline is lidar→map→frontier→A*→PP */
 
 /* ── Wi-Fi credentials — fill in before flashing ───────────────────────── */
 #define WIFI_SSID      "SPOT-iot"
@@ -40,22 +40,15 @@
 #include "../hardware_pins.h"
 #include "src/lidar_driver.h"
 #include "src/lidar_to_map.h"
-#include "src/polar_to_cart.h"
-#include "src/scan_matcher.h"
-#include "src/rbpf.h"
 #include "src/quadtree_map.h"
 #include "src/map_updater.h"
 #include "src/obstacle_classifier.h"
 #include "src/map_consistency.h"
 #include "src/frontier_detector.h"
 #include "src/hybrid_astar.h"
-#include "src/path_refiner.h"
 #include "src/command_gen.h"
 #include "src/uart_bridge.h"
 #include "src/wifi_dashboard.h"
-#if USE_LOCAL_PLANNER
-#include "src/local_planner.h"
-#endif
 #include "src/test/test_room.h"         /* build_test_room() */
 #include "src/test/room_data.h"         /* ROOM_WIDTH_MM, ROOM_HEIGHT_MM */
 #include "src/test/simulate_lidar.h"    /* slam_map_init(), simulate_and_update_map() */
@@ -66,8 +59,11 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 #include <math.h>
 #include <stdbool.h>
+
+static void slam_main_task(void *arg);
 
 /* ── Debug fallback ──────────────────────────────────────────────────────── */
 #define DEBUG_FORWARD_MM   200.0f
@@ -77,7 +73,10 @@
 #define TARGET_REACHED_MM   150.0f
 #define REPLAN_TIMEOUT_MS  5000
 #define MAX_DRIVE_MS        3000u   /* must match wemos/main.c */
-#define CYCLE_DELAY_MS      200     /* pause between planning cycles */
+#define CYCLE_DELAY_MS      200     /* fallback drive extra wait (ms) */
+#define SCAN_POLL_MS        50u     /* LiDAR poll interval while tracking (ms) */
+#define PATH_TIMEOUT_MS     15000u  /* replan if Wemos never sends path-done */
+#define QT_BCAST_PERIOD     5       /* broadcast quadtree every N planning cycles */
 
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -88,6 +87,7 @@
  * ════════════════════════════════════════════════════════════════════════════ */
 static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
 {
+    pose->theta = cmd->t_heading;
     float dist_mm = sqrtf(cmd->tx * cmd->tx + cmd->ty * cmd->ty);
     if (dist_mm < 1.0f) return;
 
@@ -97,17 +97,22 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
     if (dt_s > max_s) dt_s = max_s;
 
     float traveled = speed * dt_s;
-    pose->x    += traveled * cosf(cmd->t_heading);
-    pose->y    += traveled * sinf(cmd->t_heading);
-    pose->theta = cmd->t_heading;
+    pose->x += traveled * cosf(cmd->t_heading);
+    pose->y += traveled * sinf(cmd->t_heading);
 }
 
 
 /* ════════════════════════════════════════════════════════════════════════════
- * app_main
+ * app_main — minimal entry point; real work runs in slam_main_task (16 KB stack)
  * ════════════════════════════════════════════════════════════════════════════ */
 void app_main(void)
 {
+    xTaskCreate(slam_main_task, "slam_main", 16384, NULL, 5, NULL);
+}
+
+static void slam_main_task(void *arg)
+{
+    (void)arg;
 /* ════════════════════════════════════════════════════════════════════════════
  * TEST_LIDAR — read scans in a loop and print stats to serial.
  * ════════════════════════════════════════════════════════════════════════════ */
@@ -295,46 +300,130 @@ void app_main(void)
         wifi_dashboard_broadcast_state(&pose, 0.0f, 0.0f, false, 0);
     }
 
-    /* prev_cmd / prev_drv_ms track the command that was just dispatched so
-     * we can (a) wait for it to finish at the TOP of the next iteration and
-     * (b) dead-reckon the pose BEFORE integrating the fresh scan.
-     *
-     * Correct ordering mirrors the simulation pipeline:
-     *   wait → dead_reckon (post-drive pose) → scan → map → frontier → drive
-     *
-     * First iteration: prev_drv_ms == 0 (no wait), prev_cmd zeroed (no-op
-     * dead_reckon), so the robot's initial pose is used for the first scan. */
-    control_frame_t prev_cmd    = {0};
-    uint32_t        prev_drv_ms = 0;
-
-#if USE_LOCAL_PLANNER
-    path_t lp_path = {0};
-    local_planner_init(120.0f);
-#endif
+    control_frame_t prev_cmd     = {0};
+    uint8_t         qt_bcast_ctr = 0;
+    path_t          astar_path   = {0};
+    bool            path_active  = false;   /* true while Wemos is executing a path */
+    uint32_t        path_sent_ms = 0;       /* timestamp of last uart_bridge_send_path() */
+    float           goal_x       = 0.0f;
+    float           goal_y       = 0.0f;
+    path_frame_t    last_path    = {0};
 
     while (1) {
 
-        /* ── Wait for the previous drive to complete ─────────────────────── */
-        if (prev_drv_ms > 0)
-            vTaskDelay(pdMS_TO_TICKS(prev_drv_ms + CYCLE_DELAY_MS));
-
-        /* ── Dead-reckon to post-drive pose ──────────────────────────────────
-         * Done BEFORE lidar_to_map so the scan integrates at the position the
-         * robot actually occupies when stationary.  Mirrors the simulation's
-         * integrate_scan(qt, scan, scan_rx, scan_ry) call order. */
-        dead_reckon_pose(&pose, &prev_cmd);
-
-        /* ── Acquire scan, integrate at post-drive pose ──────────────────── */
-        if (lidar_driver_read_scan(&scan) && scan.count > 10) {
-            map_dirty_rect_t dr;
-            lidar_to_map(&slam_map, &scan, &pose, 6000.0f, 150.0f, &dr);
-            wifi_dashboard_mark_dirty(&dr);
+        /* ── Emergency stop from dashboard ───────────────────────────────── */
+        if (wifi_dashboard_stop_requested()) {
+            wifi_dashboard_log("Exploration stopped.");
+            break;
         }
 
-        /* ── Push map + quadtree to dashboard ───────────────────────────── */
-        wifi_dashboard_update(&slam_map, &pose);
+        /* ── Pose update — drain ALL pending odom packets ────────────────────
+         * Dead-reckoning only when no path is active and prev_cmd moved. */
+        {
+            static uint32_t s_last_odom_seq = 0;
+            odom_t odom;
+            bool got_odom = false;
+            static uint32_t s_odom_log_ctr = 0;
+            while (uart_bridge_recv_odom(&odom)) {
+                if (odom.dt_ms > 0.0f) {
+                    uint32_t expected = s_last_odom_seq;
+                    if (odom.seq != 0 && odom.seq != expected)
+                        printf("[ODOM] drop: expected %lu got %lu\n",
+                               (unsigned long)expected, (unsigned long)odom.seq);
+                    s_last_odom_seq = odom.seq + 1;
+                    float dtheta    = odom.yaw_rate_imu * (odom.dt_ms / 1000.0f);
+                    float mid_theta = pose.theta + dtheta * 0.5f;
+                    pose.x    += odom.linear_disp_mm * cosf(mid_theta);
+                    pose.y    += odom.linear_disp_mm * sinf(mid_theta);
+                    pose.theta += dtheta;
+                    while (pose.theta >  (float)M_PI) pose.theta -= 2.0f * (float)M_PI;
+                    while (pose.theta < -(float)M_PI) pose.theta += 2.0f * (float)M_PI;
+                    got_odom = true;
+                    /* Log every 5th odom packet so serial isn't flooded */
+                    if (++s_odom_log_ctr % 5 == 0)
+                        printf("[S3 ODOM] seq=%lu disp=%.0f mm yaw=%.3f rad/s"
+                               "  pose=(%.0f,%.0f,%.2f)\n",
+                               (unsigned long)odom.seq,
+                               (double)odom.linear_disp_mm,
+                               (double)odom.yaw_rate_imu,
+                               (double)pose.x, (double)pose.y, (double)pose.theta);
+                }
+            }
+            if (!got_odom && !path_active) {
+                float prev_dist = sqrtf(prev_cmd.tx * prev_cmd.tx +
+                                        prev_cmd.ty * prev_cmd.ty);
+                if (prev_dist > 1.0f || prev_cmd.t_speed > 10.0f)
+                    dead_reckon_pose(&pose, &prev_cmd);
+            }
+        }
 
-        /* ── Frontier detection ──────────────────────────────────────────── */
+        /* ── LiDAR scan → quadtree map update (with de-skewing) ─────────── */
+        {
+            pose_t  pre_scan_pose  = pose;
+            int64_t pre_scan_time  = esp_timer_get_time();
+
+            if (lidar_driver_read_scan(&scan) && scan.count > 10) {
+
+                /* Drain odom that arrived during the blocking scan (~200 ms) */
+                {
+                    odom_t odom;
+                    while (uart_bridge_recv_odom(&odom)) {
+                        if (odom.dt_ms > 0.0f) {
+                            float dtheta    = odom.yaw_rate_imu * (odom.dt_ms / 1000.0f);
+                            float mid_theta = pose.theta + dtheta * 0.5f;
+                            pose.x    += odom.linear_disp_mm * cosf(mid_theta);
+                            pose.y    += odom.linear_disp_mm * sinf(mid_theta);
+                            pose.theta += dtheta;
+                            while (pose.theta >  (float)M_PI) pose.theta -= 2.0f * (float)M_PI;
+                            while (pose.theta < -(float)M_PI) pose.theta += 2.0f * (float)M_PI;
+                        }
+                    }
+                }
+
+                pose_t  post_scan_pose = pose;
+                int64_t post_scan_time = esp_timer_get_time();
+
+                map_dirty_rect_t dr;
+                lidar_deskew_and_map(&slam_map, &scan,
+                                     &pre_scan_pose,  pre_scan_time,
+                                     &post_scan_pose, post_scan_time,
+                                     6000.0f, 150.0f, &dr);
+                wifi_dashboard_mark_dirty(&dr);
+                wifi_dashboard_broadcast_scan(&scan, &pose);
+            }
+        }
+
+        /* ── Dashboard map push; periodic quadtree frame ─────────────────── */
+        wifi_dashboard_update(&slam_map, &pose);
+        if (++qt_bcast_ctr >= QT_BCAST_PERIOD) {
+            qt_bcast_ctr = 0;
+            wifi_dashboard_broadcast_quadtree(&slam_map);
+        }
+
+        /* ── Tracking mode — wait for Wemos to complete the current path ─── *
+         * Frontier detection and A* are NOT run until Wemos signals path done.*
+         * LiDAR scanning and map updates continue every SCAN_POLL_MS so the  *
+         * FIFO never overflows during the drive phase.                        */
+        if (path_active) {
+            bool path_done = uart_bridge_recv_path_done();
+
+            if (!path_done) {
+                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+                if ((now_ms - path_sent_ms) < PATH_TIMEOUT_MS) {
+                    wifi_dashboard_broadcast_state(&pose, goal_x, goal_y, true, 0);
+                    wifi_dashboard_broadcast_path(&last_path);
+                    vTaskDelay(pdMS_TO_TICKS(SCAN_POLL_MS));
+                    continue;
+                }
+                wifi_dashboard_log("Path timeout — replanning");
+            } else {
+                wifi_dashboard_log("Path complete — replanning");
+            }
+            path_active = false;
+            prev_cmd    = (control_frame_t){0};
+        }
+
+        /* ── Planning: frontier detection ────────────────────────────────── */
         frontier_list_t frontiers = frontier_detector_detect(&slam_map, &pose);
 
         control_frame_t cmd = {0};
@@ -343,85 +432,82 @@ void app_main(void)
 
         if (frontiers.count > 0) {
             frontier_t best = frontier_detector_best(&frontiers, &pose);
-            has_frontier    = true;
-            fx              = best.cx;
-            fy              = best.cy;
-#if USE_LOCAL_PLANNER
-            /* Replan when requested or path expired */
-            if (local_planner_replan_needed() || !hybrid_astar_is_valid(&lp_path)) {
-                lp_path = hybrid_astar_plan(&slam_map, &pose, &best);
-                if (hybrid_astar_is_valid(&lp_path)) {
-                    local_planner_reset_waypoint();
-                    local_planner_clear_replan();
-                }
-            }
-            if (!local_planner_update(&slam_map, &pose, &lp_path, false, &cmd)) {
+            has_frontier = true;
+            fx = best.cx;
+            fy = best.cy;
+
+            astar_path = hybrid_astar_plan(&slam_map, &pose, &best);
+
+            if (hybrid_astar_is_valid(&astar_path)) {
+                char lbuf[64];
+                snprintf(lbuf, sizeof(lbuf), "A*: %u wp  target=(%.0f,%.0f)",
+                         (unsigned)astar_path.length, (double)fx, (double)fy);
+                wifi_dashboard_log(lbuf);
+            } else {
+                wifi_dashboard_log("A* failed — direct cmd");
                 waypoint_t wp = { .x = best.cx, .y = best.cy };
-                cmd           = command_gen_compute(&pose, &wp);
+                cmd = command_gen_compute(&pose, &wp);
             }
-#else
-            waypoint_t wp = { .x = best.cx, .y = best.cy };
-            cmd           = command_gen_compute(&pose, &wp);
-#endif
         } else {
-            cmd.tx        = 0.0f;
-            cmd.ty        = DEBUG_FORWARD_MM;
-            cmd.t_heading = pose.theta;
-            cmd.t_speed   = DEBUG_SPEED_MM_S;
+            /* No frontiers: hold position — cmd stays zero.
+             * dead_reckon_pose will be a no-op; BRIDGE_SLAVE discards stop frames. */
+            wifi_dashboard_log("No frontiers — stopped");
         }
 
-        /* ── Transmit path/command to Wemos ──────────────────────────────── */
+        /* ── Transmit to Wemos ───────────────────────────────────────────── */
         bool sent_path = false;
+        path_frame_t path_frame = {0};
 
-#if USE_LOCAL_PLANNER
-        /*
-         * New Pure Pursuit protocol:
-         * If Hybrid A* produced a valid path, send a short path_frame_t
-         * to the Wemos. Wemos will run Pure Pursuit on this path.
-         */
-        if (has_frontier && hybrid_astar_is_valid(&lp_path)) {
-            path_frame_t path_frame = {0};
-
-            uint8_t n = (lp_path.length > MAX_SHARED_PATH_POINTS)
+        if (has_frontier && hybrid_astar_is_valid(&astar_path)) {
+            uint8_t n = (astar_path.length > MAX_SHARED_PATH_POINTS)
                         ? MAX_SHARED_PATH_POINTS
-                        : (uint8_t)lp_path.length;
-
+                        : (uint8_t)astar_path.length;
             path_frame.length = n;
-
             for (uint8_t i = 0; i < n; i++) {
-                path_frame.waypoints[i] = lp_path.waypoints[i];
-
-                if (path_frame.waypoints[i].v_target <= 10.0f) {
-                    path_frame.waypoints[i].v_target = cmd.t_speed;
-                }
+                path_frame.waypoints[i] = astar_path.waypoints[i];
+                if (path_frame.waypoints[i].v_target <= 10.0f)
+                    path_frame.waypoints[i].v_target = DEBUG_SPEED_MM_S;
             }
-
             sent_path = uart_bridge_send_path(&path_frame);
-
-            printf("[S3] sent path: length=%u status=%s\n",
-                   (unsigned)path_frame.length,
+            printf("[S3] path: %u wp  frontiers=%u  %s\n",
+                   (unsigned)n, (unsigned)frontiers.count,
                    sent_path ? "OK" : "FAIL");
+            printf("[ASTAR] pose=(%.0f,%.0f) frontier=(%.0f,%.0f)"
+                   "  wp[0]=(%.0f,%.0f)  wp[%u]=(%.0f,%.0f)\n",
+                   (double)pose.x, (double)pose.y,
+                   (double)fx, (double)fy,
+                   (double)path_frame.waypoints[0].x,
+                   (double)path_frame.waypoints[0].y,
+                   (unsigned)(n - 1u),
+                   (double)path_frame.waypoints[n - 1u].x,
+                   (double)path_frame.waypoints[n - 1u].y);
         }
-#endif
 
-        /*
-         * Old fallback protocol:
-         * If no valid path exists, send the single control_frame_t.
-         */
         if (!sent_path) {
             uart_bridge_send_control(&cmd);
+            prev_cmd = cmd;
         }
 
-        /* ── Broadcast state ─────────────────────────────────────────────── */
+        /* ── Broadcast pose + frontier target + path to dashboard ────────── */
         wifi_dashboard_broadcast_state(&pose, fx, fy, has_frontier, 0);
+        wifi_dashboard_broadcast_path(&path_frame);
 
-        /* ── Compute drive duration; save command for next iteration ──────── */
-        float    dist_mm = sqrtf(cmd.tx * cmd.tx + cmd.ty * cmd.ty);
-        float    spd     = (cmd.t_speed > 10.0f) ? cmd.t_speed : DEBUG_SPEED_MM_S;
-        prev_drv_ms      = (uint32_t)((dist_mm / spd) * 1000.0f);
-        if (prev_drv_ms > MAX_DRIVE_MS) prev_drv_ms = MAX_DRIVE_MS;
-        if (prev_drv_ms < 50u)          prev_drv_ms = 50u;
-        prev_cmd = cmd;
+        /* ── Transition to tracking or wait for fallback drive ────────────── */
+        if (sent_path) {
+            path_active  = true;
+            prev_cmd     = (control_frame_t){0};
+            path_sent_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+            goal_x       = fx;
+            goal_y       = fy;
+            last_path    = path_frame;
+            /* Discard any stale done flag that arrived from the previous path. */
+            (void)uart_bridge_recv_path_done();
+        } else {
+            /* lidar_driver_read_scan() blocks ~200 ms per scan, pacing the loop at
+             * ~5 Hz naturally. A longer sleep here would overflow the 5000-byte LiDAR
+             * UART FIFO (fills in ≈480 ms at 7 Hz) and corrupt the next scan. */
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 
 
@@ -589,4 +675,6 @@ void app_main(void)
 #endif  /* USE_REAL_LIDAR / USE_WAYPOINT_PLAYBACK */
 
 #endif  /* TEST_LIDAR / TEST_IMU / TEST_BRIDGE_TX / else (normal SLAM) */
+
+    vTaskDelete(NULL);
 }

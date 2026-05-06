@@ -36,6 +36,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 
 static const char *TAG = "lidar_drv";
@@ -138,7 +139,9 @@ void lidar_driver_init(void)
 bool lidar_driver_read_scan(lidar_scan_t *out)
 {
     if (!out) return false;
-    out->count = 0;
+    out->count              = 0;
+    out->scan_start_us      = 0;
+    out->rotation_period_us = 0;
 
     /* Sliding-window parser: reads one byte at a time into a 5-byte window.
      * When the window holds a valid packet (S^!S==1, check_bit==1) it is
@@ -149,6 +152,7 @@ bool lidar_driver_read_scan(lidar_scan_t *out)
     uint8_t  win[5];
     int      wlen       = 0;
     bool     collecting = false;
+    int64_t  scan_start_us = 0;
     TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
 
     while (xTaskGetTickCount() < deadline && out->count < 460) {
@@ -172,19 +176,31 @@ bool lidar_driver_read_scan(lidar_scan_t *out)
         /* Valid 5-byte packet consumed */
         wlen = 0;
 
-        if (s && collecting) break;    /* second start → one full rotation done */
+        if (s && collecting) {
+            /* Second start-bit → one full rotation done; record end time */
+            int64_t scan_end_us = esp_timer_get_time();
+            out->scan_start_us = (uint32_t)scan_start_us;
+            out->rotation_period_us = (scan_end_us > scan_start_us)
+                                      ? (uint32_t)(scan_end_us - scan_start_us)
+                                      : 200000u;   /* fallback 200 ms (5 Hz) */
+            break;
+        }
 
         float angle = (uint16_t)((win[2] << 8) | win[1]) >> 1;
         angle /= 64.0f;
         float dist  = (uint16_t)((win[4] << 8) | win[3]) / 4.0f;
         uint8_t q   = (win[0] >> 2) & 0x3F;
 
-        if (s) collecting = true;      /* first start packet — begin collecting */
+        if (s) {
+            collecting    = true;          /* first start packet — begin collecting */
+            scan_start_us = esp_timer_get_time();
+        }
 
         if (collecting && dist >= MIN_RANGE_MM && dist <= MAX_RANGE_MM && q > 0) {
-            out->points[out->count].r_mm      = dist;
-            out->points[out->count].theta_deg = angle;
-            out->points[out->count].intensity = q;
+            out->points[out->count].r_mm         = dist;
+            out->points[out->count].theta_deg    = angle;
+            out->points[out->count].intensity    = q;
+            out->points[out->count].timestamp_us = 0;  /* filled below */
             out->count++;
         }
     }
@@ -194,7 +210,19 @@ bool lidar_driver_read_scan(lidar_scan_t *out)
         return false;
     }
 
-    ESP_LOGI(TAG, "Scan: %u points", out->count);
+    /* Back-compute per-point timestamps from angle offset within the rotation */
+    if (out->count > 0 && out->rotation_period_us > 0) {
+        float theta_start = out->points[0].theta_deg;
+        for (uint16_t i = 0; i < out->count; i++) {
+            float angle_offset = out->points[i].theta_deg - theta_start;
+            if (angle_offset < 0.0f) angle_offset += 360.0f;
+            out->points[i].timestamp_us = out->scan_start_us +
+                (uint32_t)(angle_offset / 360.0f * (float)out->rotation_period_us);
+        }
+    }
+
+    ESP_LOGI(TAG, "Scan: %u points  period=%lu µs", out->count,
+             (unsigned long)out->rotation_period_us);
     return out->count > 10;
 }
 

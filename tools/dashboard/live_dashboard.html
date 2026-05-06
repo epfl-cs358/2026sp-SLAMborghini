@@ -217,6 +217,7 @@ input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
       <div class="leg"><div class="sw" style="background:#fbbf24;border-radius:50%"></div>LiDAR scan</div>
       <div class="leg"><div class="sw" style="background:#4361ee"></div>Robot</div>
       <div class="leg"><div class="sw" style="background:#00ffff;border-radius:50%"></div>Path trail</div>
+      <div class="leg"><div class="sw" style="background:#52b788;border-radius:50%"></div>A* planned path</div>
       <div class="leg"><div class="sw" style="background:#f4a261;border-radius:50%"></div>Frontier target</div>
     </div>
 
@@ -225,6 +226,7 @@ input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
       <div class="ck"><input type="checkbox" id="chkFollow" checked><label for="chkFollow">Follow robot</label></div>
       <div class="ck"><input type="checkbox" id="chkScan"   checked><label for="chkScan">LiDAR scan</label></div>
       <div class="ck"><input type="checkbox" id="chkTrail"  checked><label for="chkTrail">Path trail</label></div>
+      <div class="ck"><input type="checkbox" id="chkAstar"  checked><label for="chkAstar">A* path</label></div>
       <div class="ck"><input type="checkbox" id="chkQT" checked><label for="chkQT">Quadtree view</label></div>
       <button onclick="resetView()" style="width:100%;margin-top:6px">Reset View</button>
     </div>
@@ -248,6 +250,7 @@ const MSG_SCAN      = 0x02;
 const MSG_POSE      = 0x03;
 const MSG_MAP_DELTA = 0x04;
 const MSG_QUADTREE  = 0x05;
+const MSG_PATH      = 0x06;
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Rendering constants
@@ -268,6 +271,7 @@ let trailPts   = [];     // [{x,y}, ...] — robot path
 let lastFront  = null;   // {fx, fy, has} — latest frontier
 let lastPose   = null;   // most recent raw pose (for scan projection)
 let qtNodes    = null;   // [{xMin,yMin,size,depth,value}, ...] — latest quadtree frame
+let astarPath  = [];     // [{x,y}, ...] — latest A* planned waypoints
 
 const cam = { zoom: 6, tx: 0, ty: 0 };
 let drag = null;
@@ -461,6 +465,24 @@ function handleQuadtree(buf) {
     };
   }
   qtNodes = nodes;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * handlePath — parse type-0x06 frame into astarPath[]
+ * Frame: [type:u8][count:u8][{x:f32,y:f32}×count]  (world coords, mm)
+ * count=0 clears the overlay (A* failed or no frontier this cycle).
+ * ════════════════════════════════════════════════════════════════════════════ */
+function handlePath(buf) {
+  const v     = new DataView(buf);
+  const count = v.getUint8(1);
+  const pts   = [];
+  for (let i = 0; i < count; i++) {
+    pts.push({
+      x: v.getFloat32(2 + i * 8,     true),
+      y: v.getFloat32(2 + i * 8 + 4, true),
+    });
+  }
+  astarPath = pts;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -687,8 +709,40 @@ function render(now) {
     }
   }
 
-  /* ── 4. Frontier target (orange dot + dashed line from robot) ── */
+  /* ── 4. A* planned path — drawn exactly as computed: wp[0]→…→wp[N-1] ── */
   const pose = getInterpolatedPose(now);
+  if (document.getElementById('chkAstar').checked && astarPath.length > 0 && mapState) {
+    const [x0, y0] = w2c(astarPath[0].x, astarPath[0].y);
+    ctx.strokeStyle = '#52b788cc';
+    ctx.lineWidth   = Math.max(1.5, cam.zoom * 0.4);
+    ctx.setLineDash([8, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    for (let i = 1; i < astarPath.length; i++) {
+      const [wx, wy] = w2c(astarPath[i].x, astarPath[i].y);
+      ctx.lineTo(wx, wy);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    /* Numbered dots at each waypoint */
+    const dotR = Math.max(3, cam.zoom * 0.45);
+    ctx.font = `${Math.max(9, Math.round(cam.zoom * 1.2))}px Courier New`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i < astarPath.length; i++) {
+      const [wx, wy] = w2c(astarPath[i].x, astarPath[i].y);
+      ctx.fillStyle = '#52b788';
+      ctx.beginPath();
+      ctx.arc(wx, wy, dotR, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#000';
+      ctx.fillText(String(i), wx, wy);
+    }
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  /* ── 5. Frontier target (orange dot + dashed line from robot) ── */
   if (lastFront?.has && pose) {
     const [fx, fy] = w2c(lastFront.fx, lastFront.fy);
     const [rx, ry] = w2c(pose.x, pose.y);
@@ -855,6 +909,7 @@ function wsConnect() {
     else if (type === MSG_SCAN)      handleScan(evt.data);
     else if (type === MSG_POSE)      handlePose(evt.data);
     else if (type === MSG_QUADTREE)  handleQuadtree(evt.data);
+    else if (type === MSG_PATH)      handlePath(evt.data);
   };
 }
 

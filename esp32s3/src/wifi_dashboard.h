@@ -107,6 +107,15 @@ uint8_t wifi_dashboard_queue_depth(void);
 void wifi_dashboard_mark_dirty(const map_dirty_rect_t *rect);
 
 /**
+ * Broadcast the A* planned path to the live dashboard as a type-0x06 frame.
+ * Pass the path_frame_t that was just sent to the Wemos so the overlay matches
+ * what the car is executing.  Pass NULL or length=0 to clear a stale overlay.
+ * Non-blocking — silently drops if no client connected.
+ * @param frame  Path frame (may be NULL or have length=0 to clear overlay).
+ */
+void wifi_dashboard_broadcast_path(const path_frame_t *frame);
+
+/**
  * Broadcast the full quadtree structure as a type-0x05 binary frame.
  * Call at ~1 Hz from the planning loop for live debug visualization.
  * Frame: [type(1)][count(2)][{x_min(2),y_min(2),size(2),depth(1),value(1)}×N]

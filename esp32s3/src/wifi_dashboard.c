@@ -62,19 +62,22 @@ static const char *TAG = "wifi_dash";
 #define MSG_SCAN      0x02u
 #define MSG_POSE      0x03u
 #define MSG_MAP_DELTA 0x04u
+#define MSG_PATH      0x06u   /* A* planned path: [type(1)][count(1)][{x(4)y(4)}×count] */
 #define MSG_KEEPALIVE 0xFEu   /* 1-byte heartbeat; browser ignores unknown types */
 
 /* ── Dashboard grid ─────────────────────────────────────────────────────── */
 #define DASH_GW    50u
 #define DASH_GH    50u
-#define DASH_CELLS (DASH_GW * DASH_GH)   /* 2500 cells, 200 mm/cell on a 10 m map */
+#define DASH_CELLS (DASH_GW * DASH_GH)   /* 2500 cells — 50×50 raster grid (was 64×64 = 4096 cells;
+                                           * larger frames triggered TCP backpressure → 3-strike WS
+                                           * close → scan display froze after first update) */
 
 /* ── Scan downsample cap ─────────────────────────────────────────────────── */
 #define SCAN_MAX_PTS 90u
 
 /* ── Static send buffers — owned exclusively by dash_task ───────────────────
  *
- * Full-map frame:  1+2+2+4+4+4+2500          = 2517 bytes
+ * Full-map frame:  1+2+2+4+4+4+2500          = 2517 bytes  (50×50 grid)
  * Delta threshold: when Δcells > 838, a full map (2517 B) is smaller than the
  *                  delta (3 + 839*3 = 2520 B) → switch to full map.
  *                  Both paths fit in MAP_BUF_SIZE = 2517.
@@ -85,19 +88,20 @@ static const char *TAG = "wifi_dash";
 #define MAP_BUF_SIZE  2517u
 #define DELTA_THRESH   838u   /* Δcells above this → switch to full-map send */
 
-/* ── Tile dirty bitmap (5×5 = 25 tiles, each 10×10 cells) ───────────────────
- * Avoids querying all 2500 cells when only a small region changed.
+/* ── Tile dirty bitmap (4×4 = 16 tiles, each 16×16 cells) ───────────────────
+ * Avoids querying all 4096 cells when only a small region changed.
  * Tile index = row * TILE_COLS + col; bit 0 = top-left tile. */
-#define TILE_COLS  5u
-#define TILE_ROWS  5u
-#define TILE_W    10u   /* cells per tile column */
-#define TILE_H    10u   /* cells per tile row    */
+#define TILE_COLS  4u
+#define TILE_ROWS  4u
+#define TILE_W    16u   /* cells per tile column */
+#define TILE_H    16u   /* cells per tile row    */
 #define TILES_ALL  ((uint32_t)((1u << (TILE_COLS * TILE_ROWS)) - 1u))
 
-static uint8_t s_map_buf[MAP_BUF_SIZE];          /* full map or delta         */
-static uint8_t s_pose_buf[24u];                  /* pose frame                */
-static uint8_t s_scan_buf[3u + SCAN_MAX_PTS * 4u]; /* scan frame             */
-static uint8_t s_log_bufs[5][80u];               /* 5-slot rotating log ring  */
+static uint8_t s_map_buf[MAP_BUF_SIZE];                            /* full map or delta  */
+static uint8_t s_pose_buf[24u];                                    /* pose frame         */
+static uint8_t s_scan_buf[3u + SCAN_MAX_PTS * 4u];                /* scan frame         */
+static uint8_t s_path_buf[2u + MAX_SHARED_PATH_POINTS * 8u];      /* path frame         */
+static uint8_t s_log_bufs[5][80u];                                 /* 5-slot log ring    */
 static uint8_t s_log_slot = 0u;
 
 /* ── Map shadow (delta encoding) ─────────────────────────────────────────── */
@@ -121,6 +125,7 @@ typedef enum {
     DASH_POSE_MSG = 1,
     DASH_SCAN_MSG = 2,
     DASH_LOG_MSG  = 3,
+    DASH_PATH_MSG = 4,
 } dash_msg_type_t;
 
 typedef struct {
@@ -134,6 +139,12 @@ typedef struct {
             uint16_t scan_idx;
         } pose;
         char log[DASH_LOG_MAX];
+        struct {
+            uint8_t count;
+            uint8_t _pad[3];
+            float   pts_x[MAX_SHARED_PATH_POINTS];
+            float   pts_y[MAX_SHARED_PATH_POINTS];
+        } path;
     };
 } dash_msg_t;
 
@@ -236,10 +247,10 @@ static bool _ws_send_raw(uint8_t *payload, size_t len, httpd_ws_type_t type)
 
 
 /* ════════════════════════════════════════════════════════════════════════════
- * _tiles_from_rect — convert a world-coordinate dirty rect to a 25-bit tile mask.
+ * _tiles_from_rect — convert a world-coordinate dirty rect to a 16-bit tile mask.
  *
- * The 50×50 cell grid is divided into 25 tiles of 10×10 cells each (5 columns,
- * 5 rows).  Only tiles whose world bbox overlaps the dirty rect get a set bit.
+ * The 64×64 cell grid is divided into 16 tiles of 16×16 cells each (4 columns,
+ * 4 rows).  Only tiles whose world bbox overlaps the dirty rect get a set bit.
  * Returns TILES_ALL on any degenerate input so callers never under-sample.
  * Called only from wifi_dashboard_update() (plan_task context).
  * ════════════════════════════════════════════════════════════════════════════ */
@@ -274,18 +285,18 @@ static uint32_t _tiles_from_rect(const map_dirty_rect_t *dr)
 
 
 /* ════════════════════════════════════════════════════════════════════════════
- * _do_map_send — sample dirty tiles of the 50×50 grid, build full or delta
+ * _do_map_send — sample dirty tiles of the 64×64 grid, build full or delta
  *                frame, send.
  *
- * dirty_tiles: 25-bit mask of which 5×5 tiles need qt_query_const resampling.
+ * dirty_tiles: 16-bit mask of which 4×4 tiles need qt_query_const resampling.
  *   — When shadow is invalid (new client), overridden to TILES_ALL.
  *   — Non-dirty tiles reuse their existing s_new_cells values; after a
  *     successful send s_last_cells==s_new_cells for those tiles, so they
  *     contribute zero delta bytes — correct.
  *
- * Uses s_map_buf (2517 B) for both paths:
- *   Δcells ≤ 838 → delta  (3 + Δ*3 ≤ 2517 B)
- *   Δcells > 838 → full   (17 + 2500 = 2517 B, smaller than delta at that count)
+ * Uses s_map_buf (4113 B) for both paths:
+ *   Δcells ≤ 1370 → delta  (3 + Δ*3 ≤ 4113 B)
+ *   Δcells > 1370 → full   (17 + 4096 = 4113 B, smaller than delta at that count)
  *
  * Reads s_map_ref without holding s_mtx (same approach as original code).
  * Slight staleness is acceptable for a dashboard visualisation.
@@ -444,6 +455,25 @@ static void _do_log_send(const char *msg)
 
 
 /* ════════════════════════════════════════════════════════════════════════════
+ * _do_path_send — build type-0x06 frame into s_path_buf, send.
+ * count=0 is valid: tells the browser to clear its stale path overlay.
+ * Called only from dash_task.
+ * ════════════════════════════════════════════════════════════════════════════ */
+static void _do_path_send(const dash_msg_t *msg)
+{
+    uint8_t n = msg->path.count;
+    if (n > MAX_SHARED_PATH_POINTS) n = MAX_SHARED_PATH_POINTS;
+    s_path_buf[0] = MSG_PATH;
+    s_path_buf[1] = n;
+    for (uint8_t i = 0; i < n; i++) {
+        memcpy(&s_path_buf[2u + (size_t)i * 8u],      &msg->path.pts_x[i], 4u);
+        memcpy(&s_path_buf[2u + (size_t)i * 8u + 4u], &msg->path.pts_y[i], 4u);
+    }
+    _ws_send_raw(s_path_buf, 2u + (size_t)n * 8u, HTTPD_WS_TYPE_BINARY);
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
  * _ws_heartbeat — 1-byte keepalive frame sent every 2 s.
  *
  * Prevents the browser's WebSocket from timing out during the robot's ≤2 s
@@ -497,6 +527,7 @@ static void _dash_task(void *arg)
                 case DASH_POSE_MSG: _do_pose_send(&msg);   break;
                 case DASH_SCAN_MSG: _do_scan_send();       break;
                 case DASH_LOG_MSG:  _do_log_send(msg.log); break;
+                case DASH_PATH_MSG: _do_path_send(&msg);   break;
             }
         }
 
@@ -761,6 +792,31 @@ void wifi_dashboard_broadcast_scan(const lidar_scan_t *scan, const pose_t *pose)
 
     if (out == 0u) return;
     dash_msg_t msg = { .type = DASH_SCAN_MSG };
+    xQueueSend(s_dash_queue, &msg, 0);
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * wifi_dashboard_broadcast_path — post A* waypoints (or empty list) to browser.
+ *
+ * Pass the same path_frame_t sent to the Wemos so the browser shows exactly
+ * what the car is executing.  Pass NULL or a frame with length=0 to clear the
+ * stale path overlay when A* fails or no frontier exists.
+ * Called from plan_task once per planning cycle — non-blocking queue post.
+ * ════════════════════════════════════════════════════════════════════════════ */
+void wifi_dashboard_broadcast_path(const path_frame_t *frame)
+{
+    if (!s_dash_queue) return;
+    dash_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = DASH_PATH_MSG;
+    if (frame && frame->length > 0 && frame->length <= MAX_SHARED_PATH_POINTS) {
+        msg.path.count = frame->length;
+        for (uint8_t i = 0; i < frame->length; i++) {
+            msg.path.pts_x[i] = frame->waypoints[i].x;
+            msg.path.pts_y[i] = frame->waypoints[i].y;
+        }
+    }
     xQueueSend(s_dash_queue, &msg, 0);
 }
 

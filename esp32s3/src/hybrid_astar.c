@@ -19,6 +19,9 @@
 #include <stddef.h>
 #include <float.h>
 #include <stdbool.h>
+#include "esp_log.h"
+
+static const char *TAG = "astar";
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -26,7 +29,7 @@
 
 #define DEFAULT_TARGET_SPEED_MM_S 200.0f
 #define ASTAR_INF 1.0e30f
-#define MAX_QT_FREE_LEAVES 4096
+#define MAX_QT_FREE_LEAVES 512
 #define MAX_QT_NEIGHBORS 16
 #define MAX_PATH_WAYPOINTS 64
 
@@ -474,7 +477,7 @@ path_t hybrid_astar_plan(const quadtree_map_t *map,
                          const frontier_t *goal)
 {
     path_t path = hybrid_astar_empty_path();
-    qt_graph_node_t nodes[MAX_QT_FREE_LEAVES];
+    static qt_graph_node_t nodes[MAX_QT_FREE_LEAVES];
 
     if (map == NULL || start == NULL || goal == NULL) {
         return path;
@@ -488,6 +491,9 @@ path_t hybrid_astar_plan(const quadtree_map_t *map,
     int node_count = collect_free_leaves(map, nodes);
     if (node_count <= 0) {
         return path;
+    }
+    if (node_count >= MAX_QT_FREE_LEAVES) {
+        ESP_LOGW(TAG, "free-leaf cap hit (%d) — raise MAX_QT_FREE_LEAVES", node_count);
     }
 
     build_adjacency(map, nodes, node_count);
@@ -511,5 +517,39 @@ path_t hybrid_astar_plan(const quadtree_map_t *map,
     }
 
     smooth_path_quadtree(map, &path);
+
+    /* ── Anchor waypoints[0] to the exact robot pose ─────────────────────────
+     * The A* start node is the centre of the leaf CONTAINING the robot, which
+     * may be hundreds of mm away from the robot's actual position.  Replace it
+     * with the exact pose so Pure Pursuit and the dashboard see the true start. */
+    if (path.length >= 1) {
+        path.waypoints[0].x = start->x;
+        path.waypoints[0].y = start->y;
+        if (path.length >= 2) {
+            float dx = path.waypoints[1].x - start->x;
+            float dy = path.waypoints[1].y - start->y;
+            path.waypoints[0].theta = atan2f(dy, dx);
+        }
+    }
+
+    /* ── Append the actual frontier as the true final waypoint ───────────────
+     * The A* goal node is the nearest FREE leaf to the frontier, not the
+     * frontier itself (which sits in unexplored space).  Adding the frontier
+     * position as an extra waypoint closes the gap, giving Pure Pursuit a
+     * target that matches the orange dot on the dashboard. */
+    if (path.length >= 1 && path.length < MAX_PATH_WAYPOINTS) {
+        float dx = goal->cx - path.waypoints[path.length - 1].x;
+        float dy = goal->cy - path.waypoints[path.length - 1].y;
+        if (dx * dx + dy * dy > 1.0f) {
+            float heading = atan2f(dy, dx);
+            path.waypoints[path.length - 1].theta = heading;   /* point last node toward frontier */
+            path.waypoints[path.length].x        = goal->cx;
+            path.waypoints[path.length].y        = goal->cy;
+            path.waypoints[path.length].theta    = heading;
+            path.waypoints[path.length].v_target = DEFAULT_TARGET_SPEED_MM_S;
+            path.length++;
+        }
+    }
+
     return path;
 }

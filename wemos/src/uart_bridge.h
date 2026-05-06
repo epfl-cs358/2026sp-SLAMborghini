@@ -29,4 +29,7 @@ bool uart_bridge_recv_control(control_frame_t *out);
  */
 bool uart_bridge_recv_path(path_frame_t *out);
 
+/* Notify ESP32-S3 that the current path has been fully executed. */
+bool uart_bridge_send_path_done(void);
+
 #endif /* UART_BRIDGE_H */

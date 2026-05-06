@@ -54,6 +54,8 @@
 #include "imu_gyro.h"
 #include "uart_bridge.h"
 #include "pure_pursuit_controller.h"
+#include "task_odometry.h"
+#include "imu_encoder_driver.h"
 
 /* ── ESP-IDF / FreeRTOS ─────────────────────────────────────────────────── */
 #include "driver/ledc.h"
@@ -86,6 +88,7 @@
 #define DEBUG_SPEED_MM_S    100.0f
 #define MAX_DRIVE_MS        1200u
 #define CYCLE_DELAY_MS      50
+#define PP_SUBCYCLE_MS      350u    /* max drive time per PP iteration */
 
 #define TURN_ARC_THRESH_RAD  0.785f   /* π/4 */
 #define TURN_ARC_MS          800u
@@ -294,6 +297,7 @@ static float drive_for_cmd(const control_frame_t *cmd, float current_heading)
  * ════════════════════════════════════════════════════════════════════════════ */
 static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
 {
+    pose->theta = cmd->t_heading;
     float dist_mm = sqrtf(cmd->tx * cmd->tx + cmd->ty * cmd->ty);
     if (dist_mm < 1.0f) return;
 
@@ -303,9 +307,8 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
     if (dt_s > max_s) dt_s = max_s;
 
     float traveled = speed * dt_s;
-    pose->x    += traveled * cosf(cmd->t_heading);
-    pose->y    += traveled * sinf(cmd->t_heading);
-    pose->theta = cmd->t_heading;
+    pose->x += traveled * cosf(cmd->t_heading);
+    pose->y += traveled * sinf(cmd->t_heading);
 }
 
 
@@ -903,6 +906,13 @@ static void bridge_slave_task(void *arg)
     pure_pursuit_controller_t pp;
     pp_init(&pp);
 
+    /*
+     * local_pose tracks the robot in world frame (same coordinate system as
+     * the ESP32-S3 planner). It is snapped to waypoints[0] whenever a new
+     * path_frame_t arrives, keeping it in sync with the planner's world frame.
+     * local_pose.theta is kept from the IMU (not overwritten on path receive)
+     * since the gyro is more accurate than the planner's theta estimate.
+     */
     pose_t local_pose = {
         .x = 0.0f,
         .y = 0.0f,
@@ -910,144 +920,127 @@ static void bridge_slave_task(void *arg)
         .cov = {0}
     };
 
-        for (;;) {
-        control_frame_t cmd = {0};
-        bool have_command = false;
+    bool  has_active_path = false;
+    float active_speed    = DEBUG_SPEED_MM_S;
 
-        /*
-         * New protocol:
-         * Try to receive a real path from ESP32-S3.
-         */
+    for (;;) {
+
+        /* ── Check for new path from ESP32-S3 (always preempts current) ──── */
         path_frame_t path_frame;
-
         if (uart_bridge_recv_path(&path_frame)) {
             printf("[SLAVE] path received: length=%u\n",
                    (unsigned)path_frame.length);
 
-            pp_set_path(&pp,
-                        path_frame.waypoints,
-                        path_frame.length);
-
             /*
-             * For now, use the final path point only to estimate how long
-             * to drive. The steering itself comes from Pure Pursuit.
+             * Snap world-frame position to path start so PP arithmetic works.
+             * The A* path starts at the quadtree leaf nearest the robot, so
+             * waypoints[0] is a good proxy for the current world position.
+             * Keep local_pose.theta from the IMU — it is more accurate.
              */
-            waypoint_t final_wp =
-                path_frame.waypoints[path_frame.length - 1];
+            local_pose.x = path_frame.waypoints[0].x;
+            local_pose.y = path_frame.waypoints[0].y;
 
-            cmd.tx = final_wp.x - local_pose.x;
-            cmd.ty = final_wp.y - local_pose.y;
-            cmd.t_heading = final_wp.theta;
-            cmd.t_speed = final_wp.v_target;
+            pp_set_path(&pp, path_frame.waypoints, path_frame.length);
 
-            if (cmd.t_speed <= 10.0f) {
-                cmd.t_speed = 150.0f;
+            active_speed = path_frame.waypoints[path_frame.length - 1].v_target;
+            if (active_speed <= 10.0f) active_speed = 150.0f;
+
+            has_active_path = true;
+        }
+
+        /* ── control_frame_t fallback disabled for path-only debug test ─────
+         * Car must NOT move unless the S3 sends a proper path_frame_t.
+         * Drain any control frames so the UART buffer stays clean. */
+        if (!has_active_path) {
+            control_frame_t _discard = {0};
+            uart_bridge_recv_control(&_discard);   /* consume and ignore */
+        }
+
+        /* ── No active path — idle ───────────────────────────────────────── */
+        if (!has_active_path) {
+            motors_stop();
+            set_duty(SERVO_CH, SERVO_DUTY_CENTER);
+            /* Heartbeat: print once per second so we know Wemos is alive */
+            static uint32_t s_idle_ticks = 0;
+            if (++s_idle_ticks >= 100u) {          /* 100 × 10 ms = 1 s   */
+                s_idle_ticks = 0;
+                printf("[SLAVE] idle — waiting for path_frame from S3...\n");
             }
-
-            have_command = true;
-        }
-
-        /*
-         * Old protocol fallback:
-         * If no path packet arrived, receive the old single control_frame_t.
-         */
-        if (!have_command && uart_bridge_recv_control(&cmd)) {
-            printf("[SLAVE] cmd: hdg=%.2f rad  spd=%.0f mm/s  tx=%.0f  ty=%.0f\n",
-                   (double)cmd.t_heading,
-                   (double)cmd.t_speed,
-                   (double)cmd.tx,
-                   (double)cmd.ty);
-
-            /*
-             * Temporary path adapter:
-             * Current old UART protocol sends one control_frame_t, not a full path.
-             * So we create a small 2-point path from the current local pose
-             * to the received target displacement.
-             */
-            waypoint_t path[2];
-
-            path[0].x = local_pose.x;
-            path[0].y = local_pose.y;
-            path[0].theta = local_pose.theta;
-            path[0].v_target = cmd.t_speed;
-
-            path[1].x = local_pose.x + cmd.tx;
-            path[1].y = local_pose.y + cmd.ty;
-            path[1].theta = cmd.t_heading;
-            path[1].v_target = cmd.t_speed;
-
-            pp_set_path(&pp, path, 2);
-
-            have_command = true;
-        }
-
-        if (!have_command) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        pp_motion_command_t pp_cmd =
-            pp_compute_command(&pp, &local_pose);
+        /* ── Compute Pure Pursuit command for current sub-cycle ──────────── */
+        pp_motion_command_t pp_cmd = pp_compute_command(&pp, &local_pose);
 
-        printf("[PP] speed=%.0f mm/s  servo=%.1f deg  stop=%d\n",
-               (double)pp_cmd.speed_mm_s,
-               (double)pp_cmd.steering_deg,
-               (int)pp_cmd.stop);
-
-        if (pp_cmd.stop) {
+        if (pp_cmd.stop || pp_is_path_complete(&pp, &local_pose)) {
+            printf("[PP] path complete — waiting for next path\n");
+            uart_bridge_send_path_done();
+            has_active_path = false;
             motors_stop();
             set_duty(SERVO_CH, SERVO_DUTY_CENTER);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        uint32_t servo_duty =
-            servo_deg_to_duty(pp_cmd.steering_deg);
-
-        set_duty(SERVO_CH, servo_duty);
+        /* ── Apply steering, pause for servo to settle ───────────────────── */
+        set_duty(SERVO_CH, servo_deg_to_duty(pp_cmd.steering_deg));
         vTaskDelay(pdMS_TO_TICKS(50));
 
-        float dist_mm = sqrtf(cmd.tx * cmd.tx + cmd.ty * cmd.ty);
-        if (dist_mm < 50.0f) {
-            dist_mm = DEBUG_FORWARD_MM;
-        }
+        /* ── Drive for one PP sub-cycle ──────────────────────────────────── */
+        (void)(pp_cmd.speed_mm_s > 10.0f ? pp_cmd.speed_mm_s : active_speed); /* speed unused now */
+        uint32_t drive_ms = PP_SUBCYCLE_MS;
 
-        float speed = pp_cmd.speed_mm_s;
-        if (cmd.t_speed > 10.0f) {
-            speed = cmd.t_speed;
-        }
-
-               /*
-         * Real-life path-following test:
-         * Drive only a short step each time a path frame arrives.
-         * This lets us see the robot follow the path gradually.
-         */
-        uint32_t drive_ms = 800;
+        /* Snapshot Ackermann pose before driving (x, y in metres) */
+        odom_pose_t before_pose = *task_odometry_get_pose();
 
         set_duty(CH_FWD, MOTOR_DUTY_FWD);
         set_duty(CH_BWD, MOTOR_DUTY_STOP);
-
-        float new_heading =
-            imu_drive_and_track(local_pose.theta, drive_ms);
-
+        vTaskDelay(pdMS_TO_TICKS(drive_ms));
         motors_stop();
 
-        /*
-         * Dead-reckon local pose after the movement.
-         * This is temporary until proper EKF/odometry feedback is connected.
-         */
-        float moved_mm = speed * ((float)drive_ms / 1000.0f);
+        /* Snapshot Ackermann pose after driving */
+        odom_pose_t after_pose = *task_odometry_get_pose();
 
+        /* Chord displacement (m→mm) and heading delta from Ackermann odom */
+        float dx_m        = after_pose.x - before_pose.x;
+        float dy_m        = after_pose.y - before_pose.y;
+        float traveled_mm = sqrtf(dx_m * dx_m + dy_m * dy_m) * 1000.0f;
+
+        float dtheta = after_pose.theta - before_pose.theta;
+        while (dtheta >  (float)M_PI) dtheta -= 2.0f * (float)M_PI;
+        while (dtheta < -(float)M_PI) dtheta += 2.0f * (float)M_PI;
+
+        float new_heading = local_pose.theta + dtheta;
+        while (new_heading >  (float)M_PI) new_heading -= 2.0f * (float)M_PI;
+        while (new_heading < -(float)M_PI) new_heading += 2.0f * (float)M_PI;
+
+        /* Update local pose (in mm) */
+        local_pose.x    += traveled_mm * cosf(new_heading);
+        local_pose.y    += traveled_mm * sinf(new_heading);
         local_pose.theta = new_heading;
-        local_pose.x += moved_mm * cosf(local_pose.theta);
-        local_pose.y += moved_mm * sinf(local_pose.theta);
 
-        printf("[PP] updated pose: x=%.0f y=%.0f theta=%.2f rad\n",
+        /* Send odometry to ESP32-S3 for pose fusion */
+        {
+            static uint32_t s_odom_seq = 0;
+            float dt_ms = (after_pose.timestamp_ms > before_pose.timestamp_ms)
+                          ? (float)(after_pose.timestamp_ms - before_pose.timestamp_ms)
+                          : (float)drive_ms;
+            odom_t odom = {
+                .linear_disp_mm = traveled_mm,
+                .yaw_rate_imu   = (dt_ms > 0.0f) ? dtheta / (dt_ms / 1000.0f) : 0.0f,
+                .dt_ms          = dt_ms,
+                .seq            = s_odom_seq++,
+            };
+            uart_bridge_send_odom(&odom);
+        }
+
+        printf("[PP] servo=%.1f deg  disp=%.0f mm  pose=(%.0f,%.0f,%.2f)\n",
+               (double)pp_cmd.steering_deg,
+               (double)traveled_mm,
                (double)local_pose.x,
                (double)local_pose.y,
                (double)local_pose.theta);
-
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 #endif /* BRIDGE_SLAVE */
@@ -1087,6 +1080,10 @@ void app_main(void)
     set_duty(SERVO_CH, SERVO_DUTY_CENTER);
     vTaskDelay(pdMS_TO_TICKS(500));
     imu_gyro_init();
+    imu_gyro_calibrate_bias(300);   /* 3 s startup calibration at 100 Hz */
+    /* task_odometry reads AS5600 via I2C (shared bus, already up after imu_gyro_init)
+     * and integrates encoder distance + IMU yaw at 100 Hz. */
+    xTaskCreate(task_odometry,     "odom",  4096, NULL, 4, NULL);
     xTaskCreate(bridge_slave_task, "slave", 4096, NULL, 3, NULL);
 
 #elif defined(HEADING_TEST_MODE)

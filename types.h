@@ -13,22 +13,28 @@
 
 /** A single point from the RPLiDAR C1 scan in polar coordinates. */
 typedef struct {
-    float   r_mm;       /**< Range in millimetres */
-    float   theta_deg;  /**< Angle in degrees (0-360) */
-    uint8_t intensity;  /**< Return signal intensity (0-255) */
+    float    r_mm;          /**< Range in millimetres */
+    float    theta_deg;     /**< Angle in degrees (0-360) */
+    uint8_t  intensity;     /**< Return signal intensity (0-255) */
+    uint8_t  _pad[3];
+    uint32_t timestamp_us;  /**< Beam capture time (µs, esp_timer epoch); set by lidar_driver */
 } lidar_scan_point_t;
 
 /** One full 360-degree LiDAR scan. */
 typedef struct {
-    lidar_scan_point_t points[460]; /**< Array of scan points */
-    uint16_t           count;       /**< Number of valid points in this scan */
+    lidar_scan_point_t points[460];       /**< Array of scan points */
+    uint16_t           count;             /**< Number of valid points in this scan */
+    uint16_t           _pad;
+    uint32_t           scan_start_us;     /**< esp_timer_get_time() at first start-bit */
+    uint32_t           rotation_period_us;/**< Time between consecutive start-bits (µs) */
 } lidar_scan_t;
 
 /** Odometry measurement: linear displacement + IMU yaw rate over dt. */
 typedef struct {
-    float linear_disp_mm; /**< Forward displacement in mm since last frame */
-    float yaw_rate_imu;   /**< Yaw rate from IMU in rad/s */
-    float dt_ms;          /**< Time delta in milliseconds */
+    float    linear_disp_mm; /**< Forward displacement in mm since last frame */
+    float    yaw_rate_imu;   /**< Yaw rate from IMU in rad/s */
+    float    dt_ms;          /**< Time delta in milliseconds */
+    uint32_t seq;            /**< Monotonic counter — gaps indicate dropped packets */
 } odom_t;
 
 /** 2-D car pose with uncertainty. */

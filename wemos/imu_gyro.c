@@ -31,8 +31,11 @@
 /* ── Gyro sensitivity at 250 DPS: 131 LSB / (°/s) ──────────────────────── */
 #define GYRO_SENS       131.0f
 
-/* ── Bias from SLAMurai calibration (rad/s) ─────────────────────────────── */
-#define GYRO_BIAS_Z     0.00635f
+/* ── Bias: warm-start from SLAMurai calibration; refined at runtime ─────── */
+static float s_bias_z = 0.00635f;
+
+/* ── ZUPT EMA gain: ~200 stationary calls to converge 50 % ──────────────── */
+#define ZUPT_GAIN 0.005f
 
 /* ── Integration poll interval ──────────────────────────────────────────── */
 #define POLL_MS         10u    /* 100 Hz */
@@ -77,6 +80,20 @@ void imu_gyro_set_stop_check(bool (*fn)(void))
 float imu_gyro_get_heading(void)
 {
     return s_live_heading;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * imu_gyro_update
+ * Integrate gyro Z into s_live_heading over dt_s seconds.
+ * Called every 10 ms by task_odometry so heading stays current between drives.
+ * ════════════════════════════════════════════════════════════════════════════ */
+void imu_gyro_update(float dt_s)
+{
+    float gz = imu_gyro_read_z();
+    s_live_heading += gz * dt_s;
+    while (s_live_heading >  (float)M_PI) s_live_heading -= 2.0f * (float)M_PI;
+    while (s_live_heading < -(float)M_PI) s_live_heading += 2.0f * (float)M_PI;
 }
 
 
@@ -158,7 +175,46 @@ float imu_gyro_read_z(void)
     int16_t raw = (int16_t)((buf[0] << 8) | buf[1]);
     float gz_deg_s = (float)raw / GYRO_SENS;
     float gz_rad_s = gz_deg_s * ((float)M_PI / 180.0f);
-    return gz_rad_s - GYRO_BIAS_Z;
+    return gz_rad_s - s_bias_z;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * imu_gyro_calibrate_bias
+ * Average raw gyro Z over `samples` ticks (10 ms each) to set s_bias_z.
+ * ════════════════════════════════════════════════════════════════════════════ */
+float imu_gyro_calibrate_bias(int samples)
+{
+    double acc = 0.0;
+    int    n   = 0;
+    for (int i = 0; i < samples; i++) {
+        uint8_t buf[2] = {0};
+        if (imu_read(REG_GYRO_ZOUT_H, buf, 2) == ESP_OK) {
+            int16_t raw    = (int16_t)((buf[0] << 8) | buf[1]);
+            float gz_deg_s = (float)raw / GYRO_SENS;
+            acc += (double)(gz_deg_s * ((float)M_PI / 180.0f));
+            n++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (n > 0) s_bias_z = (float)(acc / n);
+    ESP_LOGI(TAG, "Gyro bias calibrated: %.5f rad/s  (%d samples)", (double)s_bias_z, n);
+    return s_bias_z;
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * imu_gyro_zupt_update
+ * EMA-refine s_bias_z from raw gyro reading when car is stationary.
+ * ════════════════════════════════════════════════════════════════════════════ */
+void imu_gyro_zupt_update(void)
+{
+    uint8_t buf[2] = {0};
+    if (imu_read(REG_GYRO_ZOUT_H, buf, 2) != ESP_OK) return;
+    int16_t raw    = (int16_t)((buf[0] << 8) | buf[1]);
+    float gz_deg_s = (float)raw / GYRO_SENS;
+    float gz_raw   = gz_deg_s * ((float)M_PI / 180.0f);
+    s_bias_z += ZUPT_GAIN * (gz_raw - s_bias_z);
 }
 
 
