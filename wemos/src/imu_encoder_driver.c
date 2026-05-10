@@ -34,9 +34,30 @@ static const char *ENC_TAG = "encoder";
 #define AS5600_TIMEOUT_MS   20u  /* must be ≥ 1 FreeRTOS tick (10 ms at 100 Hz); 5 ms rounded to 0 ticks and timed out instantly */
 
 /* ── Wheel geometry — measure and set these before first run ─────────────── */
-#define WHEEL_DIAMETER_M    0.065f                          /* 65 mm default  */
-#define WHEEL_CIRC_M        ((float)M_PI * WHEEL_DIAMETER_M)
-#define ENCODER_SIGN        1.0f   /* -1.0f if forward motion reads negative  */
+#define WHEEL_DIAMETER_M    0.065f    /* 65 mm driven wheel outer diameter     */
+#define ENCODER_SIGN        1.0f      /* -1.0f if forward motion reads negative */
+
+/* Motor-to-wheel gear reduction ratio.
+ *
+ * If the AS5600 is mounted on the MOTOR SHAFT (not the wheel axle), it spins
+ * GEAR_RATIO times per wheel revolution.  Set this to the number of motor
+ * shaft turns per wheel turn.
+ *
+ * Calibration procedure (one-time, takes ~2 minutes):
+ *   1. Mark the robot's start position on the floor.
+ *   2. Flash with USE_REAL_LIDAR=1, let the S3 send one path and drive one
+ *      PP sub-cycle (~380 ms).  Read the printed line:
+ *        [ODOM-SEND] disp=XXXX.X mm ...
+ *   3. Measure the physical distance the robot actually traveled (ruler/tape).
+ *   4. Set GEAR_RATIO = reported_mm / actual_mm.
+ *
+ * Example: log shows 1284 mm, ruler shows 160 mm → GEAR_RATIO = 8.025 → use 8.0
+ *
+ * If the encoder IS on the wheel axle (no gear reduction visible), set 1.0.
+ */
+#define GEAR_RATIO          16.0f
+
+#define WHEEL_CIRC_M        ((float)M_PI * WHEEL_DIAMETER_M / GEAR_RATIO)
 
 /* ── Module state ─────────────────────────────────────────────────────────── */
 static uint16_t s_prev_raw     = 0u;

@@ -36,10 +36,10 @@
 /* ── Hardware test modes — uncomment exactly one; all others must be off ─── */
 //#define TEST_MOTOR       /* drive forward 30 cm then stop                   */
 // #define TEST_SERVO       /* sweep: centre → left → centre → right → centre  */
-// #define TEST_IMU         /* WHO_AM_I check + live gyro-Z / heading read     */
-// #define TEST_AS5600      /* I2C scan + continuous angle read (AS5600 @ 0x36)*/
+//#define TEST_IMU         /* WHO_AM_I check + live gyro-Z / heading read     */
+//#define TEST_AS5600      /* I2C scan + continuous angle read (AS5600 @ 0x36)*/
 // #define TEST_BRIDGE_RX   /* receive and decode UART bridge frames from ESP32-S3 */
-// #define TEST_BRIDGE_PONG /* interactive: press ENTER → send "hey2", print replies */
+//#define TEST_BRIDGE_PONG /* interactive: press ENTER → send "hey2", print replies */
 #define BRIDGE_SLAVE     /* receive drive commands from ESP32-S3 and execute them */
 
 #include "hardware_pins.h"
@@ -921,29 +921,55 @@ static void bridge_slave_task(void *arg)
     };
 
     bool  has_active_path = false;
-    float active_speed    = DEBUG_SPEED_MM_S;
+    bool  path_just_ended = false;   /* set true when path → idle transition occurs */
 
     for (;;) {
 
         /* ── Check for new path from ESP32-S3 (always preempts current) ──── */
         path_frame_t path_frame;
         if (uart_bridge_recv_path(&path_frame)) {
-            printf("[SLAVE] path received: length=%u\n",
+            /* ACK before any processing — S3 starts its timeout only after this. */
+            uart_bridge_send_path_ack((uint8_t)path_frame.length);
+            printf("[SLAVE] path received: length=%u  ACK sent\n",
                    (unsigned)path_frame.length);
 
             /*
-             * Snap world-frame position to path start so PP arithmetic works.
-             * The A* path starts at the quadtree leaf nearest the robot, so
-             * waypoints[0] is a good proxy for the current world position.
-             * Keep local_pose.theta from the IMU — it is more accurate.
+             * Sync local_pose into the world frame used by the S3 planner.
+             *
+             * x/y: use waypoints[0] — the A* start cell, which is the S3's
+             *   best estimate of the robot's world-frame position at plan time.
+             *   The odom frame starts at (0,0) on boot; it does NOT match the
+             *   planner's world frame (map centred at 5000,5000 mm).  Using
+             *   odom absolute position here would place the robot thousands of
+             *   mm from the path, breaking PP lookahead entirely.
+             *
+             * theta: use IMU heading from task_odometry — more accurate than
+             *   waypoints[0].theta (which is the desired heading at that cell,
+             *   not the robot's actual heading).
+             *
+             * After this snap, local_pose.x/y are updated by odom DELTAS each
+             * PP cycle, keeping them in the same world frame.
              */
-            local_pose.x = path_frame.waypoints[0].x;
-            local_pose.y = path_frame.waypoints[0].y;
+            {
+                odom_pose_t cur_odom;
+                task_odometry_copy_pose(&cur_odom);
+                local_pose.x     = path_frame.waypoints[0].x;
+                local_pose.y     = path_frame.waypoints[0].y;
+                local_pose.theta = cur_odom.theta;
+            }
 
             pp_set_path(&pp, path_frame.waypoints, path_frame.length);
 
-            active_speed = path_frame.waypoints[path_frame.length - 1].v_target;
-            if (active_speed <= 10.0f) active_speed = 150.0f;
+            /* Dump all waypoints so we can verify coordinates and spacing. */
+            printf("[PP-PATH] local_pose snap: (%.0f,%.0f,%.3f rad)\n",
+                   (double)local_pose.x, (double)local_pose.y,
+                   (double)local_pose.theta);
+            for (uint8_t _wi = 0; _wi < path_frame.length; _wi++)
+                printf("[PP-PATH]   wp[%u] = (%.0f, %.0f)  theta=%.2f\n",
+                       (unsigned)_wi,
+                       (double)path_frame.waypoints[_wi].x,
+                       (double)path_frame.waypoints[_wi].y,
+                       (double)path_frame.waypoints[_wi].theta);
 
             has_active_path = true;
         }
@@ -960,6 +986,40 @@ static void bridge_slave_task(void *arg)
         if (!has_active_path) {
             motors_stop();
             set_duty(SERVO_CH, SERVO_DUTY_CENTER);
+            task_odometry_set_steering_rad(0.0f);
+
+            /* Send heading updates at ~10 Hz so S3 tracks rotation during idle.
+             * Without this, turning the car in place never updates the S3 pose,
+             * so the dashboard car icon stays frozen and scans are projected at
+             * the wrong angle. */
+            static odom_pose_t s_idle_last_pose  = {0};
+            static bool        s_idle_pose_init  = false;
+            static uint32_t    s_idle_odom_seq   = 0;
+            static uint8_t     s_idle_send_ctr   = 0;
+            /* Initialize last_pose from current IMU on first entry so the
+             * first odom packet doesn't send a spurious large rotation. */
+            if (!s_idle_pose_init || path_just_ended) {
+                task_odometry_copy_pose(&s_idle_last_pose);
+                s_idle_pose_init = true;
+                path_just_ended  = false;
+            }
+            if (++s_idle_send_ctr >= 10u) {        /* 10 × 10 ms = 100 ms */
+                s_idle_send_ctr = 0;
+                odom_pose_t cur;
+                task_odometry_copy_pose(&cur);
+                float dtheta_idle = cur.theta - s_idle_last_pose.theta;
+                while (dtheta_idle >  (float)M_PI) dtheta_idle -= 2.0f * (float)M_PI;
+                while (dtheta_idle < -(float)M_PI) dtheta_idle += 2.0f * (float)M_PI;
+                odom_t idle_odom = {
+                    .linear_disp_mm = 0.0f,
+                    .yaw_rate_imu   = dtheta_idle * 10.0f,  /* 100 ms window → ×10 = rad/s */
+                    .dt_ms          = 100.0f,
+                    .seq            = s_idle_odom_seq++,
+                };
+                uart_bridge_send_odom(&idle_odom);
+                s_idle_last_pose = cur;
+            }
+
             /* Heartbeat: print once per second so we know Wemos is alive */
             static uint32_t s_idle_ticks = 0;
             if (++s_idle_ticks >= 100u) {          /* 100 × 10 ms = 1 s   */
@@ -973,34 +1033,50 @@ static void bridge_slave_task(void *arg)
         /* ── Compute Pure Pursuit command for current sub-cycle ──────────── */
         pp_motion_command_t pp_cmd = pp_compute_command(&pp, &local_pose);
 
+        /* One-line diagnostic: helps spot bad lookahead / wrong coordinate frame */
+        printf("[PP-DBG] pose=(%.0f,%.0f,%.2f)  servo=%.0f  wp_idx=%u/%u\n",
+               (double)local_pose.x, (double)local_pose.y,
+               (double)local_pose.theta,
+               (double)pp_cmd.steering_deg,
+               (unsigned)pp.last_target_index,
+               (unsigned)pp.path_length);
+
         if (pp_cmd.stop || pp_is_path_complete(&pp, &local_pose)) {
             printf("[PP] path complete — waiting for next path\n");
             uart_bridge_send_path_done();
             has_active_path = false;
+            path_just_ended = true;
             motors_stop();
             set_duty(SERVO_CH, SERVO_DUTY_CENTER);
+            task_odometry_set_steering_rad(0.0f);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        /* ── Apply steering, pause for servo to settle ───────────────────── */
+        /* ── Update steering while car keeps rolling ─────────────────────── */
         set_duty(SERVO_CH, servo_deg_to_duty(pp_cmd.steering_deg));
-        vTaskDelay(pdMS_TO_TICKS(50));
+        task_odometry_set_steering_rad((pp_cmd.steering_deg - 90.0f) * ((float)M_PI / 180.0f));
+        vTaskDelay(pdMS_TO_TICKS(20));   /* 20 ms — servo reaches target in ~1 PWM period */
 
         /* ── Drive for one PP sub-cycle ──────────────────────────────────── */
-        (void)(pp_cmd.speed_mm_s > 10.0f ? pp_cmd.speed_mm_s : active_speed); /* speed unused now */
         uint32_t drive_ms = PP_SUBCYCLE_MS;
 
         /* Snapshot Ackermann pose before driving (x, y in metres) */
-        odom_pose_t before_pose = *task_odometry_get_pose();
+        odom_pose_t before_pose;
+        task_odometry_copy_pose(&before_pose);
 
         set_duty(CH_FWD, MOTOR_DUTY_FWD);
         set_duty(CH_BWD, MOTOR_DUTY_STOP);
         vTaskDelay(pdMS_TO_TICKS(drive_ms));
+        /* Brief stop between cycles so each burst's effect is observable during
+         * testing. Remove this (and the delay) once testing is complete and
+         * continuous motion is desired. */
         motors_stop();
+        vTaskDelay(pdMS_TO_TICKS(30));
 
         /* Snapshot Ackermann pose after driving */
-        odom_pose_t after_pose = *task_odometry_get_pose();
+        odom_pose_t after_pose;
+        task_odometry_copy_pose(&after_pose);
 
         /* Chord displacement (m→mm) and heading delta from Ackermann odom */
         float dx_m        = after_pose.x - before_pose.x;
@@ -1033,6 +1109,11 @@ static void bridge_slave_task(void *arg)
                 .seq            = s_odom_seq++,
             };
             uart_bridge_send_odom(&odom);
+
+            /* Encoder health check: if traveled_mm is always 0 while driving,
+             * the AS5600 is not contributing — check magnet alignment / I2C. */
+            printf("[ODOM-SEND] disp=%.1f mm  dtheta=%.3f rad  dt=%.0f ms\n",
+                   (double)traveled_mm, (double)dtheta, (double)dt_ms);
         }
 
         printf("[PP] servo=%.1f deg  disp=%.0f mm  pose=(%.0f,%.0f,%.2f)\n",

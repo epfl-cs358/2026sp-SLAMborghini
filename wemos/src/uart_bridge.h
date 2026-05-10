@@ -32,4 +32,7 @@ bool uart_bridge_recv_path(path_frame_t *out);
 /* Notify ESP32-S3 that the current path has been fully executed. */
 bool uart_bridge_send_path_done(void);
 
+/* Acknowledge receipt of a path frame (path_len = number of waypoints received). */
+bool uart_bridge_send_path_ack(uint8_t path_len);
+
 #endif /* UART_BRIDGE_H */

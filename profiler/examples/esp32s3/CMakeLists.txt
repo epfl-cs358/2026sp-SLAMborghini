@@ -1,0 +1,40 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        # Unit tests
+        "test_lidar_driver.c"
+        "test_quadtree.c"
+        "test_lidar_to_map.c"
+        "test_frontier.c"
+        "test_hybrid_astar.c"
+        "test_uart_bridge.c"
+        "test_wifi_dashboard.c"
+        # Pipeline integration tests
+        "test_pipeline_scan_to_map.c"
+        "test_pipeline_frontier.c"
+        "test_pipeline_full_slam.c"
+        # Real module implementations from the project
+        "../../../esp32s3/src/quadtree_map.c"
+        "../../../esp32s3/src/quadtree_map_compat.c"
+        "../../../esp32s3/src/lidar_to_map.c"
+        "../../../esp32s3/src/frontier_detector.c"
+        "../../../esp32s3/src/hybrid_astar.c"
+        "../../../esp32s3/src/lidar_driver.c"
+        "../../../esp32s3/src/uart_bridge.c"
+        "../../../esp32s3/src/wifi_dashboard.c"
+    INCLUDE_DIRS
+        "."
+        "../../../"
+        "../../../esp32s3/src"
+    REQUIRES
+        profiler
+        freertos
+        esp_common
+        esp_timer
+        heap
+        driver
+        nvs_flash
+        esp_wifi
+        esp_http_server
+        esp_netif
+)

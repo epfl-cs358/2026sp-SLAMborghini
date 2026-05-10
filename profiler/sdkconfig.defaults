@@ -1,0 +1,44 @@
+# profiler/sdkconfig.defaults
+#
+# Required Kconfig options for the SLAMborghini profiling framework.
+# Merge these into your project's sdkconfig.defaults when enabling profiling.
+# Remove or set to 'n' in production builds where PROFILER_ENABLED=0.
+#
+# Apply with:  idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;profiler/sdkconfig.defaults" build
+
+# ── FreeRTOS runtime statistics ───────────────────────────────────────────────
+# Enables vTaskGetRunTimeStats() — per-task CPU % and absolute runtime.
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# Enables uxTaskGetSystemState() — full per-task state/priority/HWM table.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# Enables vTaskList() and vTaskGetRunTimeStats() string formatting helpers.
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
+# Adds xCoreID field to TaskStatus_t — required for dual-core task table.
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+
+# ── Stack overflow protection ─────────────────────────────────────────────────
+# Writes a canary pattern to the bottom of every task stack.
+# Panics with a diagnostic message if a task overwrites the canary.
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW=y
+
+# Arms a hardware watchpoint at the end of each task's stack.
+# Triggers a debug exception (breakpoint) before the overflow corrupts heap.
+# Note: uses one of the ESP32-S3's 4 hardware watchpoints — incompatible with
+# simultaneous GDB hardware breakpoints on that watchpoint slot.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+
+# ── Heap leak tracing ─────────────────────────────────────────────────────────
+# Instruments every malloc/free — significant overhead, for targeted debug only.
+# Required for the HEAP_TRACE_START() / HEAP_TRACE_STOP_DUMP() macros.
+CONFIG_HEAP_TRACING=y
+CONFIG_HEAP_TRACING_STANDALONE=y
+
+# ── Xtensa hardware performance counters ──────────────────────────────────────
+# Enables xtensa_perfmon_exec() — required for the PROFILER_USE_PERFMON layer.
+# The perfmon component uses two on-chip performance counter registers; it has
+# negligible overhead when not actively measuring (counters are stopped between
+# xtensa_perfmon_exec() calls).
+CONFIG_PERFMON=y

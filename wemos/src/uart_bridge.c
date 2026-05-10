@@ -12,8 +12,8 @@
  *   UART1 @ 115200 baud, 8N1
  *
  * Wiring:
- *   Wemos RX GPIO4  <- ESP32-S3 TX GPIO17
- *   Wemos TX GPIO5  -> ESP32-S3 RX GPIO16
+ *   Wemos RX GPIO16 <- ESP32-S3 TX GPIO17
+ *   Wemos TX GPIO17 -> ESP32-S3 RX GPIO16
  *   GND shared between boards
  *
  * Packet format:
@@ -69,6 +69,7 @@
 #define MSG_ODOM           0x02u
 #define MSG_PATH           0x03u
 #define MSG_PATH_DONE      0x04u
+#define MSG_PATH_ACK       0x05u
 
 #define HEADER_LEN         4u
 #define MAX_PAYLOAD_LEN    256u
@@ -284,4 +285,13 @@ bool uart_bridge_send_path_done(void)
 {
     uint8_t done = 1u;
     return send_packet(MSG_PATH_DONE, &done, 1u);
+}
+
+/* ------------------------------------------------------------
+ * Send path-ACK to ESP32-S3 (called immediately after recv_path)
+ * payload = number of waypoints received, as a cross-check
+ * ------------------------------------------------------------ */
+bool uart_bridge_send_path_ack(uint8_t path_len)
+{
+    return send_packet(MSG_PATH_ACK, &path_len, 1u);
 }

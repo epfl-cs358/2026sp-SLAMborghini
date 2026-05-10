@@ -16,4 +16,7 @@ bool uart_bridge_recv_odom(odom_t *out);
 /* Returns true (once) when Wemos signals that the current path is complete. */
 bool uart_bridge_recv_path_done(void);
 
+/* Returns true (once) when Wemos ACKs receipt of the last sent path. */
+bool uart_bridge_recv_path_ack(void);
+
 #endif /* UART_BRIDGE_H */

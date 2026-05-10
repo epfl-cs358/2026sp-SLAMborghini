@@ -11,6 +11,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 
 
@@ -81,6 +82,11 @@ void qt_iterate_occupied(QuadTreeMap *map,
 
 // qt_memory_bytes: returns memory usage of allocated nodes.
 size_t qt_memory_bytes(const QuadTreeMap *map);
+
+// qt_is_pool_full: true once no more nodes can be allocated (map is frozen).
+static inline bool qt_is_pool_full(const QuadTreeMap *map) {
+    return map && map->pool && map->count >= QT_POOL_SIZE;
+}
 
 // qt_query const variant — does not modify the map.
 int8_t qt_query_const(const QuadTreeMap *map, float x, float y);

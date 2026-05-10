@@ -10,10 +10,10 @@
  *     whatever points were collected.
  *
  * Wiring — see hardware_pins.h:
- *   LIDAR_UART_RX = GPIO16  → ESP32-S3 RX (LiDAR TX wire)
- *   LIDAR_UART_TX = GPIO15  → ESP32-S3 TX (LiDAR RX wire)
+ *   LIDAR_UART_RX = GPIO14  → ESP32-S3 RX (LiDAR TX yellow wire)
+ *   LIDAR_UART_TX = GPIO13  → ESP32-S3 TX (LiDAR RX green wire)
  *   LIDAR_BAUD    = 460800
- *   LiDAR VCC → 5 V, GND → GND
+ *   LiDAR VCC → 5 V (dedicated supply — motor draws 500-800 mA), GND shared
  *   MOTOCTL — not used; motor powered from VCC.
  *
  * RPLiDAR C1 legacy scan packet (5 bytes):

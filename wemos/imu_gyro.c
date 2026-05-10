@@ -2,8 +2,8 @@
  * imu_gyro.c
  * Minimal ICM-20948 gyro-Z driver for ESP-IDF.
  *
- * In the two-board layout the ICM-20948 is wired to the ESP32-S3 — see
- * hardware_pins.h for the current pin assignments (SDA=GPIO8, SCL=GPIO9).
+ * In the two-board layout the ICM-20948 is wired to the Wemos D1 R32 — see
+ * hardware_pins.h for the current pin assignments (SDA=GPIO21, SCL=GPIO22).
  */
 
 #include "imu_gyro.h"
@@ -36,6 +36,9 @@ static float s_bias_z = 0.00635f;
 
 /* ── ZUPT EMA gain: ~200 stationary calls to converge 50 % ──────────────── */
 #define ZUPT_GAIN 0.005f
+
+/* ── ZUPT rotation guard: skip bias update if car is actively spinning ───── */
+#define ZUPT_GYRO_THRESH_RAD_S  0.05f   /* ≈ 3°/s — above noise, below any real turn */
 
 /* ── Integration poll interval ──────────────────────────────────────────── */
 #define POLL_MS         10u    /* 100 Hz */
@@ -175,7 +178,7 @@ float imu_gyro_read_z(void)
     int16_t raw = (int16_t)((buf[0] << 8) | buf[1]);
     float gz_deg_s = (float)raw / GYRO_SENS;
     float gz_rad_s = gz_deg_s * ((float)M_PI / 180.0f);
-    return gz_rad_s - s_bias_z;
+    return -(gz_rad_s - s_bias_z);   /* negate: chip mounts CW-positive, code expects CCW-positive */
 }
 
 
@@ -214,6 +217,10 @@ void imu_gyro_zupt_update(void)
     int16_t raw    = (int16_t)((buf[0] << 8) | buf[1]);
     float gz_deg_s = (float)raw / GYRO_SENS;
     float gz_raw   = gz_deg_s * ((float)M_PI / 180.0f);
+    /* Skip bias update while the car is actively spinning — otherwise ZUPT
+     * pulls s_bias_z toward the real rotation rate and freezes s_live_heading. */
+    float gz_corrected = -(gz_raw - s_bias_z);
+    if (fabsf(gz_corrected) > ZUPT_GYRO_THRESH_RAD_S) return;
     s_bias_z += ZUPT_GAIN * (gz_raw - s_bias_z);
 }
 

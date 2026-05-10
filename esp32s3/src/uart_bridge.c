@@ -18,6 +18,7 @@
 #define MSG_ODOM           0x02u
 #define MSG_PATH           0x03u
 #define MSG_PATH_DONE      0x04u
+#define MSG_PATH_ACK       0x05u
 
 #define HEADER_LEN         4u
 #define MAX_PAYLOAD_LEN    256u
@@ -118,6 +119,9 @@ bool uart_bridge_send_path(const path_frame_t *path_frame)
 /* Flag set when Wemos sends MSG_PATH_DONE; cleared by uart_bridge_recv_path_done(). */
 static bool s_path_done = false;
 
+/* Flag set when Wemos sends MSG_PATH_ACK; cleared by uart_bridge_recv_path_ack(). */
+static bool s_path_ack = false;
+
 /* uart_bridge_recv_odom — pop the next MSG_ODOM packet from the UART buffer.
  *
  * Also captures MSG_PATH_DONE packets en-route (sets s_path_done flag).
@@ -138,13 +142,17 @@ bool uart_bridge_recv_odom(odom_t *out)
     while (available >= HEADER_LEN + 1) {
         uint8_t byte = 0;
 
+        /* Non-blocking scan for SYNC_A. */
         uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, 0);
         if (byte != SYNC_A) {
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
             continue;
         }
 
-        uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, 0);
+        /* SYNC_A found — give the rest of the packet time to arrive.
+         * At 115200 baud a 6-byte MSG_PATH_DONE takes ~520 µs; 5 ms is
+         * plenty of margin without blocking the SLAM loop noticeably. */
+        if (uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, pdMS_TO_TICKS(5)) != 1) break;
         if (byte != SYNC_B) {
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
             continue;
@@ -153,15 +161,15 @@ bool uart_bridge_recv_odom(odom_t *out)
         uint8_t msg_type    = 0;
         uint8_t payload_len = 0;
 
-        if (uart_read_bytes(BRIDGE_UART_PORT, &msg_type,    1, 0) != 1) return false;
-        if (uart_read_bytes(BRIDGE_UART_PORT, &payload_len, 1, 0) != 1) return false;
+        if (uart_read_bytes(BRIDGE_UART_PORT, &msg_type,    1, pdMS_TO_TICKS(5)) != 1) break;
+        if (uart_read_bytes(BRIDGE_UART_PORT, &payload_len, 1, pdMS_TO_TICKS(5)) != 1) break;
 
         /* Unknown type — skip payload + checksum and keep scanning. */
-        if (msg_type != MSG_ODOM && msg_type != MSG_PATH_DONE) {
+        if (msg_type != MSG_ODOM && msg_type != MSG_PATH_DONE && msg_type != MSG_PATH_ACK) {
             uint8_t skip[MAX_PAYLOAD_LEN + 1u];
             uint8_t skip_len = payload_len + 1u;
             if (skip_len > 0u)
-                uart_read_bytes(BRIDGE_UART_PORT, skip, skip_len, 0);
+                uart_read_bytes(BRIDGE_UART_PORT, skip, skip_len, pdMS_TO_TICKS(50));
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
             continue;
         }
@@ -170,8 +178,8 @@ bool uart_bridge_recv_odom(odom_t *out)
         uint8_t payload[MAX_PAYLOAD_LEN];
         uint8_t received_ck = 0;
 
-        if (uart_read_bytes(BRIDGE_UART_PORT, payload,      payload_len, 0) != (int)payload_len) return false;
-        if (uart_read_bytes(BRIDGE_UART_PORT, &received_ck, 1,           0) != 1)                return false;
+        if (uart_read_bytes(BRIDGE_UART_PORT, payload,      payload_len, pdMS_TO_TICKS(50)) != (int)payload_len) break;
+        if (uart_read_bytes(BRIDGE_UART_PORT, &received_ck, 1,           pdMS_TO_TICKS(10)) != 1) break;
 
         uint8_t check_buf[2u + MAX_PAYLOAD_LEN];
         check_buf[0] = msg_type;
@@ -185,6 +193,12 @@ bool uart_bridge_recv_odom(odom_t *out)
 
         if (msg_type == MSG_PATH_DONE) {
             s_path_done = true;
+            uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
+            continue;
+        }
+
+        if (msg_type == MSG_PATH_ACK) {
+            s_path_ack = true;
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
             continue;
         }
@@ -207,6 +221,15 @@ bool uart_bridge_recv_path_done(void)
 {
     if (s_path_done) {
         s_path_done = false;
+        return true;
+    }
+    return false;
+}
+
+bool uart_bridge_recv_path_ack(void)
+{
+    if (s_path_ack) {
+        s_path_ack = false;
         return true;
     }
     return false;
