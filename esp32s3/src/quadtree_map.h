@@ -17,16 +17,20 @@
 
 #define QT_MAX_DEPTH 7   /* depth 7 → 2^6=64 splits/axis → 156 mm leaf cells on 10 m map */
 
-// Node pool size (each QTNode ≈ 12 bytes after alignment).
+// Node pool size (each QTNode = 12 bytes after alignment).
 // Depth 7: worst-case full tree needs ~5461 nodes (4096 leaves + internal).
-// Wemos (ESP32): 6000 nodes ≈ 72 KB — enough headroom for depth 7 in a real room
-//   (a 10 m × 10 m room scanned from one position uses far fewer than 4096 leaves).
-//   ESP32 has ~300 KB DRAM available after WiFi; 72 KB is comfortably within that.
-// ESP32-S3: more DRAM → 8000 nodes gives comfortable headroom for depth 7.
-// If WiFi init fails on S3, try build_flags = -DQT_POOL_SIZE=5000
+//
+// ESP32-S3 D-cache = 16 KB = 1365 nodes max before cache pressure.
+// Phase 1 (fixed pose, 1500 mm active radius) uses ~400 nodes = 4.8 KB.
+// 1200 nodes = 14.4 KB — fits in D-cache, 3× headroom over Phase 1.
+// If the robot moves extensively and the pool fills, qt_is_pool_full()
+// returns true — caller must reset with qt_free() + qt_init().
+//
+// Wemos (ESP32): no WiFi on the map path, cache pressure is lower;
+//   6000 nodes kept for full-room SLAM headroom.
 #ifndef QT_POOL_SIZE
 #  ifdef CONFIG_IDF_TARGET_ESP32S3
-#    define QT_POOL_SIZE 8000
+#    define QT_POOL_SIZE 1200
 #  else
 #    define QT_POOL_SIZE 6000
 #  endif

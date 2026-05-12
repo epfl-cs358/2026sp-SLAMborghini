@@ -101,11 +101,17 @@ void task_odometry(void *pvParameters)
 
     encoder_ackermann_odom_init(&s_odom, &k_cfg);
 
-    int64_t last_log_us = 0;
+    int64_t last_log_us  = 0;
+    int64_t last_tick_us = esp_timer_get_time();
 
     for (;;) {
-        /* 1. Integrate gyro Z → fresh heading available before encoder update */
-        imu_gyro_update(0.01f);
+        /* 1. Integrate gyro Z with measured dt — actual period includes I2C time */
+        int64_t now_us = esp_timer_get_time();
+        float dt_s = (float)(now_us - last_tick_us) * 1e-6f;
+        last_tick_us = now_us;
+        if (dt_s < 0.005f) dt_s = 0.005f;   /* guard against spurious near-zero on first tick */
+        if (dt_s > 0.050f) dt_s = 0.050f;   /* guard against stale timer after scheduler pause */
+        imu_gyro_update(dt_s);
 
         /* 2. Read AS5600 encoder tick (cumulative distance) */
         imu_encoder_driver_update();
