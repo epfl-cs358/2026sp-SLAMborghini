@@ -894,6 +894,7 @@ static void test_bridge_pong_task(void *arg)
  * ════════════════════════════════════════════════════════════════════════════ */
 #ifdef BRIDGE_SLAVE
 
+SemaphoreHandle_t g_i2c_mutex;
 static QueueHandle_t     q_path_wemos;    /* path_frame_t depth 1: uart→PP       */
 static QueueHandle_t     q_odom_out;      /* odom_t depth 4: PP→uart             */
 static SemaphoreHandle_t s_path_done_sig; /* binary: PP signals path complete    */
@@ -1154,9 +1155,10 @@ void app_main(void)
     q_path_wemos    = xQueueCreate(1, sizeof(path_frame_t));
     q_odom_out      = xQueueCreate(4, sizeof(odom_t));
     s_path_done_sig = xSemaphoreCreateBinary();
+    g_i2c_mutex     = xSemaphoreCreateMutex();
 
     /* task_odometry: AS5600 via I2C + IMU yaw at 100 Hz */
-    xTaskCreate(task_odometry,     "odom",  4096, NULL, 5, NULL);
+    xTaskCreate(task_odometry,     "odom",  4096, NULL, 2, NULL);
     xTaskCreate(task_uart_slave,   "uart",  4096, NULL, 4, NULL);
     xTaskCreate(task_pure_pursuit, "pp",    4096, NULL, 3, NULL);
 

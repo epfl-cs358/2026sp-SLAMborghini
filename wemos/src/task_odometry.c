@@ -103,6 +103,7 @@ void task_odometry(void *pvParameters)
 
     int64_t last_log_us  = 0;
     int64_t last_tick_us = esp_timer_get_time();
+    extern SemaphoreHandle_t g_i2c_mutex;
 
     for (;;) {
         /* 1. Integrate gyro Z with measured dt — actual period includes I2C time */
@@ -111,10 +112,12 @@ void task_odometry(void *pvParameters)
         last_tick_us = now_us;
         if (dt_s < 0.005f) dt_s = 0.005f;   /* guard against spurious near-zero on first tick */
         if (dt_s > 0.050f) dt_s = 0.050f;   /* guard against stale timer after scheduler pause */
+        xSemaphoreTake(g_i2c_mutex, portMAX_DELAY);
         imu_gyro_update(dt_s);
 
         /* 2. Read AS5600 encoder tick (cumulative distance) */
         imu_encoder_driver_update();
+        xSemaphoreGive(g_i2c_mutex);
 
         float distance_m   = imu_encoder_driver_get_distance_m();  /* cumulative, metres */
         float yaw_rad      = imu_encoder_driver_get_yaw_rad();      /* IMU heading, rad   */
@@ -148,7 +151,7 @@ void task_odometry(void *pvParameters)
         taskEXIT_CRITICAL(&s_pose_mux);
 
         /* 5. Log once per second */
-        int64_t now_us = esp_timer_get_time();
+        now_us = esp_timer_get_time();
         if ((now_us - last_log_us) > 1000000LL) {
             const odom_pose_t *p = task_odometry_get_pose();
             if (p)
