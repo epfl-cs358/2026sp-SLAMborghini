@@ -122,10 +122,17 @@ static bool s_path_done = false;
 /* Flag set when Wemos sends MSG_PATH_ACK; cleared by uart_bridge_recv_path_ack(). */
 static bool s_path_ack = false;
 
+/* ── Compact odom wire type — must match wemos/src/uart_bridge.c exactly ──── */
+typedef struct __attribute__((packed)) {
+    int16_t  disp_x16;   /* linear_disp_mm × 16;  0.0625 mm/lsb  */
+    int16_t  yaw_mrad_s; /* yaw_rate_imu × 1000;  1 mrad/s/lsb   */
+    uint8_t  dt_ms;      /* integration window in ms              */
+    uint8_t  seq;        /* low 8 bits of sequence counter        */
+} odom_wire_t;
+
 /* uart_bridge_recv_odom — pop the next MSG_ODOM packet from the UART buffer.
  *
- * Also captures MSG_PATH_DONE packets en-route (sets s_path_done flag).
- * All other unknown packet types are skipped.
+ * Also captures MSG_PATH_DONE and MSG_PATH_ACK packets en-route.
  * Call in a loop to drain all accumulated packets:
  *   while (uart_bridge_recv_odom(&odom)) { integrate(odom); }
  */
@@ -150,7 +157,7 @@ bool uart_bridge_recv_odom(odom_t *out)
         }
 
         /* SYNC_A found — give the rest of the packet time to arrive.
-         * At 115200 baud a 6-byte MSG_PATH_DONE takes ~520 µs; 5 ms is
+         * At 921600 baud an 11-byte odom packet takes ~120 µs; 2 ms is
          * plenty of margin without blocking the SLAM loop noticeably. */
         if (uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, pdMS_TO_TICKS(5)) != 1) break;
         if (byte != SYNC_B) {
@@ -203,13 +210,18 @@ bool uart_bridge_recv_odom(odom_t *out)
             continue;
         }
 
-        /* MSG_ODOM — validate size then return. */
-        if (payload_len != sizeof(odom_t)) {
+        /* MSG_ODOM — decode compact wire format back to odom_t. */
+        if (payload_len != sizeof(odom_wire_t)) {
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
             continue;
         }
 
-        memcpy(out, payload, sizeof(odom_t));
+        odom_wire_t w;
+        memcpy(&w, payload, sizeof(odom_wire_t));
+        out->linear_disp_mm = (float)w.disp_x16   / 16.0f;
+        out->yaw_rate_imu   = (float)w.yaw_mrad_s / 1000.0f;
+        out->dt_ms          = (float)w.dt_ms;
+        out->seq            = w.seq;
         return true;
     }
 #endif

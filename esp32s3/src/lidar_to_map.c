@@ -18,6 +18,14 @@ static inline int64_t _now_us(void) {
 
 static inline bool _valid(float v) { return isfinite(v); }
 
+/* ── Angular delta filter state ────────────────────────────────────────────
+ * 360 buckets (1°/bucket).  s_delta_ref[b] = last processed range at that
+ * angle in mm; 0.0f = no-return.  s_delta_valid is false until the first
+ * complete scan has populated all buckets. */
+#define DELTA_BUCKETS 360
+static float s_delta_ref[DELTA_BUCKETS];
+static bool  s_delta_valid = false;
+
 void lidar_to_map(quadtree_map_t     *map,
                   const lidar_scan_t *scan,
                   const pose_t       *pose,
@@ -70,27 +78,41 @@ void lidar_to_map(quadtree_map_t     *map,
         }
 
         float r = scan->points[i].r_mm;
-        if (r < 100.0f || r > max_range_mm) continue;
+        /* Self-hit: driver filters these, but be defensive */
+        if (r > 0.0f && r < 100.0f) continue;
 
         float theta_deg = scan->points[i].theta_deg;
         if (!_valid(theta_deg)) continue;
 
-        /* Quality filter — zero intensity = noisy/invalid return */
-        if (scan->points[i].intensity == 0) continue;
+        float rad     = theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
+        float cos_rad = cosf(rad);
+        float sin_rad = sinf(rad);
+        /* Unit vector in world frame — valid even when r == 0 */
+        float ux = cos_rad * cos_t - sin_rad * sin_t;
+        float uy = cos_rad * sin_t + sin_rad * cos_t;
 
-        /* Polar (LiDAR frame) → robot frame → world frame, all in mm.
-         * LIDAR_OFFSET_THETA_RAD rotates the beam within the sensor frame. */
-        float rad = theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
-        float lx  = r * cosf(rad);
-        float ly  = r * sinf(rad);
-        float ex  = x0 + lx * cos_t - ly * sin_t;
-        float ey  = y0 + lx * sin_t + ly * cos_t;
+        /* Determine march distance and whether this beam ends at an obstacle.
+         * Three cases:
+         *   no return / beyond sensor range → free to radius, no obstacle
+         *   valid return beyond active zone → free to radius, no obstacle
+         *   valid return within active zone → free along ray, obstacle at r */
+        float march_to;
+        bool  has_obstacle;
+        if (r == 0.0f || r > max_range_mm) {
+            march_to     = LIDAR_MAP_RADIUS_MM;
+            has_obstacle = false;
+        } else if (r > LIDAR_MAP_RADIUS_MM) {
+            march_to     = LIDAR_MAP_RADIUS_MM;
+            has_obstacle = false;
+        } else {
+            march_to     = r;
+            has_obstacle = true;
+        }
 
+        float ex = x0 + ux * march_to;
+        float ey = y0 + uy * march_to;
         if (!_valid(ex) || !_valid(ey)) continue;
 
-        /* Expand dirty rect to include this beam's endpoint.
-         * All ray-step cells lie on the segment (x0,y0)→(ex,ey) so
-         * the endpoints already bound the entire beam geometrically. */
         if (out_dirty) {
             if (ex < out_dirty->x_min) out_dirty->x_min = ex;
             if (ey < out_dirty->y_min) out_dirty->y_min = ey;
@@ -98,16 +120,11 @@ void lidar_to_map(quadtree_map_t     *map,
             if (ey > out_dirty->y_max) out_dirty->y_max = ey;
         }
 
-        /* Unit vector along beam */
-        float dx = (ex - x0) / r;
-        float dy = (ey - y0) / r;
+        for (float t = step_mm; t < march_to - step_mm; t += step_mm)
+            qt_update(map, x0 + ux * t, y0 + uy * t, QT_MISS_DEC);
 
-        /* Ray-march: mark free space */
-        for (float t = step_mm; t < r - step_mm; t += step_mm)
-            qt_update(map, x0 + dx * t, y0 + dy * t, QT_MISS_DEC);
-
-        /* Endpoint: mark obstacle */
-        qt_update(map, ex, ey, QT_HIT_INC);
+        if (has_obstacle)
+            qt_update(map, ex, ey, QT_HIT_INC);
     }
 }
 
@@ -151,8 +168,7 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
         }
 
         float r = scan->points[i].r_mm;
-        if (r < 100.0f || r > max_range_mm) continue;
-        if (scan->points[i].intensity == 0) continue;
+        if (r > 0.0f && r < 100.0f) continue;
 
         float theta_deg = scan->points[i].theta_deg;
         if (!_valid(theta_deg)) continue;
@@ -175,13 +191,45 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
         float sx = px + LIDAR_OFFSET_X_MM * cos_t - LIDAR_OFFSET_Y_MM * sin_t;
         float sy = py + LIDAR_OFFSET_X_MM * sin_t + LIDAR_OFFSET_Y_MM * cos_t;
 
-        /* Beam endpoint in world frame */
-        float rad = theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
-        float lx  = r * cosf(rad);
-        float ly  = r * sinf(rad);
-        float ex  = sx + lx * cos_t - ly * sin_t;
-        float ey  = sy + lx * sin_t + ly * cos_t;
+        /* ── Angular delta filter ──────────────────────────────────────────
+         * Map the beam to a 1°-wide bucket and compare to the previous scan.
+         * Unchanged beams (within LIDAR_DELTA_MM) are skipped entirely — no
+         * ray march, no map write.  The reference is always updated so the
+         * next scan compares against the freshest reading. */
+        int bucket = (int)(theta_deg + 0.5f) % DELTA_BUCKETS;
+        if (bucket < 0) bucket += DELTA_BUCKETS;
 
+        float prev_r = s_delta_valid ? s_delta_ref[bucket] : -1.0f;
+        s_delta_ref[bucket] = r;   /* update reference regardless of skip */
+
+        if (s_delta_valid) {
+            bool same_no_return = (r == 0.0f && prev_r == 0.0f);
+            bool same_range     = (r > 0.0f && prev_r > 0.0f
+                                   && fabsf(r - prev_r) < LIDAR_DELTA_MM);
+            if (same_no_return || same_range) continue;
+        }
+
+        float rad     = theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
+        float cos_rad = cosf(rad);
+        float sin_rad = sinf(rad);
+        float ux = cos_rad * cos_t - sin_rad * sin_t;
+        float uy = cos_rad * sin_t + sin_rad * cos_t;
+
+        float march_to;
+        bool  has_obstacle;
+        if (r == 0.0f || r > max_range_mm) {
+            march_to     = LIDAR_MAP_RADIUS_MM;
+            has_obstacle = false;
+        } else if (r > LIDAR_MAP_RADIUS_MM) {
+            march_to     = LIDAR_MAP_RADIUS_MM;
+            has_obstacle = false;
+        } else {
+            march_to     = r;
+            has_obstacle = true;
+        }
+
+        float ex = sx + ux * march_to;
+        float ey = sy + uy * march_to;
         if (!_valid(ex) || !_valid(ey)) continue;
 
         if (out_dirty) {
@@ -196,12 +244,12 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
             if (ey > out_dirty->y_max) out_dirty->y_max = ey;
         }
 
-        /* Mark robot cell free, then ray-march, then mark endpoint */
         qt_update(map, sx, sy, QT_MISS_DEC);
-        float dx = (ex - sx) / r;
-        float dy = (ey - sy) / r;
-        for (float t = step_mm; t < r - step_mm; t += step_mm)
-            qt_update(map, sx + dx * t, sy + dy * t, QT_MISS_DEC);
-        qt_update(map, ex, ey, QT_HIT_INC);
+        for (float t = step_mm; t < march_to - step_mm; t += step_mm)
+            qt_update(map, sx + ux * t, sy + uy * t, QT_MISS_DEC);
+        if (has_obstacle)
+            qt_update(map, ex, ey, QT_HIT_INC);
     }
+
+    s_delta_valid = true;
 }

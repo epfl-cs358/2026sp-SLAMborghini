@@ -34,7 +34,7 @@
 #define BRIDGE_UART_PORT  UART_NUM_2
 #define BRIDGE_TX_PIN     GPIO_NUM_17  /* ESP32-S3 GPIO17 → Wemos GPIO16   */
 #define BRIDGE_RX_PIN     GPIO_NUM_16  /* Wemos GPIO17    → ESP32-S3 GPIO16 */
-#define BRIDGE_BAUD       115200
+#define BRIDGE_BAUD       921600
 
 /* ══════════════════════════════════════════════════════════════════════════
  * Wemos D1 R32 — IBT-4 motor driver
@@ -82,6 +82,6 @@
 #define WEMOS_BRIDGE_UART_PORT  UART_NUM_2
 #define WEMOS_BRIDGE_RX_PIN     16   /* from ESP32-S3 GPIO17                */
 #define WEMOS_BRIDGE_TX_PIN     17   /* to   ESP32-S3 GPIO16                */
-#define WEMOS_BRIDGE_BAUD       115200
+#define WEMOS_BRIDGE_BAUD       921600
 
 #endif /* HARDWARE_PINS_H */

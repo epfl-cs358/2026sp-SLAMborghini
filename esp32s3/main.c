@@ -59,6 +59,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_timer.h"
 #include <math.h>
 #include <stdbool.h>
@@ -79,27 +81,340 @@ static void slam_main_task(void *arg);
 #define QT_BCAST_PERIOD     5       /* broadcast quadtree every N planning cycles */
 
 
+
 /* ════════════════════════════════════════════════════════════════════════════
- * dead_reckon_pose
- * Update pose estimate from the command just sent.  Since we have no odometry
- * yet, we assume the car traveled min(dist_mm/speed * 1s, MAX_DRIVE_MS ms)
- * in the commanded direction.
+ * USE_REAL_LIDAR — multi-task shared state and task functions
  * ════════════════════════════════════════════════════════════════════════════ */
-static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
+#if USE_REAL_LIDAR
+
+#define SCAN_NBUF 3
+
+typedef struct {
+    uint8_t  idx;
+    pose_t   pre_pose;
+    int64_t  pre_time_us;
+    pose_t   post_pose;
+    int64_t  post_time_us;
+} scan_pkt_t;
+
+static lidar_scan_t      s_scan_buf[SCAN_NBUF];
+static quadtree_map_t    s_map;
+static pose_t            s_pose;
+static SemaphoreHandle_t s_pose_mtx;
+static SemaphoreHandle_t s_map_mtx;
+static SemaphoreHandle_t s_plan_trigger;
+static QueueHandle_t     q_raw_scan;
+static QueueHandle_t     q_frontier_for_astar;
+static QueueHandle_t     q_path_tx;
+static volatile bool     s_stop_requested;
+static uint32_t          s_odom_last_seq;
+
+typedef struct {
+    float        fx, fy;
+    bool         has_frontier;
+    path_frame_t last_path;
+} dash_state_t;
+static dash_state_t      s_dash;
+static SemaphoreHandle_t s_dash_mtx;
+
+/* ── Core0 prio 7 ────────────────────────────────────────────────────────── */
+static void task_lidar_scan(void *arg)
 {
-    pose->theta = cmd->t_heading;
-    float dist_mm = sqrtf(cmd->tx * cmd->tx + cmd->ty * cmd->ty);
-    if (dist_mm < 1.0f) return;
+    (void)arg;
+    uint8_t buf_idx = 0;
+    for (;;) {
+        pose_t pre_pose;
+        xSemaphoreTake(s_pose_mtx, portMAX_DELAY);
+        pre_pose = s_pose;
+        xSemaphoreGive(s_pose_mtx);
+        int64_t pre_time_us = esp_timer_get_time();
 
-    float speed = (cmd->t_speed > 10.0f) ? cmd->t_speed : DEBUG_SPEED_MM_S;
-    float dt_s  = dist_mm / speed;
-    float max_s = MAX_DRIVE_MS / 1000.0f;
-    if (dt_s > max_s) dt_s = max_s;
+        lidar_scan_t *scan = &s_scan_buf[buf_idx];
+        if (!lidar_driver_read_scan(scan) || scan->count <= 10) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
 
-    float traveled = speed * dt_s;
-    pose->x += traveled * cosf(cmd->t_heading);
-    pose->y += traveled * sinf(cmd->t_heading);
+        int64_t post_time_us = esp_timer_get_time();
+        pose_t post_pose;
+        xSemaphoreTake(s_pose_mtx, portMAX_DELAY);
+        post_pose = s_pose;
+        xSemaphoreGive(s_pose_mtx);
+
+        scan_pkt_t pkt = {
+            .idx          = buf_idx,
+            .pre_pose     = pre_pose,
+            .pre_time_us  = pre_time_us,
+            .post_pose    = post_pose,
+            .post_time_us = post_time_us,
+        };
+        xQueueOverwrite(q_raw_scan, &pkt);
+        buf_idx = (uint8_t)((buf_idx + 1u) % SCAN_NBUF);
+    }
 }
+
+/* ── Core0 prio 6 ────────────────────────────────────────────────────────── */
+static void task_uart_bridge(void *arg)
+{
+    (void)arg;
+    bool     path_active  = false;
+    uint32_t path_sent_ms = 0;
+    uint32_t odom_log_ctr = 0;
+
+    for (;;) {
+        /* Drain all pending odom packets → update shared pose */
+        {
+            odom_t odom;
+            while (uart_bridge_recv_odom(&odom)) {
+                if (odom.dt_ms > 0.0f) {
+                    xSemaphoreTake(s_pose_mtx, portMAX_DELAY);
+                    if (odom.seq != 0 && odom.seq != s_odom_last_seq)
+                        printf("[ODOM] seq gap: expected %lu got %lu (integrating)\n",
+                               (unsigned long)s_odom_last_seq,
+                               (unsigned long)odom.seq);
+                    s_odom_last_seq = odom.seq + 1;
+                    float dtheta    = odom.yaw_rate_imu * (odom.dt_ms / 1000.0f);
+                    float mid_theta = s_pose.theta + dtheta * 0.5f;
+                    s_pose.x       += odom.linear_disp_mm * cosf(mid_theta);
+                    s_pose.y       += odom.linear_disp_mm * sinf(mid_theta);
+                    s_pose.theta   += dtheta;
+                    while (s_pose.theta >  (float)M_PI) s_pose.theta -= 2.0f * (float)M_PI;
+                    while (s_pose.theta < -(float)M_PI) s_pose.theta += 2.0f * (float)M_PI;
+                    pose_t log_pose = s_pose;
+                    xSemaphoreGive(s_pose_mtx);
+                    if (++odom_log_ctr % 5 == 0)
+                        printf("[S3 ODOM] seq=%lu disp=%.0f mm yaw=%.3f rad/s"
+                               "  pose=(%.0f,%.0f,%.2f)\n",
+                               (unsigned long)odom.seq,
+                               (double)odom.linear_disp_mm,
+                               (double)odom.yaw_rate_imu,
+                               (double)log_pose.x, (double)log_pose.y,
+                               (double)log_pose.theta);
+                }
+            }
+        }
+
+        /* Send a newly planned path to Wemos (with up to 3 ACK retries) */
+        if (!path_active) {
+            path_frame_t pf;
+            if (xQueueReceive(q_path_tx, &pf, 0) == pdTRUE) {
+                bool got_ack = false;
+                for (int r = 0; r < 3 && !got_ack; r++) {
+                    uart_bridge_send_path(&pf);
+                    uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000ULL);
+                    while ((uint32_t)(esp_timer_get_time() / 1000ULL) - t0 < 500u) {
+                        odom_t _d;
+                        while (uart_bridge_recv_odom(&_d)) { /* drain only */ }
+                        if (uart_bridge_recv_path_ack()) { got_ack = true; break; }
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                    }
+                    if (!got_ack && r < 2)
+                        wifi_dashboard_log("WARN: no path ACK — retrying...");
+                }
+                printf("[S3] path: %u wp  ack=%s\n",
+                       (unsigned)pf.length, got_ack ? "OK" : "FAIL");
+                if (got_ack) {
+                    path_active  = true;
+                    path_sent_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+                    xSemaphoreTake(s_dash_mtx, portMAX_DELAY);
+                    s_dash.last_path = pf;
+                    xSemaphoreGive(s_dash_mtx);
+                    (void)uart_bridge_recv_path_done();   /* discard stale flag */
+                } else {
+                    wifi_dashboard_log("WARN: path send failed — replanning");
+                    xSemaphoreGive(s_plan_trigger);
+                }
+            }
+        }
+
+        /* Check for path completion or timeout → trigger replanning */
+        if (path_active) {
+            if (uart_bridge_recv_path_done()) {
+                wifi_dashboard_log("Path complete — replanning");
+                path_active = false;
+                xSemaphoreGive(s_plan_trigger);
+            } else {
+                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+                if ((now_ms - path_sent_ms) >= PATH_TIMEOUT_MS) {
+                    wifi_dashboard_log("Path timeout — replanning");
+                    path_active = false;
+                    xSemaphoreGive(s_plan_trigger);
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* ── Core0 prio 5 ────────────────────────────────────────────────────────── */
+static void task_map_update(void *arg)
+{
+    (void)arg;
+    scan_pkt_t pkt;
+    for (;;) {
+        if (xQueueReceive(q_raw_scan, &pkt, portMAX_DELAY) != pdTRUE) continue;
+        lidar_scan_t    *scan = &s_scan_buf[pkt.idx];
+        map_dirty_rect_t dr;
+        xSemaphoreTake(s_map_mtx, portMAX_DELAY);
+        lidar_deskew_and_map(&s_map, scan,
+                             &pkt.pre_pose,  pkt.pre_time_us,
+                             &pkt.post_pose, pkt.post_time_us,
+                             LIDAR_PROCESS_RANGE_MM, 150.0f, &dr);
+        xSemaphoreGive(s_map_mtx);
+        wifi_dashboard_mark_dirty(&dr);
+        wifi_dashboard_broadcast_scan(scan, &pkt.post_pose);
+    }
+}
+
+/* ── Core0 prio 3 ────────────────────────────────────────────────────────── */
+static void task_wifi_ws(void *arg)
+{
+    (void)arg;
+    uint8_t     qt_ctr     = 0;
+    static bool pool_warned = false;
+
+    for (;;) {
+        if (wifi_dashboard_stop_requested()) {
+            s_stop_requested = true;
+            wifi_dashboard_log("Exploration stopped.");
+        }
+        if (s_stop_requested) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        pose_t local_pose;
+        xSemaphoreTake(s_pose_mtx, portMAX_DELAY);
+        local_pose = s_pose;
+        xSemaphoreGive(s_pose_mtx);
+
+        dash_state_t ds;
+        xSemaphoreTake(s_dash_mtx, portMAX_DELAY);
+        ds = s_dash;
+        xSemaphoreGive(s_dash_mtx);
+
+        xSemaphoreTake(s_map_mtx, portMAX_DELAY);
+        bool pool_full = !pool_warned && qt_is_pool_full(&s_map);
+        wifi_dashboard_update(&s_map, &local_pose);
+        if (++qt_ctr >= QT_BCAST_PERIOD) {
+            qt_ctr = 0;
+            wifi_dashboard_broadcast_quadtree(&s_map);
+        }
+        xSemaphoreGive(s_map_mtx);
+
+        if (pool_full) {
+            pool_warned = true;
+            wifi_dashboard_log("WARN: map pool full — map frozen");
+        }
+
+        wifi_dashboard_broadcast_state(&local_pose, ds.fx, ds.fy, ds.has_frontier, 0);
+        wifi_dashboard_broadcast_path(&ds.last_path);
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+/* ── Core1 prio 6 ────────────────────────────────────────────────────────── */
+static void task_hybrid_astar(void *arg)
+{
+    (void)arg;
+    frontier_t goal;
+    for (;;) {
+        if (xQueueReceive(q_frontier_for_astar, &goal, portMAX_DELAY) != pdTRUE) continue;
+        if (s_stop_requested) continue;
+
+        pose_t local_pose;
+        xSemaphoreTake(s_pose_mtx, portMAX_DELAY);
+        local_pose = s_pose;
+        xSemaphoreGive(s_pose_mtx);
+
+        xSemaphoreTake(s_map_mtx, portMAX_DELAY);
+        path_t astar_path = hybrid_astar_plan(&s_map, &local_pose, &goal);
+        xSemaphoreGive(s_map_mtx);
+
+        if (!hybrid_astar_is_valid(&astar_path)) {
+            wifi_dashboard_log("A* failed — waiting");
+            xSemaphoreGive(s_plan_trigger);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        char lbuf[64];
+        snprintf(lbuf, sizeof(lbuf), "A*: %u wp  target=(%.0f,%.0f)",
+                 (unsigned)astar_path.length, (double)goal.cx, (double)goal.cy);
+        wifi_dashboard_log(lbuf);
+
+        uint8_t n = (astar_path.length > MAX_SHARED_PATH_POINTS)
+                    ? MAX_SHARED_PATH_POINTS : (uint8_t)astar_path.length;
+        path_frame_t pf = {0};
+        pf.length = n;
+        for (uint8_t i = 0; i < n; i++) {
+            pf.waypoints[i] = astar_path.waypoints[i];
+            if (pf.waypoints[i].v_target <= 10.0f)
+                pf.waypoints[i].v_target = DEBUG_SPEED_MM_S;
+        }
+        printf("[ASTAR] pose=(%.0f,%.0f) frontier=(%.0f,%.0f)"
+               "  wp[0]=(%.0f,%.0f)  wp[%u]=(%.0f,%.0f)\n",
+               (double)local_pose.x, (double)local_pose.y,
+               (double)goal.cx, (double)goal.cy,
+               (double)pf.waypoints[0].x, (double)pf.waypoints[0].y,
+               (unsigned)(n - 1u),
+               (double)pf.waypoints[n - 1u].x, (double)pf.waypoints[n - 1u].y);
+
+        xSemaphoreTake(s_dash_mtx, portMAX_DELAY);
+        s_dash.fx           = goal.cx;
+        s_dash.fy           = goal.cy;
+        s_dash.has_frontier = true;
+        xSemaphoreGive(s_dash_mtx);
+
+        xQueueOverwrite(q_path_tx, &pf);
+    }
+}
+
+/* ── Core1 prio 5 ────────────────────────────────────────────────────────── */
+static void task_frontier(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(s_plan_trigger, portMAX_DELAY);
+        if (s_stop_requested) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        pose_t local_pose;
+        xSemaphoreTake(s_pose_mtx, portMAX_DELAY);
+        local_pose = s_pose;
+        xSemaphoreGive(s_pose_mtx);
+
+        xSemaphoreTake(s_map_mtx, portMAX_DELAY);
+        frontier_list_t fl = frontier_detector_detect(&s_map, &local_pose);
+        xSemaphoreGive(s_map_mtx);
+
+        if (fl.count == 0) {
+            wifi_dashboard_log("No frontiers — stopped");
+            xSemaphoreTake(s_dash_mtx, portMAX_DELAY);
+            s_dash.has_frontier = false;
+            xSemaphoreGive(s_dash_mtx);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            xSemaphoreGive(s_plan_trigger);   /* retry after delay */
+            continue;
+        }
+
+        frontier_t best = frontier_detector_best(&fl, &local_pose);
+
+        xSemaphoreTake(s_dash_mtx, portMAX_DELAY);
+        s_dash.has_frontier = true;
+        s_dash.fx           = best.cx;
+        s_dash.fy           = best.cy;
+        xSemaphoreGive(s_dash_mtx);
+
+        xQueueOverwrite(q_frontier_for_astar, &best);
+    }
+}
+
+#endif /* USE_REAL_LIDAR (multi-task declarations) */
 
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -281,275 +596,37 @@ static void slam_main_task(void *arg)
     lidar_driver_init();
 
     /* 10 m × 10 m map, robot starts at centre (5000, 5000) mm */
-    quadtree_map_t slam_map;
-    quadtree_map_init(&slam_map, 10000.0f, 10000.0f, 50.0f);
+    quadtree_map_init(&s_map, 10000.0f, 10000.0f, 50.0f);
+    s_pose = (pose_t){ .x = 5000.0f, .y = 5000.0f, .theta = 0.0f };
 
-    pose_t pose = { .x = 5000.0f, .y = 5000.0f, .theta = 0.0f };
-    static lidar_scan_t scan;   /* ~4 KB — too large for stack, put in BSS */
+    s_pose_mtx           = xSemaphoreCreateMutex();
+    s_map_mtx            = xSemaphoreCreateMutex();
+    s_plan_trigger       = xSemaphoreCreateBinary();
+    s_dash_mtx           = xSemaphoreCreateMutex();
+    q_raw_scan           = xQueueCreate(1, sizeof(scan_pkt_t));
+    q_frontier_for_astar = xQueueCreate(1, sizeof(frontier_t));
+    q_path_tx            = xQueueCreate(1, sizeof(path_frame_t));
 
-    /* Wait for browser to send {"cmd":"start"} before driving.
-     * Keep scanning so the map populates live even while stationary. */
+    /* Launch all tasks immediately so the LiDAR scans, the map builds, and
+     * the WebSocket dashboard stays alive while we wait for Start.
+     * task_frontier and task_hybrid_astar block on s_plan_trigger /
+     * q_frontier_for_astar — they are harmlessly idle until Start is pressed. */
+    xTaskCreatePinnedToCore(task_lidar_scan,   "lscan",    4096, NULL, 7, NULL, 0);
+    xTaskCreatePinnedToCore(task_uart_bridge,  "uart_br",  4096, NULL, 6, NULL, 0);
+    xTaskCreatePinnedToCore(task_map_update,   "mapupd",   6144, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(task_wifi_ws,      "wifi_ws",  6144, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(task_hybrid_astar, "astar",    8192, NULL, 6, NULL, 1);
+    xTaskCreatePinnedToCore(task_frontier,     "frontier", 6144, NULL, 5, NULL, 1);
+
+    /* Wait for the browser Start button — yield every 200 ms so dash_task
+     * (priority 1) gets CPU time and the WebSocket stays connected. */
     while (!wifi_dashboard_exploration_requested()) {
-        /* Drain idle heading updates from Wemos so the car icon and scan
-         * projection stay correct while the user rotates the car by hand. */
-        {
-            odom_t odom;
-            while (uart_bridge_recv_odom(&odom)) {
-                if (odom.dt_ms > 0.0f) {
-                    float dtheta    = odom.yaw_rate_imu * (odom.dt_ms / 1000.0f);
-                    float mid_theta = pose.theta + dtheta * 0.5f;
-                    pose.x    += odom.linear_disp_mm * cosf(mid_theta);
-                    pose.y    += odom.linear_disp_mm * sinf(mid_theta);
-                    pose.theta += dtheta;
-                    while (pose.theta >  (float)M_PI) pose.theta -= 2.0f * (float)M_PI;
-                    while (pose.theta < -(float)M_PI) pose.theta += 2.0f * (float)M_PI;
-                }
-            }
-        }
-        if (lidar_driver_read_scan(&scan) && scan.count > 10) {
-            /* Drain odom that arrived during the ~200 ms blocking scan so the
-             * map projection uses the heading at scan-end, not scan-start. */
-            {
-                odom_t odom;
-                while (uart_bridge_recv_odom(&odom)) {
-                    if (odom.dt_ms > 0.0f) {
-                        float dtheta    = odom.yaw_rate_imu * (odom.dt_ms / 1000.0f);
-                        float mid_theta = pose.theta + dtheta * 0.5f;
-                        pose.x    += odom.linear_disp_mm * cosf(mid_theta);
-                        pose.y    += odom.linear_disp_mm * sinf(mid_theta);
-                        pose.theta += dtheta;
-                        while (pose.theta >  (float)M_PI) pose.theta -= 2.0f * (float)M_PI;
-                        while (pose.theta < -(float)M_PI) pose.theta += 2.0f * (float)M_PI;
-                    }
-                }
-            }
-            map_dirty_rect_t dr;
-            lidar_to_map(&slam_map, &scan, &pose, 6000.0f, 150.0f, &dr);
-            wifi_dashboard_mark_dirty(&dr);
-            wifi_dashboard_broadcast_scan(&scan, &pose);
-        }
-        wifi_dashboard_update(&slam_map, &pose);
-        wifi_dashboard_broadcast_state(&pose, 0.0f, 0.0f, false, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 
-    uint8_t         qt_bcast_ctr    = 0;
-    path_t          astar_path      = {0};
-    bool            path_active     = false;
-    uint32_t        path_sent_ms    = 0;
-    float           goal_x          = 0.0f;
-    float           goal_y          = 0.0f;
-    path_frame_t    last_path       = {0};
-    /* Odom seq tracking — shared by both drain sites so gaps aren't
-     * falsely reported when packets arrive during the blocking LiDAR scan. */
-    uint32_t        odom_last_seq   = 0;
-    uint32_t        odom_log_ctr    = 0;
-
-    while (1) {
-
-        /* ── Emergency stop from dashboard ───────────────────────────────── */
-        if (wifi_dashboard_stop_requested()) {
-            wifi_dashboard_log("Exploration stopped.");
-            break;
-        }
-
-        /* ── Pose update — drain ALL pending odom packets ──────────────────── */
-        {
-            odom_t odom;
-            while (uart_bridge_recv_odom(&odom)) {
-                if (odom.dt_ms > 0.0f) {
-                    if (odom.seq != 0 && odom.seq != odom_last_seq)
-                        printf("[ODOM] seq gap: expected %lu got %lu (integrating)\n",
-                               (unsigned long)odom_last_seq,
-                               (unsigned long)odom.seq);
-                    odom_last_seq = odom.seq + 1;
-                    float dtheta    = odom.yaw_rate_imu * (odom.dt_ms / 1000.0f);
-                    float mid_theta = pose.theta + dtheta * 0.5f;
-                    pose.x    += odom.linear_disp_mm * cosf(mid_theta);
-                    pose.y    += odom.linear_disp_mm * sinf(mid_theta);
-                    pose.theta += dtheta;
-                    while (pose.theta >  (float)M_PI) pose.theta -= 2.0f * (float)M_PI;
-                    while (pose.theta < -(float)M_PI) pose.theta += 2.0f * (float)M_PI;
-                    /* Log every 5th odom packet so serial isn't flooded */
-                    if (++odom_log_ctr % 5 == 0)
-                        printf("[S3 ODOM] seq=%lu disp=%.0f mm yaw=%.3f rad/s"
-                               "  pose=(%.0f,%.0f,%.2f)\n",
-                               (unsigned long)odom.seq,
-                               (double)odom.linear_disp_mm,
-                               (double)odom.yaw_rate_imu,
-                               (double)pose.x, (double)pose.y, (double)pose.theta);
-                }
-            }
-        }
-
-        /* ── LiDAR scan → quadtree map update (with de-skewing) ─────────── */
-        {
-            pose_t  pre_scan_pose  = pose;
-            int64_t pre_scan_time  = esp_timer_get_time();
-
-            if (lidar_driver_read_scan(&scan) && scan.count > 10) {
-
-                /* Drain odom that arrived during the blocking scan (~200 ms).
-                 * Advances odom_last_seq so the next main drain doesn't log
-                 * false seq-gap warnings for packets consumed here. */
-                {
-                    odom_t odom;
-                    while (uart_bridge_recv_odom(&odom)) {
-                        if (odom.dt_ms > 0.0f) {
-                            odom_last_seq = odom.seq + 1;
-                            float dtheta    = odom.yaw_rate_imu * (odom.dt_ms / 1000.0f);
-                            float mid_theta = pose.theta + dtheta * 0.5f;
-                            pose.x    += odom.linear_disp_mm * cosf(mid_theta);
-                            pose.y    += odom.linear_disp_mm * sinf(mid_theta);
-                            pose.theta += dtheta;
-                            while (pose.theta >  (float)M_PI) pose.theta -= 2.0f * (float)M_PI;
-                            while (pose.theta < -(float)M_PI) pose.theta += 2.0f * (float)M_PI;
-                        }
-                    }
-                }
-
-                pose_t  post_scan_pose = pose;
-                int64_t post_scan_time = esp_timer_get_time();
-
-                map_dirty_rect_t dr;
-                lidar_deskew_and_map(&slam_map, &scan,
-                                     &pre_scan_pose,  pre_scan_time,
-                                     &post_scan_pose, post_scan_time,
-                                     6000.0f, 150.0f, &dr);
-                wifi_dashboard_mark_dirty(&dr);
-                wifi_dashboard_broadcast_scan(&scan, &pose);
-            }
-        }
-
-        /* ── Dashboard map push; periodic quadtree frame ─────────────────── */
-        wifi_dashboard_update(&slam_map, &pose);
-        if (++qt_bcast_ctr >= QT_BCAST_PERIOD) {
-            qt_bcast_ctr = 0;
-            wifi_dashboard_broadcast_quadtree(&slam_map);
-        }
-
-        /* ── Tracking mode — wait for Wemos to complete the current path ─── *
-         * Frontier detection and A* are NOT run until Wemos signals path done.*
-         * LiDAR scanning and map updates continue every SCAN_POLL_MS so the  *
-         * FIFO never overflows during the drive phase.                        */
-        if (path_active) {
-            bool path_done = uart_bridge_recv_path_done();
-
-            if (!path_done) {
-                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-                if ((now_ms - path_sent_ms) < PATH_TIMEOUT_MS) {
-                    wifi_dashboard_broadcast_state(&pose, goal_x, goal_y, true, 0);
-                    wifi_dashboard_broadcast_path(&last_path);
-                    vTaskDelay(pdMS_TO_TICKS(SCAN_POLL_MS));
-                    continue;
-                }
-                wifi_dashboard_log("Path timeout — replanning");
-            } else {
-                wifi_dashboard_log("Path complete — replanning");
-            }
-            path_active = false;
-        }
-
-        /* ── Planning: frontier detection ────────────────────────────────── */
-        frontier_list_t frontiers = frontier_detector_detect(&slam_map, &pose);
-
-        bool has_frontier   = false;
-        float fx = 0.0f, fy = 0.0f;
-
-        if (frontiers.count > 0) {
-            frontier_t best = frontier_detector_best(&frontiers, &pose);
-            has_frontier = true;
-            fx = best.cx;
-            fy = best.cy;
-
-            astar_path = hybrid_astar_plan(&slam_map, &pose, &best);
-
-            if (hybrid_astar_is_valid(&astar_path)) {
-                char lbuf[64];
-                snprintf(lbuf, sizeof(lbuf), "A*: %u wp  target=(%.0f,%.0f)",
-                         (unsigned)astar_path.length, (double)fx, (double)fy);
-                wifi_dashboard_log(lbuf);
-            } else {
-                wifi_dashboard_log("A* failed — waiting");
-            }
-        } else {
-            wifi_dashboard_log("No frontiers — stopped");
-        }
-
-        /* ── Transmit to Wemos ───────────────────────────────────────────── */
-        bool sent_path = false;
-        path_frame_t path_frame = {0};
-
-        if (has_frontier && hybrid_astar_is_valid(&astar_path)) {
-            uint8_t n = (astar_path.length > MAX_SHARED_PATH_POINTS)
-                        ? MAX_SHARED_PATH_POINTS
-                        : (uint8_t)astar_path.length;
-            path_frame.length = n;
-            for (uint8_t i = 0; i < n; i++) {
-                path_frame.waypoints[i] = astar_path.waypoints[i];
-                if (path_frame.waypoints[i].v_target <= 10.0f)
-                    path_frame.waypoints[i].v_target = DEBUG_SPEED_MM_S;
-            }
-            /* Send path and wait for Wemos ACK (MSG_PATH_ACK).
-             * Up to 3 attempts × 500 ms window each = 1.5 s worst-case.
-             * PATH_TIMEOUT_MS starts only after ACK — no more timing races.
-             * Odom packets arriving during the wait are drained but discarded
-             * (pre-drive odom is low-value; pose fusion resumes once active). */
-            bool got_ack = false;
-            for (int _r = 0; _r < 3 && !got_ack; _r++) {
-                uart_bridge_send_path(&path_frame);
-                uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000ULL);
-                while ((uint32_t)(esp_timer_get_time() / 1000ULL) - t0 < 500u) {
-                    odom_t _d;
-                    while (uart_bridge_recv_odom(&_d)) { /* drain only */ }
-                    if (uart_bridge_recv_path_ack()) { got_ack = true; break; }
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                }
-                if (!got_ack && _r < 2) {
-                    wifi_dashboard_log("WARN: no path ACK — retrying...");
-                }
-            }
-            sent_path = got_ack;
-            printf("[S3] path: %u wp  frontiers=%u  ack=%s\n",
-                   (unsigned)n, (unsigned)frontiers.count,
-                   got_ack ? "OK" : "FAIL");
-            printf("[ASTAR] pose=(%.0f,%.0f) frontier=(%.0f,%.0f)"
-                   "  wp[0]=(%.0f,%.0f)  wp[%u]=(%.0f,%.0f)\n",
-                   (double)pose.x, (double)pose.y,
-                   (double)fx, (double)fy,
-                   (double)path_frame.waypoints[0].x,
-                   (double)path_frame.waypoints[0].y,
-                   (unsigned)(n - 1u),
-                   (double)path_frame.waypoints[n - 1u].x,
-                   (double)path_frame.waypoints[n - 1u].y);
-        }
-
-        /* ── Broadcast pose + frontier target + path to dashboard ────────── */
-        {
-            static bool s_pool_warned = false;
-            if (!s_pool_warned && qt_is_pool_full(&slam_map)) {
-                s_pool_warned = true;
-                wifi_dashboard_log("WARN: map pool full — map frozen");
-            }
-        }
-        wifi_dashboard_broadcast_state(&pose, fx, fy, has_frontier, 0);
-        wifi_dashboard_broadcast_path(&path_frame);
-
-        /* ── Arm tracking state or yield until next scan ─────────────────── */
-        if (sent_path) {
-            path_active  = true;
-            path_sent_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-            goal_x       = fx;
-            goal_y       = fy;
-            last_path    = path_frame;
-            /* Discard any stale done flag that arrived from the previous path. */
-            (void)uart_bridge_recv_path_done();
-        } else {
-            /* lidar_driver_read_scan() blocks ~200 ms per scan, pacing the loop at
-             * ~5 Hz naturally. A longer sleep here would overflow the 5000-byte LiDAR
-             * UART FIFO (fills in ≈480 ms at 7 Hz) and corrupt the next scan. */
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
+    /* Start pressed — release frontier detector and exit. */
+    xSemaphoreGive(s_plan_trigger);
+    vTaskDelete(NULL);
 
 
 /* ════════════════════════════════════════════════════════════════════════════

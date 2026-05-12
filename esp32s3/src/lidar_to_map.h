@@ -14,9 +14,26 @@
  * Set to measured values once the sensor is mounted and measured.             *
  * Positive X_MM = sensor is forward of centre; positive Y_MM = port side.    *
  * THETA_RAD: sensor yaw relative to robot forward axis (positive = CCW).     */
-#define LIDAR_OFFSET_X_MM    0.0f
-#define LIDAR_OFFSET_Y_MM    0.0f
+#define LIDAR_OFFSET_X_MM      0.0f
+#define LIDAR_OFFSET_Y_MM      0.0f
 #define LIDAR_OFFSET_THETA_RAD 0.0f
+
+/* Hard range filter — beams beyond this are silently dropped before any
+ * processing.  Set to the sensor's reliable physical limit. */
+#define LIDAR_PROCESS_RANGE_MM 3500.0f
+
+/* Active mapping radius (mm).  Only the disc of this radius around the
+ * robot is written to the map each scan.  Beams that return beyond this
+ * distance are still useful: they mark free space to the radius boundary
+ * but do NOT register an obstacle.  Shrink to reduce cpu/memory per scan;
+ * enlarge to map further ahead at planning time. */
+#define LIDAR_MAP_RADIUS_MM    1500.0f
+
+/* Angular delta filter threshold (mm).  If a beam's range changed by less
+ * than this amount compared to the previous scan, the beam is skipped — no
+ * ray march, no map write.  Only genuinely new readings reach the map.
+ * Raise to skip more (faster, noisier); lower to be more conservative. */
+#define LIDAR_DELTA_MM          80.0f
 
 /**
  * World-coordinate bounding box of cells written during one lidar_to_map() call.

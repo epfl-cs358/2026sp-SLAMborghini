@@ -54,10 +54,13 @@
 
 /* ── Pipeline test enable switches ─────────────────────────────────────────── */
 #ifndef ENABLE_PIPELINE_STAGES
-#  define ENABLE_PIPELINE_STAGES 0   /* Task 1 (scan→map) + Task 2 (map→frontier) */
+#  define ENABLE_PIPELINE_STAGES     0   /* Task 1 (scan→map) + Task 2 (map→frontier) */
 #endif
 #ifndef ENABLE_PIPELINE_FULL
-#  define ENABLE_PIPELINE_FULL   0   /* Full SLAM: scan→map→frontier→astar */
+#  define ENABLE_PIPELINE_FULL       0   /* Full SLAM: scan→map→frontier→astar */
+#endif
+#ifndef ENABLE_PIPELINE_LIDAR_WIFI
+#  define ENABLE_PIPELINE_LIDAR_WIFI 0   /* Real LiDAR → map → WiFi dashboard */
 #endif
 
 static const char *TAG = "PROFILER_MAIN";
@@ -102,6 +105,12 @@ extern task_profile_t *pipeline_frontier_task_get_profile(void);
 #if ENABLE_PIPELINE_FULL
 extern void full_slam_task(void *arg);
 extern task_profile_t *full_slam_task_get_profile(void);
+#endif
+#if ENABLE_PIPELINE_LIDAR_WIFI
+extern void lidar_wifi_scan_task(void *arg);
+extern task_profile_t *lidar_wifi_scan_task_get_profile(void);
+extern void lidar_wifi_dash_task(void *arg);
+extern task_profile_t *lidar_wifi_dash_task_get_profile(void);
 #endif
 
 /* ── Profile registry ───────────────────────────────────────────────────────── */
@@ -203,6 +212,19 @@ void app_main(void)
                             12288, NULL, 4, NULL, 0);
     vTaskDelay(pdMS_TO_TICKS(100));
     register_profile(full_slam_task_get_profile());
+#endif
+
+    /* ── Pipeline Group C: real LiDAR → map → WiFi dashboard ────────── */
+#if ENABLE_PIPELINE_LIDAR_WIFI
+    xTaskCreatePinnedToCore(lidar_wifi_scan_task, "lw_scan",
+                            10240, NULL, 5, NULL, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));   /* let scan_task init WiFi+LiDAR first */
+    register_profile(lidar_wifi_scan_task_get_profile());
+
+    xTaskCreatePinnedToCore(lidar_wifi_dash_task, "lw_dash",
+                            4096, NULL, 2, NULL, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    register_profile(lidar_wifi_dash_task_get_profile());
 #endif
 
     xTaskCreate(monitor_task, "profiler_mon", 4096, NULL, 1, NULL);

@@ -15,8 +15,12 @@
 
 static const char *TAG = "task_odometry";
 
-/* Shared odometry state — written by task_odometry, read via task_odometry_copy_pose() */
+/* Shared odometry state — written by task_odometry, internal use only */
 static encoder_ackermann_odom_t s_odom;
+
+/* Published pose snapshot — written under lock by task_odometry,
+ * read by bridge_slave_task via task_odometry_copy_pose(). */
+static odom_pose_t s_published_pose;
 
 /* Protects s_odom.pose between writer (task_odometry) and reader (bridge_slave_task).
  * Critical section keeps it to ~100 ns on the read side — safe for UART ISRs. */
@@ -72,7 +76,7 @@ void task_odometry_set_steering_rad(float steering_rad)
 void task_odometry_copy_pose(odom_pose_t *out)
 {
     taskENTER_CRITICAL(&s_pose_mux);
-    *out = s_odom.pose;
+    *out = s_published_pose;
     taskEXIT_CRITICAL(&s_pose_mux);
 }
 
@@ -125,14 +129,16 @@ void task_odometry(void *pvParameters)
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
         /* 4. Fuse encoder + steering (Ackermann) + IMU into pose.
-         *    Lock only during the struct write so bridge_slave_task always gets
-         *    a coherent snapshot from task_odometry_copy_pose(). */
-        taskENTER_CRITICAL(&s_pose_mux);
+         *    Compute outside any lock — trig and wrap_angle must not run with
+         *    interrupts disabled (TWDT cannot fire during a critical section).
+         *    Lock is held only for the 16-byte pose publish. */
         encoder_ackermann_odom_update(&s_odom,
                                       distance_m,
                                       steering_rad,
                                       yaw_rad,
                                       now_ms);
+        taskENTER_CRITICAL(&s_pose_mux);
+        s_published_pose = s_odom.pose;
         taskEXIT_CRITICAL(&s_pose_mux);
 
         /* 5. Log once per second */
@@ -141,11 +147,12 @@ void task_odometry(void *pvParameters)
             const odom_pose_t *p = task_odometry_get_pose();
             if (p)
                 ESP_LOGI(TAG,
-                         "x=%.3f m  y=%.3f m  θ=%.2f°  dist=%.3f m  steer=%.1f°",
+                         "x=%.3f m  y=%.3f m  θ=%.2f°  dist=%.3f m  steer=%.1f°  stack_hwm=%u",
                          p->x, p->y,
                          (double)(p->theta * 180.0f / (float)M_PI),
                          distance_m,
-                         (double)(steering_rad * 180.0f / (float)M_PI));
+                         (double)(steering_rad * 180.0f / (float)M_PI),
+                         (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
             last_log_us = now_us;
         }
 

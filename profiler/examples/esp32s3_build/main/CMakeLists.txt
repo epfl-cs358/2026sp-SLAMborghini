@@ -20,6 +20,7 @@ idf_component_register(
         "${TESTS_DIR}/test_pipeline_scan_to_map.c"
         "${TESTS_DIR}/test_pipeline_frontier.c"
         "${TESTS_DIR}/test_pipeline_full_slam.c"
+        "${TESTS_DIR}/test_pipeline_lidar_wifi.c"
         # real module implementations
         "${SRC_DIR}/quadtree_map.c"
         "${SRC_DIR}/quadtree_map_compat.c"

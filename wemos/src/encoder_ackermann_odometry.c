@@ -1,14 +1,12 @@
 #include "encoder_ackermann_odometry.h"
 #include <math.h>
 
+/* O(1) for any finite float — safe even if imu heading drifts large. */
 static float wrap_angle(float a)
 {
-    while (a > (float)M_PI) {
-        a -= 2.0f * (float)M_PI;
-    }
-    while (a < -(float)M_PI) {
-        a += 2.0f * (float)M_PI;
-    }
+    a = fmodf(a, 2.0f * (float)M_PI);
+    if (a >  (float)M_PI) a -= 2.0f * (float)M_PI;
+    if (a < -(float)M_PI) a += 2.0f * (float)M_PI;
     return a;
 }
 
@@ -71,10 +69,13 @@ void encoder_ackermann_odom_update(encoder_ackermann_odom_t *odom,
         return;
     }
 
-    /* 3. Ackermann prediction */
+    /* 3. Ackermann prediction — clamp away from ±π/2 where tanf → ±Inf */
     float dtheta_ack = 0.0f;
     if (fabsf(odom->cfg.wheelbase_m) > 1e-6f) {
-        dtheta_ack = (ds / odom->cfg.wheelbase_m) * tanf(steering_rad);
+        float s = steering_rad;
+        if (s >  1.50f) s =  1.50f;
+        if (s < -1.50f) s = -1.50f;
+        dtheta_ack = (ds / odom->cfg.wheelbase_m) * tanf(s);
     }
 
     float theta_pred = wrap_angle(odom->pose.theta + dtheta_ack);

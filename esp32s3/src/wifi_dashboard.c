@@ -545,6 +545,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "Disconnected reason=%u", (unsigned)disc->reason);
         if (s_retries < WIFI_MAX_RETRIES) {
             esp_wifi_connect();
             s_retries++;
@@ -682,6 +684,7 @@ void wifi_dashboard_init(const char *ssid, const char *password)
     wifi_config_t wcfg = {0};
     strlcpy((char *)wcfg.sta.ssid,     ssid,     sizeof(wcfg.sta.ssid));
     strlcpy((char *)wcfg.sta.password, password, sizeof(wcfg.sta.password));
+    wcfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;   /* accept WPA2 and above */
 
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wcfg);

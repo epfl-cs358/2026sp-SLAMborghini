@@ -64,6 +64,7 @@
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include <stdio.h>
 #include <math.h>
@@ -88,7 +89,7 @@
 #define DEBUG_SPEED_MM_S    100.0f
 #define MAX_DRIVE_MS        1200u
 #define CYCLE_DELAY_MS      50
-#define PP_SUBCYCLE_MS      350u    /* max drive time per PP iteration */
+#define PP_CONTROL_MS        50u    /* PP steering update interval (20 Hz closed loop) */
 
 #define TURN_ARC_THRESH_RAD  0.785f   /* π/4 */
 #define TURN_ARC_MS          800u
@@ -116,29 +117,25 @@
 #define SERVO_STEER_GAIN   1042.0f
 
 /* ════════════════════════════════════════════════════════════════════════════
- * Shared state — protected by s_mtx
+ * Standalone exploration globals — only used in the normal exploration build.
+ * Not compiled under BRIDGE_SLAVE or HEADING_TEST_MODE.
  * ════════════════════════════════════════════════════════════════════════════ */
+#if !defined(HEADING_TEST_MODE) && !defined(BRIDGE_SLAVE)
+
 static quadtree_map_t    s_map;
 static pose_t            s_pose;
 static SemaphoreHandle_t s_mtx;
 
-/* ── Drive interpolation state ───────────────────────────────────────────────
- * plan_task arms this before calling drive_for_cmd(); scan_task reads it to
- * compute a live interpolated pose instead of using the stale s_pose.
- *
- * Position formula (first-order, chord approximation for arc turns):
- *   pos = start_pos + speed * elapsed_s * unit_vec(live_theta)
- *
- * Protected by s_mtx: plan_task writes, scan_task reads in its pose snapshot.
- * ──────────────────────────────────────────────────────────────────────────── */
 typedef struct {
-    float      x0;          /* robot X when motors engaged (mm)  */
-    float      y0;          /* robot Y when motors engaged (mm)  */
-    float      speed;       /* mm/s                              */
-    TickType_t t0;          /* tick when motors engaged          */
-    bool       active;      /* true while drive_for_cmd running  */
+    float      x0;
+    float      y0;
+    float      speed;
+    TickType_t t0;
+    bool       active;
 } drive_info_t;
 static drive_info_t s_drv;
+
+#endif /* !HEADING_TEST_MODE && !BRIDGE_SLAVE */
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Motor helpers
@@ -312,7 +309,7 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
 }
 
 
-#ifndef HEADING_TEST_MODE
+#if !defined(HEADING_TEST_MODE) && !defined(BRIDGE_SLAVE)
 /* ════════════════════════════════════════════════════════════════════════════
  * scan_task  (priority 5)
  *
@@ -507,7 +504,7 @@ static void plan_task(void *arg)
         /* loop back → wait for Start again */
     }
 }
-#endif /* !HEADING_TEST_MODE */
+#endif /* !HEADING_TEST_MODE && !BRIDGE_SLAVE */
 
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -891,138 +888,141 @@ static void test_bridge_pong_task(void *arg)
 
 
 /* ════════════════════════════════════════════════════════════════════════════
- * BRIDGE_SLAVE — receive drive commands from ESP32-S3 and execute them.
- * ESP32-S3 runs SLAM + frontier detection + dashboard.
- * Wemos only drives motors/servo based on received control_frame_t.
+ * BRIDGE_SLAVE — two tasks replace the old monolithic bridge_slave_task.
+ *   task_uart_slave   (prio 4): sole UART writer; receives paths, sends odom.
+ *   task_pure_pursuit (prio 3): PP execution + motor control.
  * ════════════════════════════════════════════════════════════════════════════ */
 #ifdef BRIDGE_SLAVE
-static void bridge_slave_task(void *arg)
+
+static QueueHandle_t     q_path_wemos;    /* path_frame_t depth 1: uart→PP       */
+static QueueHandle_t     q_odom_out;      /* odom_t depth 4: PP→uart             */
+static SemaphoreHandle_t s_path_done_sig; /* binary: PP signals path complete    */
+
+/* ── prio 4 — single UART writer ─────────────────────────────────────────── */
+static void task_uart_slave(void *arg)
 {
     (void)arg;
-
     uart_bridge_init();
-    printf("[SLAVE] Ready — waiting for drive commands from ESP32-S3...\n");
+    printf("[SLAVE] Ready — waiting for path_frame from ESP32-S3...\n");
+
+    for (;;) {
+        /* Forward path_done signal from PP task to S3 */
+        if (xSemaphoreTake(s_path_done_sig, 0) == pdTRUE) {
+            uart_bridge_send_path_done();
+            printf("[SLAVE] path_done sent\n");
+        }
+
+        /* Drain odom queue from PP task and send to S3 */
+        {
+            odom_t odom;
+            while (xQueueReceive(q_odom_out, &odom, 0) == pdTRUE)
+                uart_bridge_send_odom(&odom);
+        }
+
+        /* Receive new path from S3, ACK immediately, forward to PP task */
+        {
+            path_frame_t pf;
+            if (uart_bridge_recv_path(&pf)) {
+                uart_bridge_send_path_ack((uint8_t)pf.length);
+                xQueueOverwrite(q_path_wemos, &pf);
+                printf("[SLAVE] path received: length=%u  ACK sent\n",
+                       (unsigned)pf.length);
+            }
+        }
+
+        /* Drain any stale control frames (old protocol) */
+        {
+            control_frame_t _discard = {0};
+            uart_bridge_recv_control(&_discard);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* ── prio 3 — Pure Pursuit execution ─────────────────────────────────────── */
+static void task_pure_pursuit(void *arg)
+{
+    (void)arg;
 
     pure_pursuit_controller_t pp;
     pp_init(&pp);
 
-    /*
-     * local_pose tracks the robot in world frame (same coordinate system as
-     * the ESP32-S3 planner). It is snapped to waypoints[0] whenever a new
-     * path_frame_t arrives, keeping it in sync with the planner's world frame.
-     * local_pose.theta is kept from the IMU (not overwritten on path receive)
-     * since the gyro is more accurate than the planner's theta estimate.
-     */
-    pose_t local_pose = {
-        .x = 0.0f,
-        .y = 0.0f,
-        .theta = 0.0f,
-        .cov = {0}
-    };
+    pose_t local_pose = { .x = 0.0f, .y = 0.0f, .theta = 0.0f, .cov = {0} };
+    bool   has_active_path = false;
+    bool   path_just_ended = false;
+    bool   motors_running  = false;    /* true while following a path */
 
-    bool  has_active_path = false;
-    bool  path_just_ended = false;   /* set true when path → idle transition occurs */
+    static odom_pose_t s_idle_last_pose = {0};
+    static bool        s_idle_pose_init = false;
+    static uint32_t    s_idle_odom_seq  = 0;
+    static uint8_t     s_idle_send_ctr  = 0;
+    static uint32_t    s_idle_ticks     = 0;
+    static uint32_t    s_odom_seq       = 0;
+    static uint8_t     s_log_ctr        = 0;
 
     for (;;) {
-
-        /* ── Check for new path from ESP32-S3 (always preempts current) ──── */
-        path_frame_t path_frame;
-        if (uart_bridge_recv_path(&path_frame)) {
-            /* ACK before any processing — S3 starts its timeout only after this. */
-            uart_bridge_send_path_ack((uint8_t)path_frame.length);
-            printf("[SLAVE] path received: length=%u  ACK sent\n",
-                   (unsigned)path_frame.length);
-
-            /*
-             * Sync local_pose into the world frame used by the S3 planner.
-             *
-             * x/y: use waypoints[0] — the A* start cell, which is the S3's
-             *   best estimate of the robot's world-frame position at plan time.
-             *   The odom frame starts at (0,0) on boot; it does NOT match the
-             *   planner's world frame (map centred at 5000,5000 mm).  Using
-             *   odom absolute position here would place the robot thousands of
-             *   mm from the path, breaking PP lookahead entirely.
-             *
-             * theta: use IMU heading from task_odometry — more accurate than
-             *   waypoints[0].theta (which is the desired heading at that cell,
-             *   not the robot's actual heading).
-             *
-             * After this snap, local_pose.x/y are updated by odom DELTAS each
-             * PP cycle, keeping them in the same world frame.
-             */
-            {
+        /* ── Check for new path from uart_slave (preempts current) ──────── */
+        {
+            path_frame_t pf;
+            if (xQueueReceive(q_path_wemos, &pf, 0) == pdTRUE) {
+                if (motors_running) {
+                    motors_stop();
+                    motors_running = false;
+                }
                 odom_pose_t cur_odom;
                 task_odometry_copy_pose(&cur_odom);
-                local_pose.x     = path_frame.waypoints[0].x;
-                local_pose.y     = path_frame.waypoints[0].y;
+                local_pose.x     = pf.waypoints[0].x;
+                local_pose.y     = pf.waypoints[0].y;
                 local_pose.theta = cur_odom.theta;
+
+                pp_set_path(&pp, pf.waypoints, pf.length);
+
+                printf("[PP-PATH] snap: (%.0f,%.0f,%.3f rad)  wps=%u\n",
+                       (double)local_pose.x, (double)local_pose.y,
+                       (double)local_pose.theta, (unsigned)pf.length);
+                for (uint8_t _wi = 0; _wi < pf.length; _wi++)
+                    printf("[PP-PATH]   wp[%u] = (%.0f, %.0f)\n",
+                           (unsigned)_wi,
+                           (double)pf.waypoints[_wi].x,
+                           (double)pf.waypoints[_wi].y);
+
+                has_active_path = true;
+                path_just_ended = false;
             }
-
-            pp_set_path(&pp, path_frame.waypoints, path_frame.length);
-
-            /* Dump all waypoints so we can verify coordinates and spacing. */
-            printf("[PP-PATH] local_pose snap: (%.0f,%.0f,%.3f rad)\n",
-                   (double)local_pose.x, (double)local_pose.y,
-                   (double)local_pose.theta);
-            for (uint8_t _wi = 0; _wi < path_frame.length; _wi++)
-                printf("[PP-PATH]   wp[%u] = (%.0f, %.0f)  theta=%.2f\n",
-                       (unsigned)_wi,
-                       (double)path_frame.waypoints[_wi].x,
-                       (double)path_frame.waypoints[_wi].y,
-                       (double)path_frame.waypoints[_wi].theta);
-
-            has_active_path = true;
-        }
-
-        /* ── control_frame_t fallback disabled for path-only debug test ─────
-         * Car must NOT move unless the S3 sends a proper path_frame_t.
-         * Drain any control frames so the UART buffer stays clean. */
-        if (!has_active_path) {
-            control_frame_t _discard = {0};
-            uart_bridge_recv_control(&_discard);   /* consume and ignore */
         }
 
         /* ── No active path — idle ───────────────────────────────────────── */
         if (!has_active_path) {
-            motors_stop();
-            set_duty(SERVO_CH, SERVO_DUTY_CENTER);
-            task_odometry_set_steering_rad(0.0f);
+            if (motors_running) {
+                motors_stop();
+                set_duty(SERVO_CH, SERVO_DUTY_CENTER);
+                task_odometry_set_steering_rad(0.0f);
+                motors_running = false;
+            }
 
-            /* Send heading updates at ~10 Hz so S3 tracks rotation during idle.
-             * Without this, turning the car in place never updates the S3 pose,
-             * so the dashboard car icon stays frozen and scans are projected at
-             * the wrong angle. */
-            static odom_pose_t s_idle_last_pose  = {0};
-            static bool        s_idle_pose_init  = false;
-            static uint32_t    s_idle_odom_seq   = 0;
-            static uint8_t     s_idle_send_ctr   = 0;
-            /* Initialize last_pose from current IMU on first entry so the
-             * first odom packet doesn't send a spurious large rotation. */
             if (!s_idle_pose_init || path_just_ended) {
                 task_odometry_copy_pose(&s_idle_last_pose);
                 s_idle_pose_init = true;
                 path_just_ended  = false;
             }
-            if (++s_idle_send_ctr >= 10u) {        /* 10 × 10 ms = 100 ms */
+            if (++s_idle_send_ctr >= 10u) {      /* 10 × 10 ms = 100 ms */
                 s_idle_send_ctr = 0;
                 odom_pose_t cur;
                 task_odometry_copy_pose(&cur);
-                float dtheta_idle = cur.theta - s_idle_last_pose.theta;
-                while (dtheta_idle >  (float)M_PI) dtheta_idle -= 2.0f * (float)M_PI;
-                while (dtheta_idle < -(float)M_PI) dtheta_idle += 2.0f * (float)M_PI;
+                float dtheta_idle = fmodf(cur.theta - s_idle_last_pose.theta, 2.0f * (float)M_PI);
+                if (dtheta_idle >  (float)M_PI) dtheta_idle -= 2.0f * (float)M_PI;
+                if (dtheta_idle < -(float)M_PI) dtheta_idle += 2.0f * (float)M_PI;
                 odom_t idle_odom = {
                     .linear_disp_mm = 0.0f,
-                    .yaw_rate_imu   = dtheta_idle * 10.0f,  /* 100 ms window → ×10 = rad/s */
+                    .yaw_rate_imu   = dtheta_idle * 10.0f,
                     .dt_ms          = 100.0f,
                     .seq            = s_idle_odom_seq++,
                 };
-                uart_bridge_send_odom(&idle_odom);
+                xQueueSend(q_odom_out, &idle_odom, 0);
                 s_idle_last_pose = cur;
             }
-
-            /* Heartbeat: print once per second so we know Wemos is alive */
-            static uint32_t s_idle_ticks = 0;
-            if (++s_idle_ticks >= 100u) {          /* 100 × 10 ms = 1 s   */
+            if (++s_idle_ticks >= 100u) {        /* 100 × 10 ms = 1 s */
                 s_idle_ticks = 0;
                 printf("[SLAVE] idle — waiting for path_frame from S3...\n");
             }
@@ -1030,98 +1030,86 @@ static void bridge_slave_task(void *arg)
             continue;
         }
 
-        /* ── Compute Pure Pursuit command for current sub-cycle ──────────── */
+        /* ── Snapshot pose before this control tick ──────────────────────── */
+        odom_pose_t before_pose;
+        task_odometry_copy_pose(&before_pose);
+
+        /* ── Compute Pure Pursuit steering command ───────────────────────── */
         pp_motion_command_t pp_cmd = pp_compute_command(&pp, &local_pose);
 
-        /* One-line diagnostic: helps spot bad lookahead / wrong coordinate frame */
-        printf("[PP-DBG] pose=(%.0f,%.0f,%.2f)  servo=%.0f  wp_idx=%u/%u\n",
-               (double)local_pose.x, (double)local_pose.y,
-               (double)local_pose.theta,
-               (double)pp_cmd.steering_deg,
-               (unsigned)pp.last_target_index,
-               (unsigned)pp.path_length);
-
         if (pp_cmd.stop || pp_is_path_complete(&pp, &local_pose)) {
-            printf("[PP] path complete — waiting for next path\n");
-            uart_bridge_send_path_done();
-            has_active_path = false;
-            path_just_ended = true;
             motors_stop();
+            motors_running = false;
             set_duty(SERVO_CH, SERVO_DUTY_CENTER);
             task_odometry_set_steering_rad(0.0f);
+            printf("[PP] path complete\n");
+            xSemaphoreGive(s_path_done_sig);
+            has_active_path = false;
+            path_just_ended = true;
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        /* ── Update steering while car keeps rolling ─────────────────────── */
+        /* ── Apply steering (servo + odometry fusion) ────────────────────── */
+        float steering_rad = (pp_cmd.steering_deg - 90.0f) * ((float)M_PI / 180.0f);
         set_duty(SERVO_CH, servo_deg_to_duty(pp_cmd.steering_deg));
-        task_odometry_set_steering_rad((pp_cmd.steering_deg - 90.0f) * ((float)M_PI / 180.0f));
-        vTaskDelay(pdMS_TO_TICKS(20));   /* 20 ms — servo reaches target in ~1 PWM period */
+        task_odometry_set_steering_rad(steering_rad);
 
-        /* ── Drive for one PP sub-cycle ──────────────────────────────────── */
-        uint32_t drive_ms = PP_SUBCYCLE_MS;
+        /* ── Start or keep motors running — no stop between ticks ───────── */
+        if (!motors_running) {
+            set_duty(CH_FWD, MOTOR_DUTY_FWD);
+            set_duty(CH_BWD, MOTOR_DUTY_STOP);
+            motors_running = true;
+        }
 
-        /* Snapshot Ackermann pose before driving (x, y in metres) */
-        odom_pose_t before_pose;
-        task_odometry_copy_pose(&before_pose);
+        /* ── Wait one control cycle — steering updates next tick ─────────── */
+        vTaskDelay(pdMS_TO_TICKS(PP_CONTROL_MS));
 
-        set_duty(CH_FWD, MOTOR_DUTY_FWD);
-        set_duty(CH_BWD, MOTOR_DUTY_STOP);
-        vTaskDelay(pdMS_TO_TICKS(drive_ms));
-        /* Brief stop between cycles so each burst's effect is observable during
-         * testing. Remove this (and the delay) once testing is complete and
-         * continuous motion is desired. */
-        motors_stop();
-        vTaskDelay(pdMS_TO_TICKS(30));
-
-        /* Snapshot Ackermann pose after driving */
+        /* ── Snapshot pose after and compute odom delta ──────────────────── */
         odom_pose_t after_pose;
         task_odometry_copy_pose(&after_pose);
 
-        /* Chord displacement (m→mm) and heading delta from Ackermann odom */
         float dx_m        = after_pose.x - before_pose.x;
         float dy_m        = after_pose.y - before_pose.y;
         float traveled_mm = sqrtf(dx_m * dx_m + dy_m * dy_m) * 1000.0f;
 
-        float dtheta = after_pose.theta - before_pose.theta;
-        while (dtheta >  (float)M_PI) dtheta -= 2.0f * (float)M_PI;
-        while (dtheta < -(float)M_PI) dtheta += 2.0f * (float)M_PI;
+        float dtheta = fmodf(after_pose.theta - before_pose.theta, 2.0f * (float)M_PI);
+        if (dtheta >  (float)M_PI) dtheta -= 2.0f * (float)M_PI;
+        if (dtheta < -(float)M_PI) dtheta += 2.0f * (float)M_PI;
 
-        float new_heading = local_pose.theta + dtheta;
-        while (new_heading >  (float)M_PI) new_heading -= 2.0f * (float)M_PI;
-        while (new_heading < -(float)M_PI) new_heading += 2.0f * (float)M_PI;
+        float new_heading = fmodf(local_pose.theta + dtheta, 2.0f * (float)M_PI);
+        if (new_heading >  (float)M_PI) new_heading -= 2.0f * (float)M_PI;
+        if (new_heading < -(float)M_PI) new_heading += 2.0f * (float)M_PI;
 
-        /* Update local pose (in mm) */
         local_pose.x    += traveled_mm * cosf(new_heading);
         local_pose.y    += traveled_mm * sinf(new_heading);
         local_pose.theta = new_heading;
 
-        /* Send odometry to ESP32-S3 for pose fusion */
+        /* ── Send odom delta to S3 every tick ────────────────────────────── */
         {
-            static uint32_t s_odom_seq = 0;
             float dt_ms = (after_pose.timestamp_ms > before_pose.timestamp_ms)
                           ? (float)(after_pose.timestamp_ms - before_pose.timestamp_ms)
-                          : (float)drive_ms;
+                          : (float)PP_CONTROL_MS;
             odom_t odom = {
                 .linear_disp_mm = traveled_mm,
                 .yaw_rate_imu   = (dt_ms > 0.0f) ? dtheta / (dt_ms / 1000.0f) : 0.0f,
                 .dt_ms          = dt_ms,
                 .seq            = s_odom_seq++,
             };
-            uart_bridge_send_odom(&odom);
-
-            /* Encoder health check: if traveled_mm is always 0 while driving,
-             * the AS5600 is not contributing — check magnet alignment / I2C. */
-            printf("[ODOM-SEND] disp=%.1f mm  dtheta=%.3f rad  dt=%.0f ms\n",
-                   (double)traveled_mm, (double)dtheta, (double)dt_ms);
+            xQueueSend(q_odom_out, &odom, 0);
         }
 
-        printf("[PP] servo=%.1f deg  disp=%.0f mm  pose=(%.0f,%.0f,%.2f)\n",
-               (double)pp_cmd.steering_deg,
-               (double)traveled_mm,
-               (double)local_pose.x,
-               (double)local_pose.y,
-               (double)local_pose.theta);
+        /* ── Log at ~2 Hz (every 10 ticks × 50 ms = 500 ms) ─────────────── */
+        if (++s_log_ctr >= 10u) {
+            s_log_ctr = 0;
+            printf("[PP] servo=%.0f° pose=(%.0f,%.0f,%.2f) wp=%u/%u disp=%.0fmm\n",
+                   (double)pp_cmd.steering_deg,
+                   (double)local_pose.x, (double)local_pose.y,
+                   (double)local_pose.theta,
+                   (unsigned)pp.last_target_index,
+                   (unsigned)pp.path_length,
+                   (double)traveled_mm);
+        }
     }
 }
 #endif /* BRIDGE_SLAVE */
@@ -1162,10 +1150,15 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(500));
     imu_gyro_init();
     imu_gyro_calibrate_bias(300);   /* 3 s startup calibration at 100 Hz */
-    /* task_odometry reads AS5600 via I2C (shared bus, already up after imu_gyro_init)
-     * and integrates encoder distance + IMU yaw at 100 Hz. */
-    xTaskCreate(task_odometry,     "odom",  4096, NULL, 4, NULL);
-    xTaskCreate(bridge_slave_task, "slave", 4096, NULL, 3, NULL);
+
+    q_path_wemos    = xQueueCreate(1, sizeof(path_frame_t));
+    q_odom_out      = xQueueCreate(4, sizeof(odom_t));
+    s_path_done_sig = xSemaphoreCreateBinary();
+
+    /* task_odometry: AS5600 via I2C + IMU yaw at 100 Hz */
+    xTaskCreate(task_odometry,     "odom",  4096, NULL, 5, NULL);
+    xTaskCreate(task_uart_slave,   "uart",  4096, NULL, 4, NULL);
+    xTaskCreate(task_pure_pursuit, "pp",    4096, NULL, 3, NULL);
 
 #elif defined(HEADING_TEST_MODE)
     motor_init();

@@ -9,7 +9,7 @@
  *   - Send odometry feedback back to ESP32-S3
  *
  * Transport:
- *   UART1 @ 115200 baud, 8N1
+ *   UART @ 921600 baud, 8N1  (baud from WEMOS_BRIDGE_BAUD in hardware_pins.h)
  *
  * Wiring:
  *   Wemos RX GPIO16 <- ESP32-S3 TX GPIO17
@@ -38,6 +38,7 @@
  */
 
 #include "uart_bridge.h"
+#include "../../hardware_pins.h"
 
 #include <string.h>
 
@@ -46,17 +47,12 @@
 #include "driver/gpio.h"
 #endif
 
-/*
- * Wiring:
- *   Wemos RX GPIO16 <- ESP32-S3 TX GPIO17
- *   Wemos TX GPIO17 -> ESP32-S3 RX GPIO16
- *   GND shared between boards
- */
-
-#define BRIDGE_UART_PORT   UART_NUM_1
-#define BRIDGE_TX_PIN GPIO_NUM_17   // TX → S3 RX (GPIO16)
-#define BRIDGE_RX_PIN GPIO_NUM_16   // RX ← S3 TX (GPIO17)
-#define BRIDGE_UART_BAUD   115200
+/* Local aliases — rest of file uses these names regardless of which
+ * board's symbols hardware_pins.h exposes. */
+#define BRIDGE_UART_PORT   WEMOS_BRIDGE_UART_PORT
+#define BRIDGE_TX_PIN      WEMOS_BRIDGE_TX_PIN
+#define BRIDGE_RX_PIN      WEMOS_BRIDGE_RX_PIN
+#define BRIDGE_UART_BAUD   WEMOS_BRIDGE_BAUD
 #define BRIDGE_RX_BUF      1024
 
 /* ------------------------------------------------------------
@@ -169,20 +165,41 @@ static bool send_packet(uint8_t msg_type,
 #endif
 }
 
-/* ------------------------------------------------------------
- * Send odometry packet to ESP32-S3
- * ------------------------------------------------------------ */
+/* ── Compact wire format for MSG_ODOM ────────────────────────────────────────
+ * odom_t has 4 floats (16 bytes) but the actual value ranges are tiny:
+ *   linear_disp_mm  ≤ ±25 mm per 50 ms tick  → int16_t × 16 lsb/mm
+ *   yaw_rate_imu    ≤ ±10 rad/s               → int16_t in mrad/s
+ *   dt_ms           1–255 ms                  → uint8_t
+ *   seq             gap-detection only         → uint8_t (wraps at 256)
+ * Wire payload: 6 bytes (was 16).  On-wire total: 11 bytes (was 22).
+ * ──────────────────────────────────────────────────────────────────────────── */
+typedef struct __attribute__((packed)) {
+    int16_t  disp_x16;   /* linear_disp_mm × 16;  0.0625 mm/lsb; ±2047.9 mm  */
+    int16_t  yaw_mrad_s; /* yaw_rate_imu × 1000;  1 mrad/s/lsb;  ±32.767 r/s */
+    uint8_t  dt_ms;      /* integration window ms; 1 ms/lsb; max 255 ms       */
+    uint8_t  seq;        /* low 8 bits of sequence counter                     */
+} odom_wire_t;
+
+/* Send odometry packet to ESP32-S3 (compact wire encoding). */
 bool uart_bridge_send_odom(const odom_t *odom)
 {
-    if (!odom) {
-        return false;
-    }
+    if (!odom) return false;
 
-    return send_packet(
-        MSG_ODOM,
-        odom,
-        (uint8_t)sizeof(odom_t)
-    );
+    /* Clamp before encoding to avoid int16_t overflow on sensor glitch. */
+    float disp   = odom->linear_disp_mm;
+    float yaw    = odom->yaw_rate_imu;
+    if (disp >  2047.0f) disp =  2047.0f;
+    if (disp < -2047.0f) disp = -2047.0f;
+    if (yaw  >  32.0f)   yaw  =  32.0f;
+    if (yaw  < -32.0f)   yaw  = -32.0f;
+
+    odom_wire_t w = {
+        .disp_x16   = (int16_t)(disp * 16.0f),
+        .yaw_mrad_s = (int16_t)(yaw  * 1000.0f),
+        .dt_ms      = (odom->dt_ms > 255.0f) ? 255u : (uint8_t)odom->dt_ms,
+        .seq        = (uint8_t)odom->seq,
+    };
+    return send_packet(MSG_ODOM, &w, (uint8_t)sizeof(odom_wire_t));
 }
 
 /* ------------------------------------------------------------
