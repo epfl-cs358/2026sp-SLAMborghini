@@ -54,6 +54,7 @@
 #include <stdbool.h>
 #include <math.h>
 #include <stdlib.h>
+#include "lwip/sockets.h"   /* SO_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT */
 
 static const char *TAG = "wifi_dash";
 
@@ -233,9 +234,9 @@ static bool _ws_send_raw(uint8_t *payload, size_t len, httpd_ws_type_t type)
     esp_err_t err = httpd_ws_send_frame_async(s_server, fd, &frame);
     if (err != ESP_OK) {
         s_fail_streak++;
-        ESP_LOGW(TAG, "_ws_send_raw fd=%d err=0x%x streak=%u/3",
+        ESP_LOGW(TAG, "_ws_send_raw fd=%d err=0x%x streak=%u/10",
                  fd, (unsigned)err, (unsigned)s_fail_streak);
-        if (s_fail_streak >= 3u) {
+        if (s_fail_streak >= 10u) {
             s_fail_streak = 0u;
             _on_send_error(fd);
         }
@@ -581,6 +582,21 @@ static esp_err_t ws_handler(httpd_req_t *req)
         s_shadow_valid = false;   /* force full map on next update */
         s_last_map_us  = 0;       /* allow immediate map send       */
         xSemaphoreGive(s_ws_mutex);
+
+        /* TCP keepalive — prevents NAT/router from silently dropping the idle
+         * connection during the robot's drive phases (no WS frames for ~3 s).
+         * Fires a keepalive probe after 30 s idle, retries every 5 s, 3 times. */
+        int ka = 1, idle_s = 30, intvl_s = 5, cnt = 3;
+        setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  &ka,     sizeof(ka));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle_s,  sizeof(idle_s));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl_s, sizeof(intvl_s));
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,     sizeof(cnt));
+
+        /* Kick an immediate full-map send — don't wait for the next task_wifi_ws tick */
+        if (s_map_ref && s_dash_queue) {
+            dash_msg_t map_msg = { .type = DASH_MAP_MSG, .dirty_tiles = TILES_ALL };
+            xQueueSend(s_dash_queue, &map_msg, 0);
+        }
         ESP_LOGI(TAG, "WS client connected fd=%d", fd);
         return ESP_OK;
     }
@@ -704,7 +720,8 @@ void wifi_dashboard_init(const char *ssid, const char *password)
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
-    hcfg.lru_purge_enable = true;
+    hcfg.lru_purge_enable    = true;
+    hcfg.recv_wait_timeout   = 30;   /* seconds; default 5 s is too short for idle WS sessions */
     if (httpd_start(&s_server, &hcfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start() failed");
         return;
@@ -715,7 +732,7 @@ void wifi_dashboard_init(const char *ssid, const char *password)
 
     /* dash_task: priority 1 — sole WebSocket sender, lowest user priority.
      * httpd (5) > scan_task (4) > plan_task (3) > dash_task (1). */
-    xTaskCreate(_dash_task, "dash", 3072, NULL, 1, NULL);
+    xTaskCreate(_dash_task, "dash", 4096, NULL, 1, NULL);
 }
 
 

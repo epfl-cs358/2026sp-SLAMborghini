@@ -14,3 +14,32 @@ CONFIG_HTTPD_MAX_URI_LEN=512
 
 # Main task stack — WiFi init + SLAM locals need more than the 8 KB default
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# ── FreeRTOS runtime / performance monitoring ─────────────────────────────
+# Required for vTaskGetRunTimeStats() and uxTaskGetRunTimeCounter()
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+# Include core-ID column in vTaskList() output
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+# Stack overflow detection (canary method)
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW=y
+
+# ── Flash/IRAM placement ──────────────────────────────────────────────────────
+# Move cold RTOS/ringbuf code to flash → frees IRAM for hot loops.
+# Safe here: we have no microsecond ISR loops; our scan period is ~100 ms.
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
+
+# Newlib nano printf: smaller flash footprint, less stack per format call.
+# Trade-off: no %lld / %f in printf on some IDF versions — all our format
+# strings use %lu and %.1f which nano supports.
+CONFIG_NEWLIB_NANO_FORMAT=y
+
+# ── LwIP TCP keepalive ────────────────────────────────────────────────────────
+# Required for SO_KEEPALIVE / TCP_KEEPIDLE socket options to take effect in LwIP.
+# Matches the setsockopt() values in wifi_dashboard.c ws_handler.
+CONFIG_LWIP_TCP_KEEPALIVE=y
+CONFIG_LWIP_TCP_KEEPIDLE=30
+CONFIG_LWIP_TCP_KEEPINTVL=5
+CONFIG_LWIP_TCP_KEEPCNT=3

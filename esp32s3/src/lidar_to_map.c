@@ -3,8 +3,10 @@
 
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
+#include "esp_attr.h"   /* IRAM_ATTR */
 #define _now_us() esp_timer_get_time()
 #else
+#define IRAM_ATTR       /* host builds: no-op */
 #include <time.h>
 static inline int64_t _now_us(void) {
     struct timespec ts;
@@ -26,12 +28,12 @@ static inline bool _valid(float v) { return isfinite(v); }
 static float s_delta_ref[DELTA_BUCKETS];
 static bool  s_delta_valid = false;
 
-void lidar_to_map(quadtree_map_t     *map,
-                  const lidar_scan_t *scan,
-                  const pose_t       *pose,
-                  float               max_range_mm,
-                  float               step_mm,
-                  map_dirty_rect_t   *out_dirty)
+IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
+                            const lidar_scan_t *scan,
+                            const pose_t       *pose,
+                            float               max_range_mm,
+                            float               step_mm,
+                            map_dirty_rect_t   *out_dirty)
 {
     if (out_dirty) out_dirty->valid = false;
 

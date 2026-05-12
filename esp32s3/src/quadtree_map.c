@@ -11,7 +11,10 @@
 
 #if defined(ESP_PLATFORM)
 #include "esp_log.h"
+#include "esp_attr.h"   /* IRAM_ATTR */
 static const char *TAG_QT = "quadtree_map";
+#else
+#define IRAM_ATTR       /* host builds: no-op */
 #endif
 
 
@@ -104,9 +107,9 @@ void qt_free(QuadTreeMap *map)
     map->count = 0;
 }
 
-static void _update(QuadTreeMap *map, uint16_t idx,
-                    float xmn, float xmx, float ymn, float ymx,
-                    float x, float y, int8_t delta)
+static IRAM_ATTR void _update(QuadTreeMap *map, uint16_t idx,
+                              float xmn, float xmx, float ymn, float ymx,
+                              float x, float y, int8_t delta)
 {
     QTNode *n = &map->pool[idx];
 
@@ -145,7 +148,7 @@ static void _update(QuadTreeMap *map, uint16_t idx,
             cxmn, cxmx, cymn, cymx, x, y, delta);
 }
 
-void qt_update(QuadTreeMap *map, float x, float y, int8_t delta)
+IRAM_ATTR void qt_update(QuadTreeMap *map, float x, float y, int8_t delta)
 {
     if (!map || !map->pool) return;
     if (x < map->x_min || x >= map->x_max) return; // ignore out-of-bounds positions.
