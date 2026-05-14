@@ -242,3 +242,66 @@ size_t qt_memory_bytes(const QuadTreeMap *map)
     if (!map) return 0;
     return (size_t)(map->count) * sizeof(QTNode);
 }
+
+
+/* ── qt_compact ─────────────────────────────────────────────────────────────
+ * Snapshot all confident wall cells, wipe the pool, re-insert.
+ *
+ * Up to QT_COMPACT_MAX cells are saved in a static BSS buffer (no stack
+ * allocation).  After the in-place pool reset, each saved cell is
+ * re-inserted with qt_update(map, cx, cy, saved_value): because the leaf
+ * starts at 0 after the reset, adding saved_value as the delta restores
+ * the exact log-odds value in one call.
+ * ────────────────────────────────────────────────────────────────────────── */
+#define QT_COMPACT_MAX 512
+
+typedef struct { float cx, cy; int8_t value; } _compact_cell_t;
+
+static _compact_cell_t _s_compact_buf[QT_COMPACT_MAX];
+static int             _s_compact_cnt = 0;
+static int8_t          _s_compact_min = 0;
+
+static void _compact_cb(float cx, float cy, int8_t value, void *ud)
+{
+    (void)ud;
+    if (value < _s_compact_min)        return;
+    if (_s_compact_cnt >= QT_COMPACT_MAX) return;
+    _s_compact_buf[_s_compact_cnt].cx    = cx;
+    _s_compact_buf[_s_compact_cnt].cy    = cy;
+    _s_compact_buf[_s_compact_cnt].value = value;
+    _s_compact_cnt++;
+}
+
+void qt_compact(QuadTreeMap *map, int8_t min_value)
+{
+    if (!map || !map->pool) return;
+
+    /* 1. Collect confident occupied cells */
+    _s_compact_cnt = 0;
+    _s_compact_min = min_value;
+    qt_iterate_occupied(map, _compact_cb, NULL);
+
+    uint16_t saved = (uint16_t)_s_compact_cnt;
+    uint16_t before = map->count;
+
+    /* 2. Reset pool in-place — no malloc/free, just wipe and reinitialise */
+    memset(map->pool, 0, (size_t)QT_POOL_SIZE * sizeof(QTNode));
+    map->count = 1;   /* slot 0 stays reserved as QT_NULL */
+    _alloc(map, 1);   /* recreate root at index 1, depth 1 */
+
+    /* 3. Re-insert saved cells — leaf starts at 0, so delta = saved value */
+    for (int i = 0; i < _s_compact_cnt; i++) {
+        qt_update(map, _s_compact_buf[i].cx,
+                       _s_compact_buf[i].cy,
+                       _s_compact_buf[i].value);
+    }
+
+#if defined(ESP_PLATFORM)
+    ESP_LOGI(TAG_QT, "compact: %u→%u nodes  saved=%u cells  freed=%u nodes",
+             (unsigned)before, (unsigned)map->count,
+             (unsigned)saved,
+             (unsigned)(before - map->count));
+#else
+    (void)before; (void)saved;
+#endif
+}

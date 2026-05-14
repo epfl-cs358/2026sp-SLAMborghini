@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -19,15 +20,23 @@ static const char *TAG = "task_odometry";
 static encoder_ackermann_odom_t s_odom;
 
 /* Published pose snapshot — written under lock by task_odometry,
- * read by bridge_slave_task via task_odometry_copy_pose(). */
+ * read by task_pure_pursuit via task_odometry_copy_pose(). */
 static odom_pose_t s_published_pose;
 
-/* Protects s_odom.pose between writer (task_odometry) and reader (bridge_slave_task).
- * Critical section keeps it to ~100 ns on the read side — safe for UART ISRs. */
+/* Protects s_published_pose between writer (task_odometry) and reader
+ * (task_pure_pursuit).  portMUX critical section is ~100 ns — safe for
+ * the 16-byte struct copy without disabling the watchdog. */
 static portMUX_TYPE s_pose_mux = portMUX_INITIALIZER_UNLOCKED;
 
+/* I2C bus mutex — both imu_gyro_update() (ICM-20948) and
+ * imu_encoder_driver_update() (AS5600) share the same I2C bus.
+ * Initialised in task_odometry() before any I2C call.
+ * Exposed via task_odometry_get_i2c_mutex() so any future I2C user can
+ * participate in the same exclusion without a global extern. */
+static SemaphoreHandle_t s_i2c_mutex = NULL;
+
 /* Current commanded servo steering angle in radians (0 = straight).
- * Written by bridge_slave_task via task_odometry_set_steering_rad().
+ * Written by task_pure_pursuit via task_odometry_set_steering_rad().
  * Single 32-bit float write is atomic on Xtensa LX7 — no lock needed. */
 static volatile float s_current_steering_rad = 0.0f;
 
@@ -38,41 +47,29 @@ static int s_stationary_ticks = 0;
 
 /* Ackermann / complementary filter config.
  *
- * All three sensors are now fused:
- *   - AS5600 encoder   → ds (incremental distance per 10 ms tick)
- *   - ICM-20948 IMU    → yaw_rad (heading, bias-corrected, ZUPT-refined)
- *   - Servo command    → steering_rad (Ackermann heading prediction)
+ * All three sensors are fused every 10 ms:
+ *   AS5600 encoder   → cumulative distance (mm), differenced per tick
+ *   ICM-20948 IMU    → yaw heading (rad), bias-corrected, ZUPT-refined
+ *   Servo command    → steering_rad, used for Ackermann fallback heading
  *
- * imu_correction_gain controls the blend:
- *   1.0 → heading = IMU reading (Ackermann is sanity-check fallback on IMU fault)
- *   0.0 → heading = Ackermann prediction only
- *   0.7 → recommended blend once steering geometry is validated on hardware
- *
- * With gain = 1.0 the Ackermann heading (steering_rad) still contributes when the
- * IMU reading jumps more than max_yaw_jump_rad in a single 10 ms tick: in that case
- * the IMU is treated as unreliable and the Ackermann prediction carries the heading
- * forward.  Without a real steering angle that fallback was always "go straight".
+ * imu_correction_gain = 1.0 means IMU is primary; Ackermann heading is the
+ * fallback when the IMU jumps more than max_yaw_jump_rad in one tick.
+ * Set to 0.7 once the Ackermann steering geometry is validated in hardware.
  */
 static const odom_config_t k_cfg = {
-    .wheelbase_m         = 0.258f,   /* measured — front-axle to rear-axle */
-    .imu_correction_gain = 1.0f,     /* 1.0 = IMU primary; lower to blend Ackermann */
+    .wheelbase_m         = 0.258f,   /* measured front-axle to rear-axle */
+    .imu_correction_gain = 1.0f,     /* 1.0 = IMU primary */
     .max_delta_dist_m    = 0.08f,    /* max plausible encoder step per 10 ms */
-    .max_yaw_jump_rad    = 0.35f     /* ~20 deg/tick — above this the IMU is distrusted */
+    .max_yaw_jump_rad    = 0.35f,    /* ~20°/tick — above this IMU is distrusted */
 };
 
 /* ── Public API ─────────────────────────────────────────────────────────────── */
 
-/* Set the commanded servo steering angle.
- * Call from bridge_slave_task immediately after writing the servo duty. */
 void task_odometry_set_steering_rad(float steering_rad)
 {
     s_current_steering_rad = steering_rad;
 }
 
-/* Atomically copy the latest odometry pose into *out.
- * The critical section (~100 ns) prevents the FreeRTOS tick ISR from switching
- * to task_odometry mid-copy, ensuring x, y, theta, timestamp_ms are from the
- * same integration step. */
 void task_odometry_copy_pose(odom_pose_t *out)
 {
     taskENTER_CRITICAL(&s_pose_mux);
@@ -80,17 +77,14 @@ void task_odometry_copy_pose(odom_pose_t *out)
     taskEXIT_CRITICAL(&s_pose_mux);
 }
 
-/* Internal accessor used only by the task itself (no lock needed — same task). */
 const odom_pose_t *task_odometry_get_pose(void)
 {
     return encoder_ackermann_odom_get_pose(&s_odom);
 }
 
-/* ── Internal helpers ───────────────────────────────────────────────────────── */
-
-static float get_steering_angle_rad(void)
+SemaphoreHandle_t task_odometry_get_i2c_mutex(void)
 {
-    return s_current_steering_rad;
+    return s_i2c_mutex;
 }
 
 /* ── Task ───────────────────────────────────────────────────────────────────── */
@@ -99,32 +93,48 @@ void task_odometry(void *pvParameters)
 {
     (void)pvParameters;
 
+    /* I2C mutex — created here, before any I2C access.
+     * Both the AS5600 and ICM-20948 share the same I2C bus, so all reads
+     * must be serialised.  Any other future I2C user should acquire this
+     * mutex via task_odometry_get_i2c_mutex() rather than a raw extern. */
+    s_i2c_mutex = xSemaphoreCreateMutex();
+    configASSERT(s_i2c_mutex);
+
     encoder_ackermann_odom_init(&s_odom, &k_cfg);
 
     int64_t last_log_us  = 0;
     int64_t last_tick_us = esp_timer_get_time();
-    extern SemaphoreHandle_t g_i2c_mutex;
+
+    static float s_prev_distance_m = 0.0f;
 
     for (;;) {
-        /* 1. Integrate gyro Z with measured dt — actual period includes I2C time */
+        /* ── 1. Measure real dt ───────────────────────────────────────────
+         * Capture time BEFORE I2C so dt includes the full tick period,
+         * not just the scheduling delay.  Clamped to [5, 50] ms to guard
+         * against first-tick and scheduler-pause edge cases.              */
         int64_t now_us = esp_timer_get_time();
         float dt_s = (float)(now_us - last_tick_us) * 1e-6f;
         last_tick_us = now_us;
-        if (dt_s < 0.005f) dt_s = 0.005f;   /* guard against spurious near-zero on first tick */
-        if (dt_s > 0.050f) dt_s = 0.050f;   /* guard against stale timer after scheduler pause */
-        xSemaphoreTake(g_i2c_mutex, portMAX_DELAY);
+        if (dt_s < 0.005f) dt_s = 0.005f;
+        if (dt_s > 0.050f) dt_s = 0.050f;
+
+        /* ── 2. Read both I2C sensors under the shared bus mutex ─────────
+         * imu_gyro_update()          → ICM-20948 at 0x68
+         * imu_encoder_driver_update() → AS5600    at 0x36
+         * Both share the same I2C bus; interleaving would corrupt reads. */
+        xSemaphoreTake(s_i2c_mutex, portMAX_DELAY);
         imu_gyro_update(dt_s);
-
-        /* 2. Read AS5600 encoder tick (cumulative distance) */
         imu_encoder_driver_update();
-        xSemaphoreGive(g_i2c_mutex);
+        xSemaphoreGive(s_i2c_mutex);
 
-        float distance_m   = imu_encoder_driver_get_distance_m();  /* cumulative, metres */
-        float yaw_rad      = imu_encoder_driver_get_yaw_rad();      /* IMU heading, rad   */
-        float steering_rad = get_steering_angle_rad();               /* servo command, rad */
+        float distance_m   = imu_encoder_driver_get_distance_m();
+        float yaw_rad      = imu_encoder_driver_get_yaw_rad();
+        float steering_rad = s_current_steering_rad;
 
-        /* 3. ZUPT — refine gyro bias when stationary (encoder delta < 1 mm) */
-        static float s_prev_distance_m = 0.0f;
+        /* ── 3. ZUPT — zero-velocity update ──────────────────────────────
+         * When encoder delta < 1 mm for 200 ms the car is stationary.
+         * imu_gyro_zupt_update() corrects accumulated gyro bias in-place,
+         * keeping heading accurate across stop-and-go manoeuvres.        */
         float delta_dist_m = fabsf(distance_m - s_prev_distance_m);
         s_prev_distance_m  = distance_m;
 
@@ -135,32 +145,36 @@ void task_odometry(void *pvParameters)
             s_stationary_ticks = 0;
         }
 
+        /* ── 4. Ackermann + IMU fusion ────────────────────────────────────
+         * encoder_ackermann_odom_update() blends:
+         *   - cumulative encoder distance (arc length)
+         *   - IMU heading (primary, bias-corrected)
+         *   - Ackermann heading prediction (fallback on IMU fault)
+         * Trig (cosf/sinf) runs outside the portMUX critical section —
+         * the watchdog must not be suspended for >15 ms.               */
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        encoder_ackermann_odom_update(&s_odom, distance_m, steering_rad, yaw_rad, now_ms);
 
-        /* 4. Fuse encoder + steering (Ackermann) + IMU into pose.
-         *    Compute outside any lock — trig and wrap_angle must not run with
-         *    interrupts disabled (TWDT cannot fire during a critical section).
-         *    Lock is held only for the 16-byte pose publish. */
-        encoder_ackermann_odom_update(&s_odom,
-                                      distance_m,
-                                      steering_rad,
-                                      yaw_rad,
-                                      now_ms);
+        /* Publish atomically — 16-byte struct copy under spinlock. */
         taskENTER_CRITICAL(&s_pose_mux);
         s_published_pose = s_odom.pose;
         taskEXIT_CRITICAL(&s_pose_mux);
 
-        /* 5. Log once per second */
+        /* ── 5. 1 Hz diagnostic log ──────────────────────────────────────
+         * Printed values feed directly into odom_t sent to the ESP32-S3.
+         * x/y/theta here ARE what the S3 integrates into its world pose. */
         now_us = esp_timer_get_time();
         if ((now_us - last_log_us) > 1000000LL) {
             const odom_pose_t *p = task_odometry_get_pose();
             if (p)
                 ESP_LOGI(TAG,
-                         "x=%.3f m  y=%.3f m  θ=%.2f°  dist=%.3f m  steer=%.1f°  stack_hwm=%u",
-                         p->x, p->y,
+                         "x=%.3f m  y=%.3f m  θ=%.2f°  dist=%.3f m"
+                         "  steer=%.1f°  zupt=%d  hwm=%u B",
+                         (double)p->x, (double)p->y,
                          (double)(p->theta * 180.0f / (float)M_PI),
-                         distance_m,
+                         (double)distance_m,
                          (double)(steering_rad * 180.0f / (float)M_PI),
+                         s_stationary_ticks >= ZUPT_STATIONARY_TICKS,
                          (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
             last_log_us = now_us;
         }

@@ -30,7 +30,7 @@
 //   6000 nodes kept for full-room SLAM headroom.
 #ifndef QT_POOL_SIZE
 #  ifdef CONFIG_IDF_TARGET_ESP32S3
-#    define QT_POOL_SIZE 1200
+#    define QT_POOL_SIZE 4000   /* 4000 × 12 B = 48 KB; supports compaction cycle */
 #  else
 #    define QT_POOL_SIZE 6000
 #  endif
@@ -38,8 +38,8 @@
 #define QT_NULL 0 // no child index 
 
 // Log-odds increments 
-#define QT_HIT_INC 15  // obstacle confirmed → value rises
-#define QT_MISS_DEC (-6)  // ray passed through → value drops 
+#define QT_HIT_INC 30   // obstacle confirmed → value rises  (5:1 vs miss keeps narrow obstacles stable)
+#define QT_MISS_DEC (-6)  // ray passed through → value drops
 #define QT_VALUE_MAX 40
 #define QT_VALUE_MIN (-40)
 
@@ -91,6 +91,17 @@ size_t qt_memory_bytes(const QuadTreeMap *map);
 static inline bool qt_is_pool_full(const QuadTreeMap *map) {
     return map && map->pool && map->count >= QT_POOL_SIZE;
 }
+
+/* qt_compact — snapshot confident walls, wipe the pool, re-insert.
+ *
+ * Collects every leaf with value >= min_value via qt_iterate_occupied,
+ * resets the pool in-place (no malloc/free), then re-inserts the saved
+ * cells so the quadtree retains all confident wall knowledge while
+ * freeing all uncertain/noise nodes.
+ *
+ * Call when map->count > QT_POOL_SIZE * 85 / 100 to prevent freezing.
+ * Safe to call from the same task that writes the map (no mutex needed). */
+void qt_compact(QuadTreeMap *map, int8_t min_value);
 
 // qt_query const variant — does not modify the map.
 int8_t qt_query_const(const QuadTreeMap *map, float x, float y);

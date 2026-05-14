@@ -22,6 +22,13 @@
  * processing.  Set to the sensor's reliable physical limit. */
 #define LIDAR_PROCESS_RANGE_MM 3500.0f
 
+/* Free-traversal endpoint guard (mm).
+ * The ray march stops this far short of the obstacle so that the last FREE
+ * step cannot fall inside the same 156 mm quadtree leaf as the endpoint.
+ * Must be > leaf cell size (10000/64 ≈ 156 mm) — 200 mm gives a comfortable
+ * margin without leaving a visible unknown band along walls. */
+#define LIDAR_ENDPOINT_GUARD_MM 200.0f
+
 /* Active mapping radius (mm).  Only the disc of this radius around the
  * robot is written to the map each scan.  Beams that return beyond this
  * distance are still useful: they mark free space to the radius boundary

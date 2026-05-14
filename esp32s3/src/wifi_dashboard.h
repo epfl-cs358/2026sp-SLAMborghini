@@ -83,6 +83,15 @@ bool wifi_dashboard_stop_peek(void);
 void wifi_dashboard_broadcast_scan(const lidar_scan_t *scan, const pose_t *pose);
 
 /**
+ * Broadcast the raw (pre-scan-match) odometry pose as a type-0x07 frame.
+ * The dashboard renders it as a ghost outline in orange so you can see the
+ * correction applied by scan matching vs the raw odometry estimate.
+ * Call once per scan cycle, right before wifi_dashboard_broadcast_state().
+ * @param raw_pose  Raw odometry pose before scan-match correction.
+ */
+void wifi_dashboard_broadcast_raw_pose(const pose_t *raw_pose);
+
+/**
  * Send a plain-text log line to the dashboard log box.
  * Silently drops if no client is connected.
  * @param msg Null-terminated string (max ~200 chars).

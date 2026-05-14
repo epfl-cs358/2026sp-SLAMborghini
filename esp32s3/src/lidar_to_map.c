@@ -63,13 +63,12 @@ IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
      * and the BFS exits immediately. */
     qt_update(map, x0, y0, QT_MISS_DEC);
 
-    /* Seed dirty rect with robot position */
+    /* Seed dirty rect with robot position; valid is set on the first processed beam */
     if (out_dirty) {
         out_dirty->x_min = x0;
         out_dirty->y_min = y0;
         out_dirty->x_max = x0;
         out_dirty->y_max = y0;
-        out_dirty->valid = true;
     }
 
     for (uint16_t i = 0; i < scan->count; i++) {
@@ -86,7 +85,19 @@ IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
         float theta_deg = scan->points[i].theta_deg;
         if (!_valid(theta_deg)) continue;
 
-        float rad     = theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
+        /* Angular delta filter — skip beams whose range barely changed */
+        int bucket = (int)(theta_deg + 0.5f) % DELTA_BUCKETS;
+        if (bucket < 0) bucket += DELTA_BUCKETS;
+        float prev_r = s_delta_valid ? s_delta_ref[bucket] : -1.0f;
+        s_delta_ref[bucket] = r;
+        if (s_delta_valid) {
+            bool same_no_return = (r == 0.0f && prev_r == 0.0f);
+            bool same_range     = (r > 0.0f && prev_r > 0.0f
+                                   && fabsf(r - prev_r) < LIDAR_DELTA_MM);
+            if (same_no_return || same_range) continue;
+        }
+
+        float rad     = -theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
         float cos_rad = cosf(rad);
         float sin_rad = sinf(rad);
         /* Unit vector in world frame — valid even when r == 0 */
@@ -116,18 +127,21 @@ IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
         if (!_valid(ex) || !_valid(ey)) continue;
 
         if (out_dirty) {
+            if (!out_dirty->valid) out_dirty->valid = true;
             if (ex < out_dirty->x_min) out_dirty->x_min = ex;
             if (ey < out_dirty->y_min) out_dirty->y_min = ey;
             if (ex > out_dirty->x_max) out_dirty->x_max = ex;
             if (ey > out_dirty->y_max) out_dirty->y_max = ey;
         }
 
-        for (float t = step_mm; t < march_to - step_mm; t += step_mm)
+        for (float t = step_mm; t < march_to - LIDAR_ENDPOINT_GUARD_MM; t += step_mm)
             qt_update(map, x0 + ux * t, y0 + uy * t, QT_MISS_DEC);
 
         if (has_obstacle)
             qt_update(map, ex, ey, QT_HIT_INC);
     }
+
+    s_delta_valid = true;
 }
 
 
@@ -211,7 +225,7 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
             if (same_no_return || same_range) continue;
         }
 
-        float rad     = theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
+        float rad     = -theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
         float cos_rad = cosf(rad);
         float sin_rad = sinf(rad);
         float ux = cos_rad * cos_t - sin_rad * sin_t;
@@ -247,7 +261,7 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
         }
 
         qt_update(map, sx, sy, QT_MISS_DEC);
-        for (float t = step_mm; t < march_to - step_mm; t += step_mm)
+        for (float t = step_mm; t < march_to - LIDAR_ENDPOINT_GUARD_MM; t += step_mm)
             qt_update(map, sx + ux * t, sy + uy * t, QT_MISS_DEC);
         if (has_obstacle)
             qt_update(map, ex, ey, QT_HIT_INC);

@@ -214,6 +214,7 @@ static uint32_t servo_deg_to_duty(float servo_deg)
 
 
 
+#if !defined(HEADING_TEST_MODE) && !defined(BRIDGE_SLAVE)
 /* ════════════════════════════════════════════════════════════════════════════
  * drive_for_cmd — steers then drives; returns actual heading from gyro.
  * ════════════════════════════════════════════════════════════════════════════ */
@@ -307,6 +308,7 @@ static void dead_reckon_pose(pose_t *pose, const control_frame_t *cmd)
     pose->x += traveled * cosf(cmd->t_heading);
     pose->y += traveled * sinf(cmd->t_heading);
 }
+#endif /* !HEADING_TEST_MODE && !BRIDGE_SLAVE */
 
 
 #if !defined(HEADING_TEST_MODE) && !defined(BRIDGE_SLAVE)
@@ -1014,8 +1016,14 @@ static void task_pure_pursuit(void *arg)
                 float dtheta_idle = fmodf(cur.theta - s_idle_last_pose.theta, 2.0f * (float)M_PI);
                 if (dtheta_idle >  (float)M_PI) dtheta_idle -= 2.0f * (float)M_PI;
                 if (dtheta_idle < -(float)M_PI) dtheta_idle += 2.0f * (float)M_PI;
+                float _dx_m = cur.x - s_idle_last_pose.x;
+                float _dy_m = cur.y - s_idle_last_pose.y;
+                float _dist_abs_mm = sqrtf(_dx_m * _dx_m + _dy_m * _dy_m) * 1000.0f;
+                /* Sign: project motion onto the previous heading direction */
+                float _fwd = _dx_m * cosf(s_idle_last_pose.theta) + _dy_m * sinf(s_idle_last_pose.theta);
+                float _disp_mm = (_fwd >= 0.0f) ? _dist_abs_mm : -_dist_abs_mm;
                 odom_t idle_odom = {
-                    .linear_disp_mm = 0.0f,
+                    .linear_disp_mm = _disp_mm,
                     .yaw_rate_imu   = dtheta_idle * 10.0f,
                     .dt_ms          = 100.0f,
                     .seq            = s_idle_odom_seq++,
@@ -1072,7 +1080,9 @@ static void task_pure_pursuit(void *arg)
 
         float dx_m        = after_pose.x - before_pose.x;
         float dy_m        = after_pose.y - before_pose.y;
-        float traveled_mm = sqrtf(dx_m * dx_m + dy_m * dy_m) * 1000.0f;
+        float _abs_mm     = sqrtf(dx_m * dx_m + dy_m * dy_m) * 1000.0f;
+        float _fwd_pp     = dx_m * cosf(before_pose.theta) + dy_m * sinf(before_pose.theta);
+        float traveled_mm = (_fwd_pp >= 0.0f) ? _abs_mm : -_abs_mm;
 
         float dtheta = fmodf(after_pose.theta - before_pose.theta, 2.0f * (float)M_PI);
         if (dtheta >  (float)M_PI) dtheta -= 2.0f * (float)M_PI;

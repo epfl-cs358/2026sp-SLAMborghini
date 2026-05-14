@@ -215,7 +215,8 @@ input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
       <div class="leg"><div class="sw" style="background:#fff;border-color:#aaa"></div>Free (explored)</div>
       <div class="leg"><div class="sw" style="background:#000"></div>Wall</div>
       <div class="leg"><div class="sw" style="background:#fbbf24;border-radius:50%"></div>LiDAR scan</div>
-      <div class="leg"><div class="sw" style="background:#4361ee"></div>Robot</div>
+      <div class="leg"><div class="sw" style="background:#4361ee"></div>Robot (scan-matched)</div>
+      <div class="leg"><div class="sw" style="border:2px solid #f97316;background:transparent"></div>Raw odometry (ghost)</div>
       <div class="leg"><div class="sw" style="background:#00ffff;border-radius:50%"></div>Path trail</div>
       <div class="leg"><div class="sw" style="background:#52b788;border-radius:50%"></div>A* planned path</div>
       <div class="leg"><div class="sw" style="background:#f4a261;border-radius:50%"></div>Frontier target</div>
@@ -251,6 +252,7 @@ const MSG_POSE      = 0x03;
 const MSG_MAP_DELTA = 0x04;
 const MSG_QUADTREE  = 0x05;
 const MSG_PATH      = 0x06;
+const MSG_RAW_POSE  = 0x07;   // raw odometry pose (pre-scan-match) → orange ghost
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Rendering constants
@@ -270,6 +272,7 @@ let scanAccum  = [];     // persistent [{wx,wy}, ...] — circular, max SCAN_MAX
 let trailPts   = [];     // [{x,y}, ...] — robot path
 let lastFront  = null;   // {fx, fy, has} — latest frontier
 let lastPose   = null;   // most recent raw pose (for scan projection)
+let rawPose    = null;   // pre-scan-match odometry pose (orange ghost)
 let qtNodes    = null;   // [{xMin,yMin,size,depth,value}, ...] — latest quadtree frame
 let astarPath  = [];     // [{x,y}, ...] — latest A* planned waypoints
 
@@ -325,7 +328,7 @@ async function buildBitmap(rawGrid, gw, gh) {
       const k   = (py * gw + ix) * 4;
       let r, g, b;
       if      (val < 118) { r = 255; g = 255; b = 255; }   // free  → white
-      else if (val > 138) { r = 0;   g = 0;   b = 0;   }   // wall  → black
+      else if (val > 148) { r = 0;   g = 0;   b = 0;   }   // wall  → black (log-odds>20: requires 2 hits)
       else                { r = 244; g = 162; b =  97; }   // unknown → orange
       d[k]=r; d[k+1]=g; d[k+2]=b; d[k+3]=255;
     }
@@ -386,7 +389,7 @@ function handleScan(buf) {
     const acd = v.getUint16(off,     true);   // angle centidegrees
     const rmm = v.getUint16(off + 2, true);   // range mm
     if (rmm < 100 || rmm > 6000) continue;
-    const arad = acd * Math.PI / 18000;
+    const arad = -acd * Math.PI / 18000;
     const lx   = rmm * Math.cos(arad);
     const ly   = rmm * Math.sin(arad);
     scanAccum.push({
@@ -444,6 +447,19 @@ function handlePose(buf) {
 
   nPose++;
   document.getElementById('sPose').textContent = nPose;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * handleRawPose — parse type-0x07 frame (raw odometry pre-scan-match).
+ * Frame: [type(1)][x(4)][y(4)][theta(4)] = 13 bytes.
+ * ════════════════════════════════════════════════════════════════════════════ */
+function handleRawPose(buf) {
+  const v = new DataView(buf);
+  rawPose = {
+    x:     v.getFloat32(1, true),
+    y:     v.getFloat32(5, true),
+    theta: v.getFloat32(9, true),
+  };
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -601,7 +617,36 @@ function drawQuadtreeMap() {
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
- * Robot drawing (RC car top-view)
+ * drawRawRobot — orange ghost outline showing raw odometry (pre-scan-match).
+ * Drawn before the corrected robot so the blue car renders on top.
+ * ════════════════════════════════════════════════════════════════════════════ */
+function drawRawRobot(cx, cy, theta) {
+  if (!mapState) return;
+  const ppm = BASE_PX * cam.zoom / mapState.cellMm;
+  const bL  = 300 * ppm;
+  const bW  = 180 * ppm;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(-theta);
+  ctx.globalAlpha = 0.75;
+
+  // Outline body in orange
+  ctx.strokeStyle = '#f97316';
+  ctx.lineWidth   = 2;
+  ctx.strokeRect(-bL / 2, -bW / 2, bL, bW);
+
+  // Front heading stripe in amber
+  ctx.strokeStyle = '#fbbf24';
+  ctx.lineWidth   = 2;
+  ctx.strokeRect(bL / 2 - bL * 0.2, -bW / 2, bL * 0.2, bW);
+
+  ctx.globalAlpha = 1.0;
+  ctx.restore();
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * Robot drawing (RC car top-view) — corrected (scan-matched) pose
  * ════════════════════════════════════════════════════════════════════════════ */
 function drawRobot(cx, cy, theta) {
   const ppm = BASE_PX * cam.zoom / mapState.cellMm;  // pixels per mm
@@ -763,7 +808,31 @@ function render(now) {
     ctx.setLineDash([]);
   }
 
-  /* ── 5. Robot ── */
+  /* ── 5. Raw odometry ghost (orange outline) + correction vector ── */
+  if (rawPose && mapState) {
+    const [rrx, rry] = w2c(rawPose.x, rawPose.y);
+    drawRawRobot(rrx, rry, rawPose.theta);
+
+    // Draw dashed line from raw pose to corrected pose when correction > 5 mm
+    if (pose) {
+      const [mx, my] = w2c(pose.x, pose.y);
+      const dist = Math.hypot(pose.x - rawPose.x, pose.y - rawPose.y);
+      if (dist > 5) {
+        ctx.save();
+        ctx.strokeStyle = '#f97316';
+        ctx.lineWidth   = 1.5;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(rrx, rry);
+        ctx.lineTo(mx, my);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+      }
+    }
+  }
+
+  /* ── 6. Robot (corrected scan-matched pose — blue) ── */
   if (pose) {
     const [rx, ry] = w2c(pose.x, pose.y);
     drawRobot(rx, ry, pose.theta);
@@ -910,6 +979,7 @@ function wsConnect() {
     else if (type === MSG_POSE)      handlePose(evt.data);
     else if (type === MSG_QUADTREE)  handleQuadtree(evt.data);
     else if (type === MSG_PATH)      handlePath(evt.data);
+    else if (type === MSG_RAW_POSE)  handleRawPose(evt.data);
   };
 }
 

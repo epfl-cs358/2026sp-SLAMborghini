@@ -64,6 +64,7 @@ static const char *TAG = "wifi_dash";
 #define MSG_POSE      0x03u
 #define MSG_MAP_DELTA 0x04u
 #define MSG_PATH      0x06u   /* A* planned path: [type(1)][count(1)][{x(4)y(4)}×count] */
+#define MSG_RAW_POSE  0x07u   /* Raw odometry pose (pre-scan-match): [type(1)][x(4)][y(4)][theta(4)] */
 #define MSG_KEEPALIVE 0xFEu   /* 1-byte heartbeat; browser ignores unknown types */
 
 /* ── Dashboard grid ─────────────────────────────────────────────────────── */
@@ -100,6 +101,7 @@ static const char *TAG = "wifi_dash";
 
 static uint8_t s_map_buf[MAP_BUF_SIZE];                            /* full map or delta  */
 static uint8_t s_pose_buf[24u];                                    /* pose frame         */
+static uint8_t s_raw_pose_buf[13u];                                /* raw odometry frame */
 static uint8_t s_scan_buf[3u + SCAN_MAX_PTS * 4u];                /* scan frame         */
 static uint8_t s_path_buf[2u + MAX_SHARED_PATH_POINTS * 8u];      /* path frame         */
 static uint8_t s_log_bufs[5][80u];                                 /* 5-slot log ring    */
@@ -122,11 +124,12 @@ static const quadtree_map_t *s_map_ref = NULL;
 #define DASH_LOG_MAX   80u
 
 typedef enum {
-    DASH_MAP_MSG  = 0,
-    DASH_POSE_MSG = 1,
-    DASH_SCAN_MSG = 2,
-    DASH_LOG_MSG  = 3,
-    DASH_PATH_MSG = 4,
+    DASH_MAP_MSG      = 0,
+    DASH_POSE_MSG     = 1,
+    DASH_SCAN_MSG     = 2,
+    DASH_LOG_MSG      = 3,
+    DASH_PATH_MSG     = 4,
+    DASH_RAW_POSE_MSG = 5,   /* pre-scan-match odometry pose (type 0x07) */
 } dash_msg_type_t;
 
 typedef struct {
@@ -146,6 +149,7 @@ typedef struct {
             float   pts_x[MAX_SHARED_PATH_POINTS];
             float   pts_y[MAX_SHARED_PATH_POINTS];
         } path;
+        struct { float x, y, theta; } raw_pose;   /* DASH_RAW_POSE_MSG */
     };
 } dash_msg_t;
 
@@ -234,9 +238,9 @@ static bool _ws_send_raw(uint8_t *payload, size_t len, httpd_ws_type_t type)
     esp_err_t err = httpd_ws_send_frame_async(s_server, fd, &frame);
     if (err != ESP_OK) {
         s_fail_streak++;
-        ESP_LOGW(TAG, "_ws_send_raw fd=%d err=0x%x streak=%u/10",
+        ESP_LOGW(TAG, "_ws_send_raw fd=%d err=0x%x streak=%u/3",
                  fd, (unsigned)err, (unsigned)s_fail_streak);
-        if (s_fail_streak >= 10u) {
+        if (s_fail_streak >= 3u) {
             s_fail_streak = 0u;
             _on_send_error(fd);
         }
@@ -415,6 +419,36 @@ static void _do_pose_send(const dash_msg_t *msg)
     _ws_send_raw(s_pose_buf, 24u, HTTPD_WS_TYPE_BINARY);
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+ * _do_raw_pose_send — build type-0x07 frame into s_raw_pose_buf, send.
+ * Called only from dash_task.
+ * ════════════════════════════════════════════════════════════════════════════ */
+static void _do_raw_pose_send(const dash_msg_t *msg)
+{
+    s_raw_pose_buf[0] = MSG_RAW_POSE;
+    memcpy(&s_raw_pose_buf[1], &msg->raw_pose.x,     4);
+    memcpy(&s_raw_pose_buf[5], &msg->raw_pose.y,     4);
+    memcpy(&s_raw_pose_buf[9], &msg->raw_pose.theta, 4);
+    _ws_send_raw(s_raw_pose_buf, 13u, HTTPD_WS_TYPE_BINARY);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * wifi_dashboard_broadcast_raw_pose — post type-0x07 raw odometry to browser.
+ * Routes through the dash queue (like all other callers) so that _ws_send_raw
+ * is always called exclusively from dash_task.  The earlier pattern of calling
+ * _ws_send_raw directly from task_lidar_slam raced on the shared s_fail_streak
+ * counter and could corrupt the static send buffer before httpd flushed it.
+ * ════════════════════════════════════════════════════════════════════════════ */
+void wifi_dashboard_broadcast_raw_pose(const pose_t *raw_pose)
+{
+    if (!raw_pose || !s_dash_queue) return;
+    dash_msg_t msg;
+    msg.type          = DASH_RAW_POSE_MSG;
+    msg.raw_pose.x     = raw_pose->x;
+    msg.raw_pose.y     = raw_pose->y;
+    msg.raw_pose.theta = raw_pose->theta;
+    xQueueSend(s_dash_queue, &msg, 0);
+}
 
 /* ════════════════════════════════════════════════════════════════════════════
  * _do_scan_send — copy staged scan into s_scan_buf, send.
@@ -524,11 +558,12 @@ static void _dash_task(void *arg)
          * the queue filled up (non-blocking xQueueSend in callers). */
         while (xQueueReceive(s_dash_queue, &msg, 0) == pdTRUE) {
             switch (msg.type) {
-                case DASH_MAP_MSG:  _do_map_send(msg.dirty_tiles); break;
-                case DASH_POSE_MSG: _do_pose_send(&msg);   break;
-                case DASH_SCAN_MSG: _do_scan_send();       break;
-                case DASH_LOG_MSG:  _do_log_send(msg.log); break;
-                case DASH_PATH_MSG: _do_path_send(&msg);   break;
+                case DASH_MAP_MSG:      _do_map_send(msg.dirty_tiles); break;
+                case DASH_POSE_MSG:     _do_pose_send(&msg);           break;
+                case DASH_SCAN_MSG:     _do_scan_send();               break;
+                case DASH_LOG_MSG:      _do_log_send(msg.log);         break;
+                case DASH_PATH_MSG:     _do_path_send(&msg);           break;
+                case DASH_RAW_POSE_MSG: _do_raw_pose_send(&msg);       break;
             }
         }
 
@@ -547,14 +582,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)data;
-        ESP_LOGW(TAG, "Disconnected reason=%u", (unsigned)disc->reason);
-        if (s_retries < WIFI_MAX_RETRIES) {
-            esp_wifi_connect();
-            s_retries++;
-            ESP_LOGI(TAG, "Retry Wi-Fi (%d/%d)", s_retries, WIFI_MAX_RETRIES);
-        } else {
-            xEventGroupSetBits(s_wifi_eg, WIFI_FAIL_BIT);
-        }
+        s_retries++;
+        ESP_LOGW(TAG, "Disconnected reason=%u — reconnecting (attempt %d)", (unsigned)disc->reason, s_retries);
+        esp_wifi_connect();   /* always retry — moving robot must never give up */
+        if (s_retries > WIFI_MAX_RETRIES)
+            xEventGroupSetBits(s_wifi_eg, WIFI_FAIL_BIT);   /* only fails wifi_dashboard_init() wait */
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
