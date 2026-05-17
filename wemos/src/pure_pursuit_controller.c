@@ -1,7 +1,10 @@
 /**
- * pure_pursuit_controller.c
+ * pure_pursuit_controller.c  —  Wemos D1 R32
  *
- * Pure Pursuit local path-following controller for the Wemos Control Brain.
+ * Ring-buffer PP: waypoints arrive as streaming PATH_CHUNK packets from
+ * ESP32-S3 and are stored in a fixed PP_RING_CAP circular buffer indexed by
+ * their global path index (gi % PP_RING_CAP).  The pursuit_idx global counter
+ * plays the role of last_target_index from the original flat-array version.
  */
 
 #include "pure_pursuit_controller.h"
@@ -13,289 +16,252 @@
 #define M_PI 3.14159265358979323846f
 #endif
 
-static float clampf(float value, float min_val, float max_val) {
-    if (value < min_val) return min_val;
-    if (value > max_val) return max_val;
-    return value;
+static float clampf(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
 }
 
-static uint16_t min_u16(uint16_t a, uint16_t b) {
-    return (a < b) ? a : b;
+static float dist_sq_2d(float ax, float ay, float bx, float by) {
+    float dx = ax - bx, dy = ay - by;
+    return dx*dx + dy*dy;
 }
 
-static float dist_sq_pose_waypoint(const pose_t *pose, const waypoint_t *wp) {
-    float dx = wp->x - pose->x;
-    float dy = wp->y - pose->y;
-    return dx * dx + dy * dy;
+/* Robot-frame transform: lateral right = X, forward = Y. */
+static waypoint_t to_robot_frame(const pose_t *robot_pose, waypoint_t g) {
+    float dx = g.x - robot_pose->x;
+    float dy = g.y - robot_pose->y;
+    waypoint_t r = g;
+    r.x =  dx * sinf(robot_pose->theta) - dy * cosf(robot_pose->theta);
+    r.y =  dx * cosf(robot_pose->theta) + dy * sinf(robot_pose->theta);
+    return r;
 }
 
-/*
- * Transform a global waypoint into the robot frame.
- *
- * Convention:
- * - robot-frame X is lateral RIGHT  (forward rotated 90° CW)
- * - robot-frame Y is forward
- * - pose->theta is the robot heading in radians (0 = East / +X world)
- *
- * Derivation:
- *   forward_dir = (cos θ,  sin θ)          right_dir = (sin θ, −cos θ)
- *   x_right  = dot((dx,dy), right_dir)  = dx·sin θ − dy·cos θ
- *   y_forward = dot((dx,dy), forward_dir) = dx·cos θ + dy·sin θ
- */
-static waypoint_t to_robot_frame(const pose_t *robot_pose, waypoint_t point_global) {
-    float dx = point_global.x - robot_pose->x;
-    float dy = point_global.y - robot_pose->y;
-
-    waypoint_t point_robot = point_global;
-
-    point_robot.x =  dx * sinf(robot_pose->theta) - dy * cosf(robot_pose->theta); /* right */
-    point_robot.y =  dx * cosf(robot_pose->theta) + dy * sinf(robot_pose->theta); /* forward */
-
-    return point_robot;
+/* ── Ring helpers ─────────────────────────────────────────────────────────── */
+static inline waypoint_t *ring_at(pure_pursuit_controller_t *pp, uint16_t gi) {
+    return &pp->ring[gi % PP_RING_CAP];
 }
+static inline uint16_t ring_tail(const pure_pursuit_controller_t *pp) {
+    return pp->ring_head + pp->ring_count;
+}
+
+/* ── Public API ───────────────────────────────────────────────────────────── */
 
 void pp_init(pure_pursuit_controller_t *pp) {
-    if (pp == NULL) {
-        return;
-    }
-
+    if (!pp) return;
     memset(pp, 0, sizeof(*pp));
-
-    /*
-     * Your project uses millimetres.
-     * Initial values are equivalent to:
-     * - wheelbase: 0.26 m
-     * - lookahead: 0.70 m
-     * - speed: 0.20 m/s
-     * - goal tolerance: 0.10 m
-     */
-    pp->wheelbase_mm = 260.0f;
-    pp->lookahead_mm = 700.0f;
-    pp->fixed_speed_mm_s = 200.0f;
-    pp->kp = 1.0f;
-
-    /*
-     * Steering limited to ±30 degrees.
-     */
-    pp->min_steering_rad = -0.523599f;
-    pp->max_steering_rad =  0.523599f;
-
-    pp->goal_tolerance_mm = 100.0f;
+    pp->wheelbase_mm      = 260.0f;
+    pp->lookahead_mm      = 300.0f;
+    pp->fixed_speed_mm_s  = 200.0f;
+    pp->kp                = 1.0f;
+    pp->min_steering_rad  = -1.134f;
+    pp->max_steering_rad  =  1.134f;
+    pp->goal_tolerance_mm = 300.0f;
 }
 
-void pp_set_path(
-    pure_pursuit_controller_t *pp,
-    const waypoint_t *path,
-    uint16_t path_length
-) {
-    if (pp == NULL || path == NULL) {
-        return;
+bool pp_append_chunk(pure_pursuit_controller_t *pp, const path_chunk_t *chunk) {
+    if (!pp || !chunk || chunk->count == 0) return false;
+
+    if (chunk->path_id != pp->path_id) {
+        /* New plan: reset ring to global index 0.  Any chunk with
+         * start_index != 0 will immediately trigger a NACK below. */
+        pp->ring_head      = 0;
+        pp->ring_count     = 0;
+        pp->path_id        = chunk->path_id;
+        pp->pursuit_idx    = 0;
+        pp->final_received = false;
     }
 
-    if (path_length > PP_MAX_PATH_LENGTH) {
-        path_length = PP_MAX_PATH_LENGTH;
+    uint16_t expected = ring_tail(pp);  /* ring_head + ring_count */
+    if (chunk->start_index != expected) {
+        return false;  /* out-of-order — caller must send NACK */
     }
 
-    pp->path_length = path_length;
-
-    if (path_length > 0) {
-        memcpy(pp->current_path, path, path_length * sizeof(waypoint_t));
+    if (pp->ring_count + chunk->count > PP_RING_CAP) {
+        /* Ring full — NACK so ESP32-S3 retries once PP has consumed space.
+         * Returning true here would silently drop final_chunk=true and
+         * permanently prevent path completion. */
+        return false;
     }
 
-    pp->last_target_index = 0;
+    for (uint8_t i = 0; i < chunk->count; i++) {
+        pp->ring[(expected + i) % PP_RING_CAP] = chunk->wp[i];
+    }
+    pp->ring_count += chunk->count;
+
+    if (chunk->final_chunk) {
+        pp->final_received = true;
+    }
+
+    return true;
 }
 
-bool pp_is_path_complete(
-    const pure_pursuit_controller_t *pp,
-    const pose_t *current_pose
-) {
-    if (pp == NULL || current_pose == NULL) {
-        return true;
-    }
-
-    if (pp->path_length == 0) {
-        return true;
-    }
-
-    const waypoint_t *final_goal = &pp->current_path[pp->path_length - 1];
-    float dist_to_goal_sq = dist_sq_pose_waypoint(current_pose, final_goal);
-
-    return dist_to_goal_sq < (pp->goal_tolerance_mm * pp->goal_tolerance_mm);
+uint16_t pp_get_consumed_idx(const pure_pursuit_controller_t *pp) {
+    return pp ? pp->pursuit_idx : 0;
 }
 
-static waypoint_t find_lookahead_point(
-    pure_pursuit_controller_t *pp,
-    const pose_t *current_pose,
-    float lookahead_mm
-) {
-    if (pp->path_length == 0) {
-        waypoint_t zero = {0};
-        return zero;
+uint16_t pp_get_path_id(const pure_pursuit_controller_t *pp) {
+    return pp ? pp->path_id : 0;
+}
+
+uint16_t pp_get_expected_start_idx(const pure_pursuit_controller_t *pp) {
+    return pp ? ring_tail(pp) : 0;
+}
+
+bool pp_has_path(const pure_pursuit_controller_t *pp) {
+    return pp && pp->ring_count > 0;
+}
+
+/* ── Lookahead search ─────────────────────────────────────────────────────── */
+
+static waypoint_t find_lookahead_point(pure_pursuit_controller_t *pp,
+                                        const pose_t *pose,
+                                        float lookahead_mm)
+{
+    uint16_t tail = ring_tail(pp);
+
+    /* Clamp pursuit_idx into valid range. */
+    if (pp->pursuit_idx < pp->ring_head) pp->pursuit_idx = pp->ring_head;
+    if (pp->pursuit_idx >= tail)         pp->pursuit_idx = tail - 1u;
+
+    /* With a single waypoint, return it directly. */
+    if (pp->ring_count < 2) {
+        return *ring_at(pp, pp->pursuit_idx);
     }
 
-    if (pp->last_target_index >= pp->path_length) {
-        pp->last_target_index = pp->path_length - 1;
-    }
-
-    if (pp->path_length == 1) {
-        return pp->current_path[0];
-    }
-
-    /*
-     * Step 1:
-     * Find the closest point on nearby path segments.
-     * This prevents the controller from jumping backwards on the path.
-     */
+    /* ── Step 1: advance pursuit_idx to the nearest segment start ────────── */
     float min_dist_sq = 1e30f;
-    waypoint_t closest_point = pp->current_path[pp->last_target_index];
+    uint16_t search_end = tail - 1u;
+    if (search_end > pp->pursuit_idx + 50u) search_end = pp->pursuit_idx + 50u;
 
-    uint16_t search_limit = min_u16(
-        (uint16_t)(pp->path_length - 1),
-        (uint16_t)(pp->last_target_index + 50)
-    );
+    for (uint16_t gi = pp->pursuit_idx; gi < search_end; gi++) {
+        waypoint_t *s = ring_at(pp, gi);
+        waypoint_t *e = ring_at(pp, gi + 1u);
 
-    for (uint16_t i = pp->last_target_index; i < search_limit; ++i) {
-        waypoint_t start = pp->current_path[i];
-        waypoint_t end = pp->current_path[i + 1];
-
-        float dx = end.x - start.x;
-        float dy = end.y - start.y;
-        float len_sq = dx * dx + dy * dy;
-
+        float dx = e->x - s->x, dy = e->y - s->y;
+        float len_sq = dx*dx + dy*dy;
         float t = 0.0f;
         if (len_sq > 1e-6f) {
-            t = ((current_pose->x - start.x) * dx +
-                 (current_pose->y - start.y) * dy) / len_sq;
+            t = ((pose->x - s->x)*dx + (pose->y - s->y)*dy) / len_sq;
         }
-
         t = clampf(t, 0.0f, 1.0f);
 
-        float px = start.x + t * dx;
-        float py = start.y + t * dy;
-
-        float ex = current_pose->x - px;
-        float ey = current_pose->y - py;
-        float d_sq = ex * ex + ey * ey;
-
+        float px = s->x + t*dx, py = s->y + t*dy;
+        float d_sq = dist_sq_2d(pose->x, pose->y, px, py);
         if (d_sq < min_dist_sq) {
-            min_dist_sq = d_sq;
-            closest_point.x = px;
-            closest_point.y = py;
-            closest_point.theta = 0.0f;
-            closest_point.v_target = pp->fixed_speed_mm_s;
-            pp->last_target_index = i;
+            min_dist_sq     = d_sq;
+            pp->pursuit_idx = gi;
         }
     }
 
-    /*
-     * Step 2:
-     * Search for the intersection between the path and the lookahead circle.
-     * Keep the furthest valid intersection along the path.
-     */
-    waypoint_t target_point = closest_point;
+    /* ── Step 2: lookahead circle intersection ───────────────────────────── */
+    waypoint_t target = *ring_at(pp, pp->pursuit_idx);
+    target.v_target = pp->fixed_speed_mm_s;
 
-    for (uint16_t i = pp->last_target_index; i < pp->path_length - 1; ++i) {
-        waypoint_t start = pp->current_path[i];
-        waypoint_t end = pp->current_path[i + 1];
+    for (uint16_t gi = pp->pursuit_idx; gi < tail - 1u; gi++) {
+        waypoint_t *s = ring_at(pp, gi);
+        waypoint_t *e = ring_at(pp, gi + 1u);
 
-        float dx = end.x - start.x;
-        float dy = end.y - start.y;
+        float dx = e->x - s->x, dy = e->y - s->y;
+        float fx = s->x - pose->x, fy = s->y - pose->y;
+        float a  = dx*dx + dy*dy;
+        if (a < 1e-6f) continue;
 
-        float fx = start.x - current_pose->x;
-        float fy = start.y - current_pose->y;
+        float b  = 2.0f*(fx*dx + fy*dy);
+        float c  = fx*fx + fy*fy - (lookahead_mm * lookahead_mm);
+        float disc = b*b - 4.0f*a*c;
+        if (disc < 0.0f) continue;
 
-        float a = dx * dx + dy * dy;
+        disc      = sqrtf(disc);
+        float t1  = (-b - disc) / (2.0f*a);
+        float t2  = (-b + disc) / (2.0f*a);
+        float t   = -1.0f;
+        if (t2 >= 0.0f && t2 <= 1.0f)      t = t2;
+        else if (t1 >= 0.0f && t1 <= 1.0f) t = t1;
+        if (t < 0.0f) continue;
 
-        if (a < 1e-6f) {
-            continue;
-        }
+        waypoint_t cand;
+        cand.x = s->x + t*dx; cand.y = s->y + t*dy;
+        cand.theta = 0.0f; cand.v_target = pp->fixed_speed_mm_s;
 
-        float b = 2.0f * (fx * dx + fy * dy);
-        float c = (fx * fx + fy * fy) - (lookahead_mm * lookahead_mm);
+        /* Reject targets that are far behind the robot. */
+        if (to_robot_frame(pose, cand).y <= -300.0f) continue;
 
-        float discriminant = b * b - 4.0f * a * c;
-
-        if (discriminant >= 0.0f) {
-            discriminant = sqrtf(discriminant);
-
-            float t1 = (-b - discriminant) / (2.0f * a);
-            float t2 = (-b + discriminant) / (2.0f * a);
-
-            if (t2 >= 0.0f && t2 <= 1.0f) {
-                target_point.x = start.x + t2 * dx;
-                target_point.y = start.y + t2 * dy;
-                target_point.theta = 0.0f;
-                target_point.v_target = pp->fixed_speed_mm_s;
-            } else if (t1 >= 0.0f && t1 <= 1.0f) {
-                target_point.x = start.x + t1 * dx;
-                target_point.y = start.y + t1 * dy;
-                target_point.theta = 0.0f;
-                target_point.v_target = pp->fixed_speed_mm_s;
-            }
-        }
+        target = cand;
+        break;
     }
 
-    return target_point;
+    return target;
 }
 
-pp_motion_command_t pp_compute_command(
-    pure_pursuit_controller_t *pp,
-    const pose_t *current_pose
-) {
-    pp_motion_command_t stop_cmd;
-    stop_cmd.speed_mm_s = 0.0f;
-    stop_cmd.steering_deg = 90.0f;
-    stop_cmd.stop = true;
+/* ── Main command ─────────────────────────────────────────────────────────── */
 
-    if (pp == NULL || current_pose == NULL) {
-        return stop_cmd;
+pp_motion_command_t pp_compute_command(pure_pursuit_controller_t *pp,
+                                        const pose_t *pose)
+{
+    pp_motion_command_t stop = { .speed_mm_s = 0.0f, .steering_deg = 90.0f, .stop = true };
+
+    if (!pp || !pose) return stop;
+
+    uint16_t tail = ring_tail(pp);
+
+    /* Ring underrun: no waypoints but more are expected — halt briefly
+     * without sending path_done.  stop=false so the caller does not mistake
+     * this for goal completion. */
+    if (pp->ring_count == 0 && !pp->final_received) {
+        pp_motion_command_t halt = { .speed_mm_s = 0.0f, .steering_deg = 90.0f, .stop = false };
+        return halt;
+    }
+    if (pp->ring_count < 2 && !pp->final_received) {
+        pp_motion_command_t halt = { .speed_mm_s = 0.0f, .steering_deg = 90.0f, .stop = false };
+        return halt;
     }
 
-    if (pp->path_length == 0 || pp_is_path_complete(pp, current_pose)) {
-        if (pp->path_length > 0) {
-            pp->last_target_index = pp->path_length - 1;
+    /* No waypoints and final chunk received: path is truly done. */
+    if (pp->ring_count == 0) return stop;
+
+    /* Goal reached: within tolerance of the last waypoint when all chunks
+     * have arrived and only one waypoint remains.
+     * Also stop if the car has overshot (last wp is now behind the robot) —
+     * prevents the car from driving straight forever past the goal. */
+    if (pp->final_received && pp->ring_count <= 1) {
+        waypoint_t *last = ring_at(pp, tail - 1u);
+        float dsq = dist_sq_2d(pose->x, pose->y, last->x, last->y);
+        if (dsq < pp->goal_tolerance_mm * pp->goal_tolerance_mm) {
+            return stop;
         }
-        return stop_cmd;
+        waypoint_t last_r = to_robot_frame(pose, *last);
+        if (last_r.y < 0.0f) {
+            return stop;  /* overshot: last waypoint is behind the robot */
+        }
     }
 
-    waypoint_t target_global = find_lookahead_point(
-        pp,
-        current_pose,
-        pp->lookahead_mm
-    );
+    waypoint_t target_g = find_lookahead_point(pp, pose, pp->lookahead_mm);
+    waypoint_t target_r = to_robot_frame(pose, target_g);
 
-    waypoint_t target_robot = to_robot_frame(current_pose, target_global);
+    if (target_r.y <= -300.0f) {
+        pp_motion_command_t straight = { pp->fixed_speed_mm_s, 90.0f, false };
+        return straight;
+    }
 
-    /*
-     * Pure Pursuit:
-     * curvature = 2 * lateral_offset / lookahead^2
-     */
-    float curvature = pp->kp *
-        (2.0f * target_robot.x) /
-        (pp->lookahead_mm * pp->lookahead_mm);
+    float ld_sq = target_r.x*target_r.x + target_r.y*target_r.y;
+    if (ld_sq < 1.0f) ld_sq = 1.0f;
 
-    float steering_rad = atanf(curvature * pp->wheelbase_mm);
+    float curvature    = pp->kp * (2.0f * target_r.x) / ld_sq;
+    float steer_rad    = atanf(curvature * pp->wheelbase_mm);
+    steer_rad          = clampf(steer_rad, pp->min_steering_rad, pp->max_steering_rad);
+    float steer_deg    = steer_rad * (180.0f / (float)M_PI) + 90.0f;
+    steer_deg          = clampf(steer_deg, 25.0f, 155.0f);
 
-    steering_rad = clampf(
-        steering_rad,
-        pp->min_steering_rad,
-        pp->max_steering_rad
-    );
+    /* Advance ring_head to free consumed slots. */
+    if (pp->pursuit_idx > pp->ring_head) {
+        uint16_t advance = pp->pursuit_idx - pp->ring_head;
+        if (advance <= pp->ring_count) {
+            pp->ring_head  += advance;
+            pp->ring_count -= advance;
+        }
+    }
 
-    float steering_deg = steering_rad * (180.0f / M_PI) + 90.0f;
-
-    /*
-     * Servo command:
-     * 90 = straight
-     * 60 = max left/right depending on wiring
-     * 120 = max right/left depending on wiring
-     */
-    steering_deg = clampf(steering_deg, 60.0f, 120.0f);
-
-    pp_motion_command_t cmd;
-    cmd.speed_mm_s = pp->fixed_speed_mm_s;
-    cmd.steering_deg = steering_deg;
-    cmd.stop = false;
-
+    pp_motion_command_t cmd = { pp->fixed_speed_mm_s, steer_deg, false };
     return cmd;
 }

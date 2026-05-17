@@ -754,6 +754,7 @@ void wifi_dashboard_init(const char *ssid, const char *password)
     httpd_config_t hcfg = HTTPD_DEFAULT_CONFIG();
     hcfg.lru_purge_enable    = true;
     hcfg.recv_wait_timeout   = 30;   /* seconds; default 5 s is too short for idle WS sessions */
+    hcfg.send_wait_timeout   = 30;   /* seconds; default 5 s fires when TCP blocks during data burst */
     if (httpd_start(&s_server, &hcfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start() failed");
         return;

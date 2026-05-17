@@ -27,8 +27,8 @@
 
 /* Robot geometry */
 #define LP_ROBOT_RADIUS_DEFAULT_MM  120.0f
-#define LP_WHEELBASE_MM             150.0f
-#define LP_MAX_STEER_RAD            0.524f   /* 30° — hard steering limit */
+#define LP_WHEELBASE_MM             260.0f
+#define LP_MAX_STEER_RAD            1.134f   /* 65° — matches real car steering limit */
 #define LP_BASE_SPEED_MM_S          150.0f
 #define LP_REVERSE_SPEED_MM_S        80.0f
 

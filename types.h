@@ -31,10 +31,12 @@ typedef struct {
 
 /** Odometry measurement: linear displacement + IMU yaw rate over dt. */
 typedef struct {
-    float    linear_disp_mm; /**< Forward displacement in mm since last frame */
-    float    yaw_rate_imu;   /**< Yaw rate from IMU in rad/s */
-    float    dt_ms;          /**< Time delta in milliseconds */
-    uint32_t seq;            /**< Monotonic counter — gaps indicate dropped packets */
+    float    linear_disp_mm;    /**< Forward displacement in mm since last frame */
+    float    yaw_rate_imu;      /**< Yaw rate from IMU in rad/s */
+    float    dt_ms;             /**< Time delta in milliseconds */
+    uint32_t seq;               /**< Monotonic counter — gaps indicate dropped packets */
+    uint16_t consumed_wp_idx;   /**< Global path index last consumed by PP (streaming) */
+    uint16_t consumed_path_id;  /**< Path ID that consumed_wp_idx belongs to */
 } odom_t;
 
 /** 2-D car pose with uncertainty. */
@@ -77,6 +79,27 @@ typedef struct {
     uint8_t reserved;    /**< Padding/reserved for alignment */
     waypoint_t waypoints[MAX_SHARED_PATH_POINTS];
 } path_frame_t;
+
+/** Waypoints per path chunk in the streaming protocol. */
+#define PATH_CHUNK_WP_COUNT 8
+
+/**
+ * Streaming path chunk transmitted from ESP32-S3 to Wemos.
+ * ESP32-S3 keeps the full path_t and refills Wemos's ring buffer in 8-wp chunks.
+ * path_id lets Wemos discard stale chunks after a replan.
+ * start_index is the global waypoint index of wp[0] in this chunk.
+ */
+typedef struct {
+    uint16_t   path_id;                     /**< Incremented on every new plan */
+    uint16_t   start_index;                 /**< Global index of first wp in this chunk */
+    uint8_t    count;                       /**< Valid entries in wp[] (1–PATH_CHUNK_WP_COUNT) */
+    bool       final_chunk;                 /**< True if this chunk contains the last waypoint */
+    uint8_t    _pad[2];
+    waypoint_t wp[PATH_CHUNK_WP_COUNT];     /**< Waypoint data */
+} path_chunk_t;
+/* path_chunk_t: 2+2+1+1+2 header + 8×16 waypoints = 136 bytes (no packing). */
+_Static_assert(sizeof(path_chunk_t) == 136u,
+               "path_chunk_t size mismatch — check waypoint_t and padding");
 
 /** Control command transmitted from ESP32-S3 to Wemos D1 R32. */
 typedef struct {

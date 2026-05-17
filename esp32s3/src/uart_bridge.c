@@ -14,11 +14,14 @@
 #define SYNC_A             0xAAu
 #define SYNC_B             0xBBu
 
+/* Wire protocol version: bump when odom_wire_t layout changes so both boards
+ * fail loudly (size mismatch) rather than silently decode garbage. v2: added
+ * consumed_wp_idx + consumed_path_id (6 → 10 bytes). */
 #define MSG_CONTROL        0x01u
 #define MSG_ODOM           0x02u
-#define MSG_PATH           0x03u
 #define MSG_PATH_DONE      0x04u
-#define MSG_PATH_ACK       0x05u
+#define MSG_PATH_CHUNK     0x06u  /* ESP32-S3 → Wemos: streaming chunk       */
+#define MSG_CHUNK_NACK     0x07u  /* Wemos → ESP32-S3: out-of-order signal   */
 
 #define HEADER_LEN         4u
 #define MAX_PAYLOAD_LEN    256u
@@ -92,50 +95,36 @@ bool uart_bridge_send_control(const control_frame_t *frame)
     if (!frame) {
         return false;
     }
-
-    return send_packet(MSG_CONTROL,
-                       frame,
-                       (uint8_t)sizeof(control_frame_t));
+    return send_packet(MSG_CONTROL, frame, (uint8_t)sizeof(control_frame_t));
 }
 
-bool uart_bridge_send_path(const path_frame_t *path_frame)
+bool uart_bridge_send_path_chunk(const path_chunk_t *chunk)
 {
-    if (!path_frame) {
+    if (!chunk || chunk->count == 0 || chunk->count > PATH_CHUNK_WP_COUNT) {
         return false;
     }
-
-    if (path_frame->length == 0 ||
-        path_frame->length > MAX_SHARED_PATH_POINTS) {
-        return false;
-    }
-
-    return send_packet(
-        MSG_PATH,
-        path_frame,
-        (uint8_t)sizeof(path_frame_t)
-    );
+    return send_packet(MSG_PATH_CHUNK, chunk, (uint8_t)sizeof(path_chunk_t));
 }
 
-/* Flag set when Wemos sends MSG_PATH_DONE; cleared by uart_bridge_recv_path_done(). */
-static bool s_path_done = false;
-
-/* Flag set when Wemos sends MSG_PATH_ACK; cleared by uart_bridge_recv_path_ack(). */
-static bool s_path_ack = false;
-
-/* ── Compact odom wire type — must match wemos/src/uart_bridge.c exactly ──── */
+/* ── Compact odom wire format v2 — must match wemos/src/uart_bridge.c exactly ─
+ * v2 adds consumed_wp_idx and consumed_path_id so the streamer can advance.    */
 typedef struct __attribute__((packed)) {
-    int16_t  disp_x16;   /* linear_disp_mm × 16;  0.0625 mm/lsb  */
-    int16_t  yaw_mrad_s; /* yaw_rate_imu × 1000;  1 mrad/s/lsb   */
-    uint8_t  dt_ms;      /* integration window in ms              */
-    uint8_t  seq;        /* low 8 bits of sequence counter        */
-} odom_wire_t;
+    int16_t  disp_x16;          /* linear_disp_mm × 16;  0.0625 mm/lsb  */
+    int16_t  yaw_mrad_s;        /* yaw_rate_imu × 1000;  1 mrad/s/lsb   */
+    uint8_t  dt_ms;             /* integration window in ms              */
+    uint8_t  seq;               /* low 8 bits of sequence counter        */
+    uint16_t consumed_wp_idx;   /* global path index last consumed by PP */
+    uint16_t consumed_path_id;  /* path_id that index belongs to         */
+} odom_wire_t;  /* 10 bytes */
+_Static_assert(sizeof(odom_wire_t) == 10u,
+               "odom_wire_t size mismatch — reflash both boards together");
 
-/* uart_bridge_recv_odom — pop the next MSG_ODOM packet from the UART buffer.
- *
- * Also captures MSG_PATH_DONE and MSG_PATH_ACK packets en-route.
- * Call in a loop to drain all accumulated packets:
- *   while (uart_bridge_recv_odom(&odom)) { integrate(odom); }
- */
+/* Flags set by the receive loop; cleared by the respective query functions. */
+static bool     s_path_done       = false;
+static bool     s_nack_pending    = false;
+static uint16_t s_nack_path_id    = 0;
+static uint16_t s_nack_exp_start  = 0;
+
 bool uart_bridge_recv_odom(odom_t *out)
 {
     if (!out) {
@@ -149,16 +138,12 @@ bool uart_bridge_recv_odom(odom_t *out)
     while (available >= HEADER_LEN + 1) {
         uint8_t byte = 0;
 
-        /* Non-blocking scan for SYNC_A. */
         uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, 0);
         if (byte != SYNC_A) {
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
             continue;
         }
 
-        /* SYNC_A found — give the rest of the packet time to arrive.
-         * At 921600 baud an 11-byte odom packet takes ~120 µs; 2 ms is
-         * plenty of margin without blocking the SLAM loop noticeably. */
         if (uart_read_bytes(BRIDGE_UART_PORT, &byte, 1, pdMS_TO_TICKS(5)) != 1) break;
         if (byte != SYNC_B) {
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
@@ -171,8 +156,9 @@ bool uart_bridge_recv_odom(odom_t *out)
         if (uart_read_bytes(BRIDGE_UART_PORT, &msg_type,    1, pdMS_TO_TICKS(5)) != 1) break;
         if (uart_read_bytes(BRIDGE_UART_PORT, &payload_len, 1, pdMS_TO_TICKS(5)) != 1) break;
 
-        /* Unknown type — skip payload + checksum and keep scanning. */
-        if (msg_type != MSG_ODOM && msg_type != MSG_PATH_DONE && msg_type != MSG_PATH_ACK) {
+        if (msg_type != MSG_ODOM &&
+            msg_type != MSG_PATH_DONE &&
+            msg_type != MSG_CHUNK_NACK) {
             uint8_t skip[MAX_PAYLOAD_LEN + 1u];
             uint8_t skip_len = payload_len + 1u;
             if (skip_len > 0u)
@@ -181,7 +167,6 @@ bool uart_bridge_recv_odom(odom_t *out)
             continue;
         }
 
-        /* Read payload + checksum for both MSG_ODOM and MSG_PATH_DONE. */
         uint8_t payload[MAX_PAYLOAD_LEN];
         uint8_t received_ck = 0;
 
@@ -204,13 +189,21 @@ bool uart_bridge_recv_odom(odom_t *out)
             continue;
         }
 
-        if (msg_type == MSG_PATH_ACK) {
-            s_path_ack = true;
+        if (msg_type == MSG_CHUNK_NACK) {
+            /* 4-byte payload: path_id (2) + expected_start (2) */
+            if (payload_len == 4u) {
+                uint16_t pid, exp;
+                memcpy(&pid, &payload[0], 2);
+                memcpy(&exp, &payload[2], 2);
+                s_nack_pending   = true;
+                s_nack_path_id   = pid;
+                s_nack_exp_start = exp;
+            }
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
             continue;
         }
 
-        /* MSG_ODOM — decode compact wire format back to odom_t. */
+        /* MSG_ODOM */
         if (payload_len != sizeof(odom_wire_t)) {
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
             continue;
@@ -218,10 +211,12 @@ bool uart_bridge_recv_odom(odom_t *out)
 
         odom_wire_t w;
         memcpy(&w, payload, sizeof(odom_wire_t));
-        out->linear_disp_mm = (float)w.disp_x16   / 16.0f;
-        out->yaw_rate_imu   = (float)w.yaw_mrad_s / 1000.0f;
-        out->dt_ms          = (float)w.dt_ms;
-        out->seq            = w.seq;
+        out->linear_disp_mm  = (float)w.disp_x16   / 16.0f;
+        out->yaw_rate_imu    = (float)w.yaw_mrad_s / 1000.0f;
+        out->dt_ms           = (float)w.dt_ms;
+        out->seq             = w.seq;
+        out->consumed_wp_idx  = w.consumed_wp_idx;
+        out->consumed_path_id = w.consumed_path_id;
         return true;
     }
 #endif
@@ -238,10 +233,12 @@ bool uart_bridge_recv_path_done(void)
     return false;
 }
 
-bool uart_bridge_recv_path_ack(void)
+bool uart_bridge_recv_chunk_nack(uint16_t *out_path_id, uint16_t *out_expected_start)
 {
-    if (s_path_ack) {
-        s_path_ack = false;
+    if (s_nack_pending) {
+        if (out_path_id)       *out_path_id       = s_nack_path_id;
+        if (out_expected_start) *out_expected_start = s_nack_exp_start;
+        s_nack_pending = false;
         return true;
     }
     return false;

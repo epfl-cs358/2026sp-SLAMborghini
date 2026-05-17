@@ -55,7 +55,7 @@ static const char *ENC_TAG = "encoder";
  *
  * If the encoder IS on the wheel axle (no gear reduction visible), set 1.0.
  */
-#define GEAR_RATIO          16.0f
+#define GEAR_RATIO          8.0f
 
 #define WHEEL_CIRC_M        ((float)M_PI * WHEEL_DIAMETER_M / GEAR_RATIO)
 

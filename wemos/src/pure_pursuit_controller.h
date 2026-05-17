@@ -4,40 +4,28 @@
 #include <stdbool.h>
 #include "../../types.h"
 
-#define PP_MAX_PATH_LENGTH 15
+/* Ring capacity.  Must be > PATH_CHUNK_WP_COUNT (8) × 2 so there is always
+ * room for one incoming chunk while a full target fill is already buffered. */
+#define PP_RING_CAP 32
 
-/**
- * Pure Pursuit output command.
- *
- * speed_mm_s: target forward speed in mm/s
- * steering_deg: servo command in degrees, where 90 = straight
- * stop: true when no valid path exists or goal is reached
- */
 typedef struct {
     float speed_mm_s;
     float steering_deg;
-    bool stop;
+    bool  stop;
 } pp_motion_command_t;
 
-/**
- * Pure Pursuit controller state.
- *
- * Your project stores positions in mm, so:
- * - waypoints are in mm
- * - pose is in mm
- * - speed is in mm/s
- * - wheelbase and lookahead are also in mm
- */
 typedef struct {
-    waypoint_t current_path[PP_MAX_PATH_LENGTH];
-    uint16_t path_length;
-    uint16_t last_target_index;
+    waypoint_t  ring[PP_RING_CAP];
+    uint16_t    ring_head;      /* global index of oldest slot currently in ring */
+    uint16_t    ring_count;     /* number of valid waypoints in the ring         */
+    uint16_t    path_id;        /* path_id from the last accepted chunk          */
+    bool        final_received; /* true after a chunk with final_chunk=true      */
+    uint16_t    pursuit_idx;    /* global segment-start index (consumed progress)*/
 
     float wheelbase_mm;
     float lookahead_mm;
     float fixed_speed_mm_s;
     float kp;
-
     float min_steering_rad;
     float max_steering_rad;
     float goal_tolerance_mm;
@@ -45,18 +33,30 @@ typedef struct {
 
 void pp_init(pure_pursuit_controller_t *pp);
 
-void pp_set_path(
-    pure_pursuit_controller_t *pp,
-    const waypoint_t *path,
-    uint16_t path_length
-);
+/**
+ * Append one streaming chunk to the ring buffer.
+ *
+ * A new path_id resets the ring to index 0 so the first chunk must have
+ * start_index==0 — any other start_index triggers a NACK.
+ *
+ * Returns true  → chunk accepted.
+ * Returns false → out-of-order; call pp_get_expected_start_idx() and send a
+ *                 NACK to ESP32-S3.
+ */
+bool pp_append_chunk(pure_pursuit_controller_t *pp, const path_chunk_t *chunk);
 
-pp_motion_command_t pp_compute_command(
-    pure_pursuit_controller_t *pp,
-    const pose_t *current_pose
-);
+/* Global waypoint index of the segment we are currently pursuing.
+ * Copy into odom_t.consumed_wp_idx every tick. */
+uint16_t pp_get_consumed_idx(const pure_pursuit_controller_t *pp);
 
-bool pp_is_path_complete(
-    const pure_pursuit_controller_t *pp,
-    const pose_t *current_pose
-);
+uint16_t pp_get_path_id(const pure_pursuit_controller_t *pp);
+
+/* Next global index we need from ESP32-S3 (= ring_head + ring_count).
+ * Use this value in a NACK payload when pp_append_chunk returns false. */
+uint16_t pp_get_expected_start_idx(const pure_pursuit_controller_t *pp);
+
+/* True if the ring has at least one waypoint to pursue. */
+bool pp_has_path(const pure_pursuit_controller_t *pp);
+
+pp_motion_command_t pp_compute_command(pure_pursuit_controller_t *pp,
+                                        const pose_t *current_pose);

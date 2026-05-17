@@ -311,6 +311,10 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
     s_bfs[tail++] = (cell_t){ (int16_t)rx, (int16_t)ry };
     bit_set(s_vis, rx, ry);
 
+    /* Nearest "behind" frontier kept as fallback — used only when no
+     * forward-facing frontier is reachable (e.g. robot against a wall). */
+    int fallback_tix = -1, fallback_tiy = -1, fallback_cnt = 0;
+
     while (head != tail) {
         cell_t c = s_bfs[head];
         head = (head + 1) % BFS_QUEUE_CAP;
@@ -331,13 +335,30 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
                 /* Nudge target away from walls if needed */
                 safety_spiral(map, &tix, &tiy, res, mw, mh);
 
-                result.items[0].cx   = cx_mm(tix, res);
-                result.items[0].cy   = cy_mm(tiy, res);
-                result.items[0].size = (uint8_t)(cnt > 255 ? 255 : cnt);
-                result.count = 1;
-                return result;   /* BFS stops here — nearest valid cluster by
-                                    BFS order is already the closest reachable
-                                    frontier; no need to scan the full map.    */
+                /* Only accept frontiers in the robot's forward half-plane.
+                 * dot(robot→frontier, heading) ≥ 0 means within ±90° of
+                 * the current heading — no reversing required to reach it.
+                 * BFS order guarantees this is the nearest such frontier. */
+                float fdx = cx_mm(tix, res) - cx_mm(rx, res);
+                float fdy = cy_mm(tiy, res) - cy_mm(ry, res);
+                bool ahead = (fdx * cosf(robot_pose->theta) +
+                              fdy * sinf(robot_pose->theta) >= 0.0f);
+
+                if (ahead) {
+                    result.items[0].cx   = cx_mm(tix, res);
+                    result.items[0].cy   = cy_mm(tiy, res);
+                    result.items[0].size = (uint8_t)(cnt > 255 ? 255 : cnt);
+                    result.count = 1;
+                    return result;   /* Nearest "ahead" frontier — done. */
+                }
+
+                /* Behind the robot — save the nearest one as fallback,
+                 * then continue BFS searching for an "ahead" cluster. */
+                if (fallback_tix < 0) {
+                    fallback_tix = tix;
+                    fallback_tiy = tiy;
+                    fallback_cnt = cnt;
+                }
             }
         }
 
@@ -359,6 +380,14 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
         }
     }
 
+    /* No "ahead" frontier reachable — use the nearest "behind" frontier so
+     * exploration doesn't deadlock (e.g. robot pushed into a corner). */
+    if (fallback_tix >= 0) {
+        result.items[0].cx   = cx_mm(fallback_tix, res);
+        result.items[0].cy   = cy_mm(fallback_tiy, res);
+        result.items[0].size = (uint8_t)(fallback_cnt > 255 ? 255 : fallback_cnt);
+        result.count = 1;
+    }
     return result;
 }
 

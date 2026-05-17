@@ -82,6 +82,9 @@
 #include "src/scan_matcher.h"
 #include "src/wifi_dashboard.h"
 #include "src/uart_bridge.h"
+#include "src/path_streamer.h"
+#include "src/frontier_detector.h"
+#include "src/hybrid_astar.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -131,6 +134,31 @@ static volatile uint32_t s_sm_calls   = 0;   /* total scan_match() invocations *
 static volatile uint32_t s_sm_valid   = 0;   /* corrections accepted */
 static volatile uint32_t s_sm_us_tot  = 0;   /* cumulative time in scan_match() */
 static volatile uint32_t s_sm_us_max  = 0;   /* worst-case scan_match() time */
+
+/* ── Planner / executor shared state ─────────────────────────────────────── */
+
+/* Task handles for xTaskNotify IPC: planner↔exec ping-pong. */
+static TaskHandle_t s_h_planner = NULL;
+static TaskHandle_t s_h_exec    = NULL;
+
+/* Guards s_map during lidar writes (lidar_to_map + qt_compact) and planner
+ * reads (frontier_detect + hybrid_astar_plan).  Never held for more than one
+ * scan cycle or one A* run (~15–200 ms). */
+static SemaphoreHandle_t s_map_mutex  = NULL;
+
+/* Guards s_planned_path + s_active_frontier between planner and exec. */
+static SemaphoreHandle_t s_path_mutex = NULL;
+
+/* Latest A* result — written by task_planner, read by task_path_exec. */
+static path_t     s_planned_path;
+static frontier_t s_active_frontier;
+
+/* Current frontier target for the dashboard overlay.
+ * Single-writer (task_planner), single-reader (task_lidar_slam) — 32-bit
+ * aligned floats are atomic on Xtensa; bool byte writes are also atomic. */
+static volatile float s_target_fx  = 0.0f;
+static volatile float s_target_fy  = 0.0f;
+static volatile bool  s_has_target = false;
 
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -233,14 +261,22 @@ static void task_lidar_slam(void *arg)
         }
 
         /* ── 4. Ray-march scan into quadtree map ────────────────────────── *
-         * Uses the scan-matched pose for map integration.                    */
+         * Uses the scan-matched pose for map integration.                    *
+         * s_map_mutex blocks concurrent planner reads (frontier + A*).       */
         map_dirty_rect_t dirty;
+        xSemaphoreTake(s_map_mutex, portMAX_DELAY);
         int64_t t0 = esp_timer_get_time();
         lidar_to_map(&s_map, &scan, &matched_pose,
                      LIDAR_PROCESS_RANGE_MM,
                      80.0f,
                      &dirty);
         uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t0);
+
+        bool     do_compact     = s_map.count > (uint16_t)(QT_POOL_SIZE * 85 / 100);
+        uint16_t before_compact = s_map.count;
+        if (do_compact) qt_compact(&s_map, 10);
+        uint16_t after_compact  = s_map.count;
+        xSemaphoreGive(s_map_mutex);
 
         s_l2m_calls++;
         s_l2m_us_tot += elapsed;
@@ -252,12 +288,10 @@ static void task_lidar_slam(void *arg)
          * scan matcher and dashboard retain full wall knowledge.
          * Headroom: re-inserting N cells uses ≤ N×7 nodes, so triggering
          * at 85% (3400/4000) leaves ≥ 600 nodes of margin. */
-        if (s_map.count > (uint16_t)(QT_POOL_SIZE * 85 / 100)) {
-            uint16_t before = s_map.count;
-            qt_compact(&s_map, 10);
+        if (do_compact) {
             printf("[MAP] compact  before=%u  after=%u  freed=%u nodes\n",
-                   (unsigned)before, (unsigned)s_map.count,
-                   (unsigned)(before - s_map.count));
+                   (unsigned)before_compact, (unsigned)after_compact,
+                   (unsigned)(before_compact - after_compact));
             /* Force dashboard to resample the full map after compaction */
             map_dirty_rect_t full_dirty = {
                 .valid = true,
@@ -280,7 +314,7 @@ static void task_lidar_slam(void *arg)
         }
 
         wifi_dashboard_broadcast_raw_pose(&raw_pose);
-        wifi_dashboard_broadcast_state(&matched_pose, 0.0f, 0.0f, false, 0);
+        wifi_dashboard_broadcast_state(&matched_pose, s_target_fx, s_target_fy, s_has_target, 0);
 
         /* ── 5. Yield — gives httpd CPU to flush TCP ACKs ────────────────── */
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -311,10 +345,41 @@ static void task_perf_mon(void *arg)
                (unsigned long)free_now,  (unsigned long)free_min,
                (unsigned long)largest,   (unsigned long)frag_pct);
 
-        printf("[PERF] stacks  lidar=%lu B  odom=%lu B  perf=%lu B\n",
-               (unsigned long)(uxTaskGetStackHighWaterMark(s_h_lidar) * sizeof(StackType_t)),
-               (unsigned long)(uxTaskGetStackHighWaterMark(s_h_odom)  * sizeof(StackType_t)),
-               (unsigned long)(uxTaskGetStackHighWaterMark(s_h_perf)  * sizeof(StackType_t)));
+        UBaseType_t stk_lidar   = uxTaskGetStackHighWaterMark(s_h_lidar);
+        UBaseType_t stk_odom    = uxTaskGetStackHighWaterMark(s_h_odom);
+        UBaseType_t stk_perf    = uxTaskGetStackHighWaterMark(s_h_perf);
+        UBaseType_t stk_planner = s_h_planner ? uxTaskGetStackHighWaterMark(s_h_planner) : 0;
+        UBaseType_t stk_exec    = s_h_exec    ? uxTaskGetStackHighWaterMark(s_h_exec)    : 0;
+
+        printf("[PERF] stacks  lidar=%lu B  odom=%lu B  perf=%lu B"
+               "  planner=%lu B  exec=%lu B\n",
+               (unsigned long)(stk_lidar   * sizeof(StackType_t)),
+               (unsigned long)(stk_odom    * sizeof(StackType_t)),
+               (unsigned long)(stk_perf    * sizeof(StackType_t)),
+               (unsigned long)(stk_planner * sizeof(StackType_t)),
+               (unsigned long)(stk_exec    * sizeof(StackType_t)));
+
+        /* Dashboard health summary every 10 s */
+        {
+            char buf[120];
+            snprintf(buf, sizeof(buf),
+                     "[PERF] heap=%luB min=%luB  map=%u nodes  streamer=%s pid=%u  q=%u",
+                     (unsigned long)free_now, (unsigned long)free_min,
+                     (unsigned)s_map.count,
+                     path_streamer_is_active() ? "ACTIVE" : "idle",
+                     (unsigned)path_streamer_current_path_id(),
+                     (unsigned)wifi_dashboard_queue_depth());
+            wifi_dashboard_log(buf);
+            printf("%s\n", buf);
+
+            snprintf(buf, sizeof(buf),
+                     "[PERF] stacks  plan=%luB exec=%luB lidar=%luB odom=%luB",
+                     (unsigned long)(stk_planner * sizeof(StackType_t)),
+                     (unsigned long)(stk_exec    * sizeof(StackType_t)),
+                     (unsigned long)(stk_lidar   * sizeof(StackType_t)),
+                     (unsigned long)(stk_odom    * sizeof(StackType_t)));
+            wifi_dashboard_log(buf);
+        }
 
         uint32_t now_ok  = s_scans_ok,  now_bad = s_scans_bad;
         uint32_t now_l2m = s_l2m_calls, now_us  = s_l2m_us_tot;
@@ -433,22 +498,20 @@ static void task_odom(void *arg)
             s_pose.x        += ds * cosf(theta_mid);
             s_pose.y        += ds * sinf(theta_mid);
             s_pose.theta     = _wrap_angle(s_pose.theta + dtheta);
-            float log_x      = s_pose.x;
-            float log_y      = s_pose.y;
-            float log_theta  = s_pose.theta;
             xSemaphoreGive(s_pose_mutex);
 
-            printf("[ODOM-PKT] seq=%3u  enc=% 7.2f mm  yaw_rate=% 6.3f rad/s"
-                   "  dt=%4.1f ms  →  ds=% 6.2f mm  dθ=% 6.3f rad"
-                   "  pose=(%.0f, %.0f, %.1f°)\n",
-                   (unsigned)(odom.seq & 0xFFu),
-                   (double)odom.linear_disp_mm,
-                   (double)odom.yaw_rate_imu,
-                   (double)odom.dt_ms,
-                   (double)ds,
-                   (double)dtheta,
-                   (double)log_x, (double)log_y,
-                   (double)(log_theta * 180.0f / (float)M_PI));
+            /* Feed consumed-waypoint progress back to the path streamer so it
+             * can top up the Wemos ring buffer proactively. */
+            path_streamer_update(odom.consumed_wp_idx, odom.consumed_path_id);
+
+        }
+
+        /* ── Handle chunk NACKs from Wemos ─────────────────────────────── */
+        {
+            uint16_t nack_pid, nack_exp;
+            if (uart_bridge_recv_chunk_nack(&nack_pid, &nack_exp)) {
+                path_streamer_handle_nack(nack_pid, nack_exp);
+            }
         }
 
         /* ── 1 Hz pose summary ──────────────────────────────────────────── */
@@ -491,85 +554,278 @@ static void task_odom(void *arg)
 
 
 /* ════════════════════════════════════════════════════════════════════════════
- * task_path_runner  —  any core, priority 3
+ * task_planner  —  Core 1, priority 3, stack 6 KB
  *
- * Defines a hardcoded L-shaped path relative to the robot's pose at startup:
- *   WP0  current position          (start)
- *   WP1  +2000 mm forward          (end of straight)
- *   WP2  +2000 mm left from WP1   (final goal)
- *
- * Sends the path once to the Wemos (which executes it via task_pure_pursuit)
- * and re-broadcasts it to the dashboard every 2 s so any late WebSocket
- * connection sees the reference path immediately.
- *
- * Terminates itself after the Wemos signals path_done.
+ * Autonomous frontier-based exploration loop:
+ *   1. Wait 3 s for WiFi + map warmup, then wait for Start button.
+ *   2. Snapshot pose → run frontier detection + A* under s_map_mutex.
+ *   3. Publish path to s_planned_path + notify task_path_exec (value 0).
+ *   4. Wait for exec reply: value 0 = replan, value 1 = stop.
+ *   5. If no frontiers found 5× in a row: declare exploration complete,
+ *      notify exec with value 1, self-delete.
  * ════════════════════════════════════════════════════════════════════════════ */
-static void task_path_runner(void *arg)
+static void task_planner(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    wifi_dashboard_log("[PLAN] ready — waiting for Start");
+    printf("[PLAN] waiting for Start button\n");
+    for (;;) {
+        if (wifi_dashboard_exploration_requested()) break;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    wifi_dashboard_log("[PLAN] Start pressed — exploring");
+    printf("[PLAN] Start pressed — beginning frontier exploration\n");
+
+    int no_frontier_streak = 0;
+    int plan_cycle = 0;
+
+    for (;;) {
+        plan_cycle++;
+
+        /* Snapshot pose */
+        pose_t pose;
+        xSemaphoreTake(s_pose_mutex, portMAX_DELAY);
+        pose = s_pose;
+        xSemaphoreGive(s_pose_mutex);
+
+        /* Frontier detection under map mutex */
+        xSemaphoreTake(s_map_mutex, portMAX_DELAY);
+        uint16_t map_nodes = s_map.count;
+        frontier_list_t flist = frontier_detector_detect(&s_map, &pose);
+        xSemaphoreGive(s_map_mutex);
+
+        {
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     "[PLAN] #%d  pose=(%.0f,%.0f,%.0f°)  map=%u nodes  frontiers=%u",
+                     plan_cycle,
+                     (double)pose.x, (double)pose.y,
+                     (double)(pose.theta * 180.0f / (float)M_PI),
+                     (unsigned)map_nodes, (unsigned)flist.count);
+            wifi_dashboard_log(buf);
+            printf("%s\n", buf);
+        }
+
+        if (flist.count == 0) {
+            no_frontier_streak++;
+            char buf[72];
+            if (no_frontier_streak >= 5) {
+                wifi_dashboard_log("[PLAN] exploration complete — no frontiers after 5 retries");
+                printf("[PLAN] exploration complete\n");
+                s_has_target = false;
+                xTaskNotify(s_h_exec, 1u, eSetValueWithOverwrite);
+                vTaskDelete(NULL);
+                return;
+            }
+            snprintf(buf, sizeof(buf),
+                     "[PLAN] no frontier (streak=%d/5) — retry in 2 s", no_frontier_streak);
+            wifi_dashboard_log(buf);
+            printf("%s\n", buf);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        no_frontier_streak = 0;
+
+        frontier_t goal = frontier_detector_best(&flist, &pose);
+
+        {
+            char buf[80];
+            snprintf(buf, sizeof(buf),
+                     "[PLAN] best frontier (%.0f,%.0f) sz=%u — running A*",
+                     (double)goal.cx, (double)goal.cy, (unsigned)goal.size);
+            wifi_dashboard_log(buf);
+            printf("%s\n", buf);
+        }
+
+        /* A* under map mutex */
+        int64_t t_astar = esp_timer_get_time();
+        xSemaphoreTake(s_map_mutex, portMAX_DELAY);
+        path_t new_path = hybrid_astar_plan(&s_map, &pose, &goal);
+        xSemaphoreGive(s_map_mutex);
+        int64_t astar_us = esp_timer_get_time() - t_astar;
+
+        if (!hybrid_astar_is_valid(&new_path)) {
+            char buf[80];
+            snprintf(buf, sizeof(buf),
+                     "[PLAN] A* FAILED for (%.0f,%.0f) in %lld ms — retry in 2 s",
+                     (double)goal.cx, (double)goal.cy, (long long)(astar_us / 1000));
+            wifi_dashboard_log(buf);
+            printf("%s\n", buf);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        {
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     "[PLAN] A* OK  %u wps in %lld ms  start=(%.0f,%.0f) goal=(%.0f,%.0f)",
+                     (unsigned)new_path.length, (long long)(astar_us / 1000),
+                     (double)pose.x, (double)pose.y,
+                     (double)goal.cx, (double)goal.cy);
+            wifi_dashboard_log(buf);
+            printf("%s\n", buf);
+        }
+
+        /* Publish path + frontier to exec */
+        xSemaphoreTake(s_path_mutex, portMAX_DELAY);
+        s_planned_path    = new_path;
+        s_active_frontier = goal;
+        xSemaphoreGive(s_path_mutex);
+
+        /* Update dashboard target (volatile, Xtensa 32-bit stores are atomic) */
+        s_target_fx  = goal.cx;
+        s_target_fy  = goal.cy;
+        s_has_target = true;
+
+        /* Signal exec: new path available */
+        xTaskNotify(s_h_exec, 0u, eSetValueWithOverwrite);
+        wifi_dashboard_log("[PLAN] path sent to exec — waiting for done");
+
+        /* Wait for exec reply: 0 = replan, 1 = stop.
+         * Poll every 1 s so Stop button is never stale for more than 1 s. */
+        for (;;) {
+            uint32_t notif = 0;
+            if (xTaskNotifyWait(0u, UINT32_MAX, &notif, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                if (notif == 1u) {
+                    wifi_dashboard_log("[PLAN] stop — shutting down");
+                    printf("[PLAN] stop signal — shutting down\n");
+                    s_has_target = false;
+                    vTaskDelete(NULL);
+                    return;
+                }
+                wifi_dashboard_log("[PLAN] path done — replanning");
+                printf("[PLAN] path done — replanning\n");
+                break; /* notif == 0: path done, go replan */
+            }
+            /* timeout — check stop button directly in case exec is gone */
+            if (wifi_dashboard_stop_requested()) {
+                wifi_dashboard_log("[PLAN] Stop detected — shutting down");
+                printf("[PLAN] Stop detected in planner poll — shutting down\n");
+                s_has_target = false;
+                vTaskDelete(NULL);
+                return;
+            }
+        }
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * task_path_exec  —  any core, priority 3, stack 3 KB
+ *
+ * Receives planned paths from task_planner via xTaskNotify and oversees
+ * streaming execution:
+ *   - value 0: new path available → stream to Wemos, wait for path_done
+ *   - value 1: stop/done → clear streamer, broadcast empty path, self-delete
+ *
+ * On path completion, notifies planner (value 0 = replan).
+ * On Stop button, notifies planner (value 1 = stop) then self-deletes.
+ * ════════════════════════════════════════════════════════════════════════════ */
+static void task_path_exec(void *arg)
 {
     (void)arg;
 
-    /* Wait for WiFi to associate and the first few scans to arrive so the
-     * dashboard has a map to render before the path overlay appears. */
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    wifi_dashboard_log("[EXEC] started — waiting for first path");
 
-    /* Snapshot the current scan-matched pose as the path origin. */
-    xSemaphoreTake(s_pose_mutex, portMAX_DELAY);
-    float sx  = s_pose.x;
-    float sy  = s_pose.y;
-    float sth = s_pose.theta;
-    xSemaphoreGive(s_pose_mutex);
-
-    const float cos_th = cosf(sth);
-    const float sin_th = sinf(sth);
-
-    /* L-path in world mm:
-     *   forward direction  = (cos_th,  sin_th)
-     *   left    direction  = (-sin_th, cos_th)   (θ + 90°) */
-    path_frame_t path;
-    path.length     = 3;
-    path.reserved   = 0;
-    path.waypoints[0] = (waypoint_t){
-        .x = sx, .y = sy,
-        .theta = sth, .v_target = 200.0f
-    };
-    path.waypoints[1] = (waypoint_t){
-        .x = sx + 2000.0f * cos_th,
-        .y = sy + 2000.0f * sin_th,
-        .theta = sth, .v_target = 200.0f
-    };
-    path.waypoints[2] = (waypoint_t){
-        .x = sx + 2000.0f * cos_th - 2000.0f * sin_th,
-        .y = sy + 2000.0f * sin_th + 2000.0f * cos_th,
-        .theta = sth + (float)M_PI / 2.0f, .v_target = 0.0f
-    };
-
-    uart_bridge_send_path(&path);
-    printf("[PATH] L-path sent:"
-           "  (%.0f,%.0f) → (%.0f,%.0f) → (%.0f,%.0f)"
-           "  heading=%.1f°\n",
-           (double)path.waypoints[0].x, (double)path.waypoints[0].y,
-           (double)path.waypoints[1].x, (double)path.waypoints[1].y,
-           (double)path.waypoints[2].x, (double)path.waypoints[2].y,
-           (double)(sth * 180.0f / (float)M_PI));
-
-    /* Re-send reference path to dashboard every 2 s until the robot is done.
-     * Handles late WebSocket connections: the browser always sees the path
-     * overlay regardless of when it opened the dashboard page. */
     for (;;) {
-        wifi_dashboard_broadcast_path(&path);
-
-        if (uart_bridge_recv_path_done()) {
-            printf("[PATH] complete — robot reached goal\n");
-            /* Clear the path overlay on the dashboard. */
-            path_frame_t empty = { .length = 0, .reserved = 0 };
-            wifi_dashboard_broadcast_path(&empty);
-            break;
+        /* Wait for planner signal; wake every 500 ms to check Stop button */
+        uint32_t notif = 0;
+        if (xTaskNotifyWait(0u, UINT32_MAX, &notif, pdMS_TO_TICKS(500)) == pdFALSE) {
+            if (wifi_dashboard_stop_requested()) {
+                wifi_dashboard_log("[EXEC] Stop while idle — clearing");
+                printf("[EXEC] Stop pressed while idle\n");
+                path_streamer_clear();
+                path_frame_t empty = { .length = 0, .reserved = 0 };
+                wifi_dashboard_broadcast_path(&empty);
+                s_has_target = false;
+                xTaskNotify(s_h_planner, 1u, eSetValueWithOverwrite);
+                vTaskDelete(NULL);
+                return;
+            }
+            continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
+        if (notif == 1u) {
+            /* Planner says exploration is complete or aborted */
+            path_streamer_clear();
+            path_frame_t empty = { .length = 0, .reserved = 0 };
+            wifi_dashboard_broadcast_path(&empty);
+            wifi_dashboard_log("[EXEC] exploration done — stopped");
+            printf("[EXEC] exploration done — stopping\n");
+            vTaskDelete(NULL);
+            return;
+        }
 
-    vTaskDelete(NULL);
+        /* Copy path + frontier from shared state */
+        path_t     local_path;
+        xSemaphoreTake(s_path_mutex, portMAX_DELAY);
+        local_path = s_planned_path;
+        xSemaphoreGive(s_path_mutex);
+
+        /* Start streaming to Wemos (path_streamer_set_path copies internally) */
+        path_streamer_set_path(&local_path);
+
+        {
+            char buf[72];
+            snprintf(buf, sizeof(buf),
+                     "[EXEC] streaming %u wps  path_id=%u",
+                     (unsigned)local_path.length,
+                     (unsigned)path_streamer_current_path_id());
+            wifi_dashboard_log(buf);
+            printf("%s\n", buf);
+        }
+
+        /* Build dashboard path_frame_t (capped at MAX_SHARED_PATH_POINTS) */
+        path_frame_t dash;
+        dash.reserved = 0;
+        uint8_t n = (local_path.length < MAX_SHARED_PATH_POINTS)
+                    ? local_path.length : MAX_SHARED_PATH_POINTS;
+        dash.length = n;
+        for (uint8_t i = 0; i < n; i++) dash.waypoints[i] = local_path.waypoints[i];
+
+        /* Execution loop: broadcast path overlay, watch for completion/stop */
+        uint32_t exec_ticks = 0;
+        for (;;) {
+            wifi_dashboard_broadcast_path(&dash);
+            exec_ticks++;
+
+            /* Log streamer progress every 5 s */
+            if (exec_ticks % 10u == 0u) {
+                char buf[80];
+                snprintf(buf, sizeof(buf),
+                         "[EXEC] waiting  streamer_active=%d  pid=%u  q=%u",
+                         (int)path_streamer_is_active(),
+                         (unsigned)path_streamer_current_path_id(),
+                         (unsigned)wifi_dashboard_queue_depth());
+                wifi_dashboard_log(buf);
+                printf("%s\n", buf);
+            }
+
+            if (wifi_dashboard_stop_requested()) {
+                wifi_dashboard_log("[EXEC] Stop pressed — clearing path");
+                printf("[EXEC] Stop pressed — clearing path\n");
+                path_streamer_clear();
+                path_frame_t empty = { .length = 0, .reserved = 0 };
+                wifi_dashboard_broadcast_path(&empty);
+                s_has_target = false;
+                xTaskNotify(s_h_planner, 1u, eSetValueWithOverwrite);
+                vTaskDelete(NULL);
+                return;
+            }
+
+            if (uart_bridge_recv_path_done()) {
+                wifi_dashboard_log("[EXEC] Wemos sent path_done — replanning");
+                printf("[EXEC] path done — requesting replan\n");
+                path_streamer_clear();
+                xTaskNotify(s_h_planner, 0u, eSetValueWithOverwrite);
+                break;  /* outer loop: wait for next path from planner */
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
 }
 
 
@@ -585,20 +841,26 @@ void app_main(void)
      * passed for API compatibility but ignored by the compat wrapper. */
     quadtree_map_init(&s_map, 10000.0f, 10000.0f, 156.0f);
 
-    /* Robot starts at map centre facing +X.  task_odom updates this from here. */
-    s_pose = (pose_t){ .x = 5000.0f, .y = 5000.0f, .theta = 0.0f };
+    /* Robot starts at map bottom-centre facing north (+Y). */
+    s_pose = (pose_t){ .x = 5000.0f, .y = 500.0f, .theta = (float)(M_PI / 2.0) };
 
     s_pose_mutex = xSemaphoreCreateMutex();
+    s_map_mutex  = xSemaphoreCreateMutex();
+    s_path_mutex = xSemaphoreCreateMutex();
     configASSERT(s_pose_mutex);
+    configASSERT(s_map_mutex);
+    configASSERT(s_path_mutex);
 
     /* WiFi + httpd + _dash_task.  Must be called after quadtree_map_init. */
     wifi_dashboard_init(WIFI_SSID, WIFI_PASSWORD);
 
     /* UART bridge to Wemos: receives encoder + IMU odometry packets. */
     uart_bridge_init();
+    path_streamer_init();
 
-    xTaskCreatePinnedToCore(task_lidar_slam, "lscan",    6144, NULL, 7, &s_h_lidar, 0);
+    xTaskCreatePinnedToCore(task_lidar_slam, "lscan",    6144, NULL, 7, &s_h_lidar,    0);
     xTaskCreate(             task_odom,      "odom",     3072, NULL, 6, &s_h_odom);
     xTaskCreate(             task_perf_mon,  "perf_mon", 3072, NULL, 1, &s_h_perf);
-    xTaskCreate(             task_path_runner,"path_run", 3072, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(task_planner,    "planner",  6144, NULL, 3, &s_h_planner,  1);
+    xTaskCreate(             task_path_exec, "path_exec", 5120, NULL, 3, &s_h_exec);
 }
