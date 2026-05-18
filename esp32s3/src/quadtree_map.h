@@ -37,9 +37,13 @@
 #endif
 #define QT_NULL 0 // no child index 
 
-// Log-odds increments 
-#define QT_HIT_INC 30   // obstacle confirmed → value rises  (5:1 vs miss keeps narrow obstacles stable)
-#define QT_MISS_DEC (-6)  // ray passed through → value drops
+// Log-odds increments
+// HIT:MISS ratio of 15:1 — walls resist erosion from stray free-space sweeps.
+// One HIT (+30) needs 15 MISS passes to erase, vs. 5 at the old -6 value.
+// Free-space detection is unaffected: corridor cells receive hundreds of beams
+// per scan, so even -2 saturates to QT_VALUE_MIN within one scan cycle.
+#define QT_HIT_INC 30   // obstacle confirmed → value rises
+#define QT_MISS_DEC (-2)  // ray passed through → value drops
 #define QT_VALUE_MAX 40
 #define QT_VALUE_MIN (-40)
 
@@ -52,8 +56,8 @@ typedef struct {
 
 
 typedef struct {
-    QTNode *pool; // heap-allocated array (from 0 to QT_POOL_SIZE)
-    uint16_t count; // next free slot 
+    QTNode *pool; /* static BSS on device; heap on host (tests only) */
+    uint16_t count; /* next free slot */
     float x_min, x_max;
     float y_min, y_max;
 } QuadTreeMap;

@@ -60,7 +60,14 @@
 #define ROBOT_CLEAR_CELLS  2    /* Chebyshev clearance radius in grid cells  */
 
 /* ── Tuning constants ────────────────────────────────────────────────────── */
-#define MIN_CLUSTER_SIZE   3    /* discard clusters with fewer cells (noise) */
+#define MIN_CLUSTER_SIZE    5    /* discard clusters with fewer free cells (was 3) */
+#define MIN_ADJACENT_UNK    4    /* min unknown cells touching the cluster —
+                                  * hole artifacts typically have 1-2; real walls
+                                  * have many more. Rejects isolated map holes.  */
+#define CLEARANCE_RADIUS    3    /* Chebyshev radius (cells) for open-space check */
+#define MIN_CLEARANCE_CELLS 12   /* min free cells in the (2R+1)²=49 box around
+                                  * the target — 12/49≈25% keeps 2-cell corridors
+                                  * (≥14 free) while rejecting 1-cell tunnels (7) */
 #define BFS_QUEUE_CAP   2048    /* WFD BFS ring-buffer capacity              */
 #define CLUSTER_CAP      128    /* max cells collected per frontier cluster  */
 #define SPIRAL_STEPS       8    /* safety spiral max search radius — must be */
@@ -201,6 +208,48 @@ static void safety_spiral(const quadtree_map_t *m, int *ix, int *iy,
     /* No safe cell within spiral range — keep original (better than nothing) */
 }
 
+/* ═══════════════════════ count_adjacent_unknown ════════════════════════════
+ * Count unknown cells that are 4-connected neighbours of the cluster in s_cbuf.
+ * Used to reject map-artifact holes: a real frontier wall has many adjacent
+ * unknown cells; an isolated hole artifact has only 1-2.
+ * May double-count cells shared by adjacent cluster members — that's fine,
+ * since we only need the count to be above a threshold, not exact.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static int count_adjacent_unknown(const quadtree_map_t *m, int cnt,
+                                   float res, int mw, int mh)
+{
+    int total = 0;
+    for (int i = 0; i < cnt; i++) {
+        for (int k = 0; k < 4; k++) {
+            int nx = s_cbuf[i].ix + K4X[k];
+            int ny = s_cbuf[i].iy + K4Y[k];
+            if (!in_bounds(nx, ny, mw, mh)) continue;
+            if (cell_is_unknown(m, cx_mm(nx, res), cy_mm(ny, res))) total++;
+        }
+    }
+    return total;
+}
+
+/* ═══════════════════════ count_free_in_radius ══════════════════════════════
+ * Count free cells within a Chebyshev radius of (ix, iy).
+ * Used as an open-space quality score: high count = large navigable area
+ * around the target; low count = tight corner or narrow dead-end.
+ * ══════════════════════════════════════════════════════════════════════════ */
+static int count_free_in_radius(const quadtree_map_t *m, int ix, int iy,
+                                 int radius, float res, int mw, int mh)
+{
+    int count = 0;
+    for (int dy = -radius; dy <= radius; dy++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            int nx = ix + dx;
+            int ny = iy + dy;
+            if (!in_bounds(nx, ny, mw, mh)) continue;
+            if (cell_is_free(m, cx_mm(nx, res), cy_mm(ny, res))) count++;
+        }
+    }
+    return count;
+}
+
 /* ═══════════════════════ cluster_frontier ═════════════════════════════════
  * 4-connected flood-fill from seed (sx, sy) over cells that pass is_frontier.
  * Stores visited cells in s_cbuf[] and marks them in s_clu[].
@@ -311,56 +360,60 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
     s_bfs[tail++] = (cell_t){ (int16_t)rx, (int16_t)ry };
     bit_set(s_vis, rx, ry);
 
-    /* Nearest "behind" frontier kept as fallback — used only when no
-     * forward-facing frontier is reachable (e.g. robot against a wall). */
-    int fallback_tix = -1, fallback_tiy = -1, fallback_cnt = 0;
+    /* "Behind" fallback: used only when no forward-facing frontier passes all
+     * filters (e.g. robot pushed into a corner with only unknown behind it). */
+    int fallback_tix = -1, fallback_tiy = -1, fallback_clr = 0;
 
     while (head != tail) {
         cell_t c = s_bfs[head];
         head = (head + 1) % BFS_QUEUE_CAP;
 
         /* ── Frontier check ─────────────────────────────────────────── */
-        /* If this free cell borders unknown space AND hasn't been
-         * absorbed into a cluster yet, grow a cluster from it. */
         if (is_frontier(map, c.ix, c.iy, res, mw, mh) &&
             !bit_get(s_clu, c.ix, c.iy))
         {
             int cnt = cluster_frontier(map, c.ix, c.iy, res, mw, mh);
 
-            if (cnt >= MIN_CLUSTER_SIZE) {
-                /* Find the cluster cell nearest to the centroid */
-                int tix, tiy;
-                nearest_to_centroid(cnt, &tix, &tiy);
+            /* Filter 1: cluster size — discard scan noise */
+            if (cnt < MIN_CLUSTER_SIZE) goto next_bfs;
 
-                /* Nudge target away from walls if needed */
-                safety_spiral(map, &tix, &tiy, res, mw, mh);
+            /* Filter 2: hole rejection — real frontiers border many unknown
+             * cells; isolated map artifacts (flickering holes) border only 1-2. */
+            if (count_adjacent_unknown(map, cnt, res, mw, mh) < MIN_ADJACENT_UNK)
+                goto next_bfs;
 
-                /* Only accept frontiers in the robot's forward half-plane.
-                 * dot(robot→frontier, heading) ≥ 0 means within ±90° of
-                 * the current heading — no reversing required to reach it.
-                 * BFS order guarantees this is the nearest such frontier. */
-                float fdx = cx_mm(tix, res) - cx_mm(rx, res);
-                float fdy = cy_mm(tiy, res) - cy_mm(ry, res);
-                bool ahead = (fdx * cosf(robot_pose->theta) +
-                              fdy * sinf(robot_pose->theta) >= 0.0f);
+            int tix, tiy;
+            nearest_to_centroid(cnt, &tix, &tiy);
+            safety_spiral(map, &tix, &tiy, res, mw, mh);
 
-                if (ahead) {
-                    result.items[0].cx   = cx_mm(tix, res);
-                    result.items[0].cy   = cy_mm(tiy, res);
-                    result.items[0].size = (uint8_t)(cnt > 255 ? 255 : cnt);
-                    result.count = 1;
-                    return result;   /* Nearest "ahead" frontier — done. */
+            /* Filter 3: open-space clearance — reject tight spots the robot
+             * cannot comfortably navigate (1-cell tunnels, blind corners).
+             * The clearance count also serves as the ranking score in
+             * frontier_detector_best: more free space = higher priority. */
+            int clr = count_free_in_radius(map, tix, tiy,
+                                            CLEARANCE_RADIUS, res, mw, mh);
+            if (clr < MIN_CLEARANCE_CELLS) goto next_bfs;
+
+            /* Filter 4: forward half-plane — prefer no reversing. */
+            float fdx = cx_mm(tix, res) - cx_mm(rx, res);
+            float fdy = cy_mm(tiy, res) - cy_mm(ry, res);
+            bool ahead = (fdx * cosf(robot_pose->theta) +
+                          fdy * sinf(robot_pose->theta) >= 0.0f);
+
+            if (ahead) {
+                if (result.count < 32) {
+                    result.items[result.count].cx   = cx_mm(tix, res);
+                    result.items[result.count].cy   = cy_mm(tiy, res);
+                    result.items[result.count].size = (uint8_t)(clr > 255 ? 255 : clr);
+                    result.count++;
                 }
-
-                /* Behind the robot — save the nearest one as fallback,
-                 * then continue BFS searching for an "ahead" cluster. */
-                if (fallback_tix < 0) {
-                    fallback_tix = tix;
-                    fallback_tiy = tiy;
-                    fallback_cnt = cnt;
-                }
+            } else if (fallback_tix < 0) {
+                fallback_tix = tix;
+                fallback_tiy = tiy;
+                fallback_clr = clr;
             }
         }
+        next_bfs:;
 
         /* ── BFS expansion ──────────────────────────────────────────── */
         /* Expand only through free cells (frontier cells are free too,
@@ -380,12 +433,12 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
         }
     }
 
-    /* No "ahead" frontier reachable — use the nearest "behind" frontier so
-     * exploration doesn't deadlock (e.g. robot pushed into a corner). */
-    if (fallback_tix >= 0) {
+    /* No "ahead" frontier passed all filters — fall back to the nearest
+     * behind-robot frontier so exploration doesn't deadlock. */
+    if (result.count == 0 && fallback_tix >= 0) {
         result.items[0].cx   = cx_mm(fallback_tix, res);
         result.items[0].cy   = cy_mm(fallback_tiy, res);
-        result.items[0].size = (uint8_t)(fallback_cnt > 255 ? 255 : fallback_cnt);
+        result.items[0].size = (uint8_t)(fallback_clr > 255 ? 255 : fallback_clr);
         result.count = 1;
     }
     return result;
@@ -394,12 +447,14 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
 /* ══════════════════════════════════════════════════════════════════════════
  * frontier_detector_best
  *
- * Score: U(f) = size / distance_to_robot   (Gain / Cost utility function)
- *   - size     approximates information gain (more cells = more unknown exposed)
- *   - distance approximates travel cost
+ * Score: U(f) = clearance / distance_to_robot
+ *   - clearance  free cells within CLEARANCE_RADIUS of the target — higher
+ *                means more open navigable space (stored in frontier_t.size)
+ *   - distance   travel cost approximation
  *
- * Returns the highest-scoring frontier, or a zero-initialised struct if
- * the list is empty (caller must check result.size > 0 before using).
+ * Prefers frontiers with large open space nearby that are not too far away.
+ * Holes and tight spots are already filtered in frontier_detector_detect,
+ * so every candidate here is a legitimate, safely reachable target.
  * ══════════════════════════════════════════════════════════════════════════ */
 frontier_t frontier_detector_best(const frontier_list_t *list,
                                    const pose_t *robot_pose)

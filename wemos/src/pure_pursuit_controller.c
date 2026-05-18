@@ -221,10 +221,14 @@ pp_motion_command_t pp_compute_command(pure_pursuit_controller_t *pp,
     if (pp->ring_count == 0) return stop;
 
     /* Goal reached: within tolerance of the last waypoint when all chunks
-     * have arrived and only one waypoint remains.
+     * have arrived and only the last segment (≤2 waypoints) remains.
+     * ring_count cannot drop below 2 in steady-state because pursuit_idx
+     * is always set to a segment START (gi < tail-1), capping ring_head
+     * advancement at tail-2.  Checking <= 2 lets the overshot/tolerance
+     * test fire on the final segment instead of never triggering.
      * Also stop if the car has overshot (last wp is now behind the robot) —
      * prevents the car from driving straight forever past the goal. */
-    if (pp->final_received && pp->ring_count <= 1) {
+    if (pp->final_received && pp->ring_count <= 2) {
         waypoint_t *last = ring_at(pp, tail - 1u);
         float dsq = dist_sq_2d(pose->x, pose->y, last->x, last->y);
         if (dsq < pp->goal_tolerance_mm * pp->goal_tolerance_mm) {

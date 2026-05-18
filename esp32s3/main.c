@@ -38,9 +38,8 @@
  *
  *   WHERE    WHAT                           SIZE        HOW ALLOCATED
  *   ───────  ─────────────────────────────  ──────────  ──────────────────────
- *   BSS      s_map  (header only)           24 B        global static
- *   HEAP     s_map.pool  (quadtree nodes)   14.4 KB     quadtree_map_init()
- *            1200 nodes × 12 B/node
+ *   BSS      s_map  (header + node pool)    48 KB       global static
+ *            4000 nodes × 12 B/node â no heap allocation
  *
  *   BSS      s_scan  (lidar_scan_t)         5.4 KB      static local in task
  *            460 points × 12 B/point + 12 B header
@@ -101,7 +100,7 @@
  * Shared state
  * ════════════════════════════════════════════════════════════════════════════ */
 
-/* Map header in BSS; node pool allocated on heap by quadtree_map_init(). */
+/* Map header and node pool both in static BSS (see qt_init); no heap allocation. */
 static quadtree_map_t s_map;
 
 /* Robot pose in the fixed world frame (mm, rad).
@@ -581,6 +580,11 @@ static void task_planner(void *arg)
     int no_frontier_streak = 0;
     int plan_cycle = 0;
 
+    /* Frontiers where A* failed are blacklisted until a path succeeds.
+     * Prevents the planner from hammering the same unreachable frontier forever. */
+    frontier_t bl[8];
+    int        bl_n = 0;
+
     for (;;) {
         plan_cycle++;
 
@@ -628,12 +632,29 @@ static void task_planner(void *arg)
         }
         no_frontier_streak = 0;
 
-        frontier_t goal = frontier_detector_best(&flist, &pose);
+        /* Build a filtered copy of the frontier list, skipping blacklisted entries.
+         * Falls back to the unfiltered list if all frontiers were blacklisted. */
+        frontier_t goal;
+        {
+            frontier_list_t avail = flist;
+            for (int i = 0; i < (int)avail.count; ) {
+                bool bad = false;
+                for (int j = 0; j < bl_n; j++) {
+                    float dx = avail.items[i].cx - bl[j].cx;
+                    float dy = avail.items[i].cy - bl[j].cy;
+                    if (dx*dx + dy*dy < 200.0f*200.0f) { bad = true; break; }
+                }
+                if (bad) avail.items[i] = avail.items[--avail.count];
+                else     i++;
+            }
+            const frontier_list_t *src = (avail.count > 0) ? &avail : &flist;
+            goal = frontier_detector_best(src, &pose);
+        }
 
         {
             char buf[80];
             snprintf(buf, sizeof(buf),
-                     "[PLAN] best frontier (%.0f,%.0f) sz=%u — running A*",
+                     "[PLAN] best frontier (%.0f,%.0f) clearance=%u — running A*",
                      (double)goal.cx, (double)goal.cy, (unsigned)goal.size);
             wifi_dashboard_log(buf);
             printf("%s\n", buf);
@@ -647,10 +668,14 @@ static void task_planner(void *arg)
         int64_t astar_us = esp_timer_get_time() - t_astar;
 
         if (!hybrid_astar_is_valid(&new_path)) {
-            char buf[80];
+            /* Blacklist this frontier so the next cycle tries a different one */
+            if (bl_n < (int)(sizeof(bl)/sizeof(bl[0])))
+                bl[bl_n++] = goal;
+            char buf[96];
             snprintf(buf, sizeof(buf),
-                     "[PLAN] A* FAILED for (%.0f,%.0f) in %lld ms — retry in 2 s",
-                     (double)goal.cx, (double)goal.cy, (long long)(astar_us / 1000));
+                     "[PLAN] A* FAILED for (%.0f,%.0f) in %lld ms — blacklisted (%d), retry",
+                     (double)goal.cx, (double)goal.cy,
+                     (long long)(astar_us / 1000), bl_n);
             wifi_dashboard_log(buf);
             printf("%s\n", buf);
             vTaskDelay(pdMS_TO_TICKS(2000));
@@ -667,6 +692,9 @@ static void task_planner(void *arg)
             wifi_dashboard_log(buf);
             printf("%s\n", buf);
         }
+
+        /* Path found — clear blacklist so frontiers get a fresh chance next cycle */
+        bl_n = 0;
 
         /* Publish path + frontier to exec */
         xSemaphoreTake(s_path_mutex, portMAX_DELAY);
@@ -858,9 +886,9 @@ void app_main(void)
     uart_bridge_init();
     path_streamer_init();
 
-    xTaskCreatePinnedToCore(task_lidar_slam, "lscan",    6144, NULL, 7, &s_h_lidar,    0);
-    xTaskCreate(             task_odom,      "odom",     3072, NULL, 6, &s_h_odom);
-    xTaskCreate(             task_perf_mon,  "perf_mon", 3072, NULL, 1, &s_h_perf);
-    xTaskCreatePinnedToCore(task_planner,    "planner",  6144, NULL, 3, &s_h_planner,  1);
-    xTaskCreate(             task_path_exec, "path_exec", 5120, NULL, 3, &s_h_exec);
+    xTaskCreatePinnedToCore(task_lidar_slam, "lscan",     6144, NULL, 7, &s_h_lidar,   0);
+    xTaskCreatePinnedToCore(task_odom,      "odom",      3072, NULL, 6, &s_h_odom,    0);
+    xTaskCreatePinnedToCore(task_perf_mon,  "perf_mon",  3072, NULL, 1, &s_h_perf,    1);
+    xTaskCreatePinnedToCore(task_planner,   "planner",   6144, NULL, 3, &s_h_planner, 1);
+    xTaskCreatePinnedToCore(task_path_exec, "path_exec", 5120, NULL, 3, &s_h_exec,    1);
 }

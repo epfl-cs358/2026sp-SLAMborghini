@@ -24,7 +24,7 @@
 #define MSG_CHUNK_NACK     0x07u  /* Wemos → ESP32-S3: out-of-order signal   */
 
 #define HEADER_LEN         4u
-#define MAX_PAYLOAD_LEN    256u
+#define MAX_PAYLOAD_LEN    255u
 
 static uint8_t checksum_xor(const uint8_t *data, uint8_t len)
 {

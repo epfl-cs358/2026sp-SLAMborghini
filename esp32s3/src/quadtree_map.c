@@ -74,35 +74,40 @@ static uint16_t _alloc(QuadTreeMap *map, uint8_t depth)
 }
 
 
+/* Static BSS pool — moves 48 KB off the heap so the quadtree is never a
+ * source of heap fragmentation.  One instance only; the device always has
+ * exactly one map (s_map in main.c).  Host test builds keep the heap path
+ * so tests that instantiate multiple maps (truth + slam) still work. */
+#if defined(ESP_PLATFORM)
+static QTNode s_qt_pool[QT_POOL_SIZE];
+#endif
+
 void qt_init(QuadTreeMap *map,
              float x_min, float x_max,
              float y_min, float y_max)
 {
-    /* Allocate from heap after WiFi has already claimed DMA DRAM.
-     * Regular malloc on ESP32 falls back to D/IRAM (125 KB) when DMA DRAM
-     * is exhausted — keeping WiFi's DMA region intact. */
-    map->pool = (QTNode *)calloc(QT_POOL_SIZE, sizeof(QTNode));
-    if (!map->pool) {
 #if defined(ESP_PLATFORM)
-        ESP_LOGE(TAG_QT, "calloc(%u nodes) failed — map disabled", (unsigned)QT_POOL_SIZE);
+    memset(s_qt_pool, 0, sizeof(s_qt_pool));
+    map->pool = s_qt_pool;
+#else
+    map->pool = (QTNode *)calloc(QT_POOL_SIZE, sizeof(QTNode));
+    if (!map->pool) return;
 #endif
-        return;
-    }
-    map->count = 1; // slot 0 is reserved as QT_NULL
 
+    map->count = 1; /* slot 0 reserved as QT_NULL */
     map->x_min = x_min;
     map->x_max = x_max;
     map->y_min = y_min;
     map->y_max = y_max;
-
-    // allocate root node = index 1
-    _alloc(map, 1);
+    _alloc(map, 1); /* root at index 1 */
 }
 
 void qt_free(QuadTreeMap *map)
 {
     if (!map) return;
+#if !defined(ESP_PLATFORM)
     free(map->pool);
+#endif
     map->pool  = NULL;
     map->count = 0;
 }

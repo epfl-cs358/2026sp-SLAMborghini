@@ -113,7 +113,9 @@ typedef struct {
 typedef struct {
     float   cx;   /**< Centroid X in mm */
     float   cy;   /**< Centroid Y in mm */
-    uint8_t size; /**< Frontier size (number of cells) */
+    uint8_t size; /**< Open-space clearance score: free cells within
+                   *   CLEARANCE_RADIUS of the target (0-49 range).
+                   *   Higher = more navigable space around the target. */
 } frontier_t;
 
 /** List of detected exploration frontiers. */

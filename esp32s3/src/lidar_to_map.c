@@ -91,10 +91,20 @@ IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
         float prev_r = s_delta_valid ? s_delta_ref[bucket] : -1.0f;
         s_delta_ref[bucket] = r;
         if (s_delta_valid) {
-            bool same_no_return = (r == 0.0f && prev_r == 0.0f);
-            bool same_range     = (r > 0.0f && prev_r > 0.0f
-                                   && fabsf(r - prev_r) < LIDAR_DELTA_MM);
-            if (same_no_return || same_range) continue;
+            bool same_range = (r > 0.0f && prev_r > 0.0f
+                               && fabsf(r - prev_r) < LIDAR_DELTA_MM);
+            if (same_range) {
+                /* Reinforce stable obstacle cell against no-return MISS erosion.
+                 * Skip the MISS march (free space hasn't changed) but still apply
+                 * HIT so the cell stays at max value rather than drifting to unknown. */
+                float rad2 = -theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
+                float c2 = cosf(rad2), s2 = sinf(rad2);
+                float ex2 = x0 + (c2 * cos_t - s2 * sin_t) * r;
+                float ey2 = y0 + (c2 * sin_t + s2 * cos_t) * r;
+                if (_valid(ex2) && _valid(ey2))
+                    qt_update(map, ex2, ey2, QT_HIT_INC);
+                continue;
+            }
         }
 
         float rad     = -theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
@@ -134,8 +144,12 @@ IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
             if (ey > out_dirty->y_max) out_dirty->y_max = ey;
         }
 
+        /* Uniform gentle miss for all beams (−1 vs HIT +30 = 30:1 ratio).
+         * Using QT_MISS_DEC (−2) for finite-range beams gave a 15:1 ratio that
+         * was insufficient: N adjacent no-return beams erode boundary obstacle
+         * cells faster than the direct-beam HIT can reinforce them. */
         for (float t = step_mm; t < march_to - LIDAR_ENDPOINT_GUARD_MM; t += step_mm)
-            qt_update(map, x0 + ux * t, y0 + uy * t, QT_MISS_DEC);
+            qt_update(map, x0 + ux * t, y0 + uy * t, (int8_t)(-1));
 
         if (has_obstacle)
             qt_update(map, ex, ey, QT_HIT_INC);
@@ -219,10 +233,20 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
         s_delta_ref[bucket] = r;   /* update reference regardless of skip */
 
         if (s_delta_valid) {
-            bool same_no_return = (r == 0.0f && prev_r == 0.0f);
-            bool same_range     = (r > 0.0f && prev_r > 0.0f
-                                   && fabsf(r - prev_r) < LIDAR_DELTA_MM);
-            if (same_no_return || same_range) continue;
+            bool same_range = (r > 0.0f && prev_r > 0.0f
+                               && fabsf(r - prev_r) < LIDAR_DELTA_MM);
+            if (same_range) {
+                /* Reinforce stable obstacle cell against no-return MISS erosion.
+                 * Skip the MISS march (free space unchanged) but still apply HIT
+                 * so the cell stays at max value rather than drifting to unknown. */
+                float rad2 = -theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
+                float c2 = cosf(rad2), s2 = sinf(rad2);
+                float ex2 = sx + (c2 * cos_t - s2 * sin_t) * r;
+                float ey2 = sy + (c2 * sin_t + s2 * cos_t) * r;
+                if (_valid(ex2) && _valid(ey2))
+                    qt_update(map, ex2, ey2, QT_HIT_INC);
+                continue;
+            }
         }
 
         float rad     = -theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
@@ -260,9 +284,9 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
             if (ey > out_dirty->y_max) out_dirty->y_max = ey;
         }
 
-        qt_update(map, sx, sy, QT_MISS_DEC);
+        qt_update(map, sx, sy, (int8_t)(-1));
         for (float t = step_mm; t < march_to - LIDAR_ENDPOINT_GUARD_MM; t += step_mm)
-            qt_update(map, sx + ux * t, sy + uy * t, QT_MISS_DEC);
+            qt_update(map, sx + ux * t, sy + uy * t, (int8_t)(-1));
         if (has_obstacle)
             qt_update(map, ex, ey, QT_HIT_INC);
     }

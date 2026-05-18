@@ -46,7 +46,7 @@ static const char *TAG = "hybrid_astar";
 
 #define DEFAULT_TARGET_SPEED_MM_S       200.0f
 
-#define MAX_HYBRID_NODES                512
+#define MAX_HYBRID_NODES                1024
 #define MAX_PATH_WAYPOINTS              HYBRID_ASTAR_MAX_WAYPOINTS
 #define MAX_QT_FREE_LEAVES              256
 

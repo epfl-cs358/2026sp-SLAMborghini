@@ -21,7 +21,7 @@
  *   • Quadtree broadcast removed: s_qt_frame (48 KB) eliminated.
  *   • Single dash_task owns all send buffers → no mutex on frame data.
  *   • Separate static buffer per message type (safe for async send).
- *   • Scan downsampled to 90 points (was 180).
+ *   • Scan: all 460 points forwarded (no downsample).
  *   • Static RAM: ~88 KB → ~12 KB.
  *
  * Binary message protocol (browser-compatible, unchanged):
@@ -74,8 +74,8 @@ static const char *TAG = "wifi_dash";
                                            * larger frames triggered TCP backpressure → 3-strike WS
                                            * close → scan display froze after first update) */
 
-/* ── Scan downsample cap ─────────────────────────────────────────────────── */
-#define SCAN_MAX_PTS 90u
+/* ── Scan point cap — full scan, no downsample ───────────────────────────── */
+#define SCAN_MAX_PTS 460u
 
 /* ── Static send buffers — owned exclusively by dash_task ───────────────────
  *
@@ -84,7 +84,7 @@ static const char *TAG = "wifi_dash";
  *                  delta (3 + 839*3 = 2520 B) → switch to full map.
  *                  Both paths fit in MAP_BUF_SIZE = 2517.
  * Pose frame:      1+4+4+4+4+4+1+2           =   24 bytes
- * Scan frame:      1+2+90*4                  =  363 bytes
+ * Scan frame:      1+2+460*4                 = 1843 bytes
  * Log ring:        5 slots × 80 bytes        =  400 bytes
  * ─────────────────────────────────────────────────────────────────────────── */
 #define MAP_BUF_SIZE  2517u
