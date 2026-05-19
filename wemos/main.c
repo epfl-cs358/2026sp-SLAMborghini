@@ -137,6 +137,7 @@ static void task_pure_pursuit(void *pvParameters)
     uint32_t odom_seq        = 0;
     bool     path_active     = false;
     int64_t  override_last_us = 0;   /* timestamp of last valid LP override */
+    control_frame_t last_override = {0};
 #define OVERRIDE_TIMEOUT_US 300000LL /* revert to PP if no override for 300 ms */
 
     for (;;) {
@@ -218,13 +219,16 @@ static void task_pure_pursuit(void *pvParameters)
 
         control_frame_t lp_override;
         bool have_override = uart_bridge_recv_control_override(&lp_override);
-        if (have_override)
+        if (have_override) {
+            last_override = lp_override;
             override_last_us = now_us;
+        }
 
         bool override_active = have_override ||
                                (now_us - override_last_us < OVERRIDE_TIMEOUT_US);
 
-        if (override_active && have_override) {
+        if (override_active) {
+            lp_override = last_override;
             /* Apply local-planner command.
              * t_speed == 0 → full stop (LP_MODE_STOPPED / footprint occupied).
              * |heading_err| > 90° means the planner wants to reverse (ESCAPE). */

@@ -238,6 +238,8 @@ static void task_lidar_slam(void *arg)
             s_pose.x     += sm.dx_mm;
             s_pose.y     += sm.dy_mm;
             s_pose.theta += sm.dtheta_rad;
+            while (s_pose.theta >  (float)M_PI) s_pose.theta -= 2.0f * (float)M_PI;
+            while (s_pose.theta < -(float)M_PI) s_pose.theta += 2.0f * (float)M_PI;
             xSemaphoreGive(s_pose_mutex);
 
             printf("[SM] corr  odom=(%.0f,%.0f,%.1f°)  matched=(%.0f,%.0f,%.1f°)"
@@ -683,10 +685,10 @@ static void task_planner(void *arg)
                 return;
             }
             snprintf(buf, sizeof(buf),
-                     "[PLAN] no frontier (streak=%d/5) — retry in 2 s", no_frontier_streak);
+                     "[PLAN] no frontier (streak=%d/5) — retry in 1 s", no_frontier_streak);
             wifi_dashboard_log(buf);
             printf("%s\n", buf);
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
         no_frontier_streak = 0;
@@ -708,10 +710,10 @@ static void task_planner(void *arg)
                 else     i++;
             }
             if (avail.count == 0) {
-                wifi_dashboard_log("[PLAN] all frontiers blacklisted — waiting 3 s for map update");
-                printf("[PLAN] all frontiers blacklisted — waiting 3 s\n");
+                wifi_dashboard_log("[PLAN] all frontiers blacklisted — waiting 1.5 s for map update");
+                printf("[PLAN] all frontiers blacklisted — waiting 1.5 s\n");
                 bl_n = 0; /* reset blacklist so next cycle tries fresh */
-                vTaskDelay(pdMS_TO_TICKS(3000));
+                vTaskDelay(pdMS_TO_TICKS(1500));
                 continue;
             }
             goal = frontier_detector_best(&avail, &pose);
@@ -744,7 +746,7 @@ static void task_planner(void *arg)
                      (long long)(astar_us / 1000), bl_n);
             wifi_dashboard_log(buf);
             printf("%s\n", buf);
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
@@ -852,6 +854,7 @@ static void task_path_exec(void *arg)
             return;
         }
 
+start_new_path: ;
         /* Copy path + frontier from shared state */
         path_t     local_path;
         xSemaphoreTake(s_path_mutex, portMAX_DELAY);
@@ -910,6 +913,26 @@ static void task_path_exec(void *arg)
                 return;
             }
 
+            /* A local-planner replan can make task_planner publish a fresh path
+             * while exec is still waiting on the old one. Consume that signal
+             * here so the old streamer is replaced immediately. */
+            uint32_t exec_notif = 0;
+            if (xTaskNotifyWait(0u, UINT32_MAX, &exec_notif, 0) == pdTRUE) {
+                path_streamer_clear();
+                if (exec_notif == 1u) {
+                    path_frame_t empty = { .length = 0, .reserved = 0 };
+                    wifi_dashboard_broadcast_path(&empty);
+                    wifi_dashboard_log("[EXEC] stop while executing — clearing");
+                    printf("[EXEC] stop while executing\n");
+                    s_has_target = false;
+                    vTaskDelete(NULL);
+                    return;
+                }
+                wifi_dashboard_log("[EXEC] new path arrived — replacing active stream");
+                printf("[EXEC] new path arrived — replacing active stream\n");
+                goto start_new_path;
+            }
+
             if (uart_bridge_recv_path_done()) {
                 wifi_dashboard_log("[EXEC] Wemos sent path_done — replanning");
                 printf("[EXEC] path done — requesting replan\n");
@@ -918,7 +941,7 @@ static void task_path_exec(void *arg)
                 break;  /* outer loop: wait for next path from planner */
             }
 
-            vTaskDelay(pdMS_TO_TICKS(500));
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 }
