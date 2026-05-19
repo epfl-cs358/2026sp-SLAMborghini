@@ -22,4 +22,11 @@ bool uart_bridge_send_path_done(void);
  * global index we need so ESP32-S3 can rewind and resend. */
 bool uart_bridge_send_chunk_nack(uint16_t path_id, uint16_t expected_start);
 
+/* Receive a local-planner override command from ESP32-S3.
+ * Returns true (once per packet) when a valid control_frame_t is available.
+ * The override is sent only in REACTIVE / ESCAPE / STOPPED modes; callers
+ * should check esp_timer_get_time() against a 300 ms timeout and revert to
+ * normal path following when no fresh override arrives. */
+bool uart_bridge_recv_control_override(control_frame_t *out);
+
 #endif /* UART_BRIDGE_H */

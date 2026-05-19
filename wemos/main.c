@@ -53,9 +53,11 @@ static const char *TAG = "wemos_main";
 #define SERVO_PWM_RES       LEDC_TIMER_16_BIT
 #define SERVO_CH            LEDC_CHANNEL_0
 #define SERVO_DUTY_CENTER   4700u     /* measured true straight */
-#define SERVO_DUTY_LEFT     3500u     /* ~65° left  — matches PP steering limit */
-#define SERVO_DUTY_RIGHT    5900u     /* ~65° right — matches PP steering limit */
 #define SERVO_STEER_GAIN    1042.0f   /* LEDC counts per radian */
+#define SERVO_MAX_STEER_RAD 1.134f    /* 65° — physical steering limit */
+/* Derived from center ± (max_steer_rad × gain): 4700 ± (1.134 × 1042) ≈ 4700 ± 1182 */
+#define SERVO_DUTY_LEFT     (SERVO_DUTY_CENTER - (uint32_t)(SERVO_MAX_STEER_RAD * SERVO_STEER_GAIN))
+#define SERVO_DUTY_RIGHT    (SERVO_DUTY_CENTER + (uint32_t)(SERVO_MAX_STEER_RAD * SERVO_STEER_GAIN))
 
 /* ── PP loop rate ─────────────────────────────────────────────────────────── */
 #define PP_PERIOD_MS    50u   /* 20 Hz */
@@ -66,10 +68,18 @@ static const char *TAG = "wemos_main";
 
 static void motor_set(float speed_mm_s)
 {
-    uint32_t duty = (speed_mm_s > 0.0f) ? (uint32_t)MOTOR_DUTY_FWD : 0u;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_FWD, duty);
+    if (speed_mm_s > 0.0f) {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_FWD, (uint32_t)MOTOR_DUTY_FWD);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BWD, 0u);
+    } else if (speed_mm_s < -10.0f) {
+        /* Reverse: drive CH_BWD; CH_FWD must be zero to avoid H-bridge shoot-through. */
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_FWD, 0u);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BWD, (uint32_t)MOTOR_DUTY_FWD);
+    } else {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_FWD, 0u);
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BWD, 0u);
+    }
     ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_FWD);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, CH_BWD, 0u);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, CH_BWD);
 }
 
@@ -121,11 +131,13 @@ static void task_pure_pursuit(void *pvParameters)
     pure_pursuit_controller_t pp;
     pp_init(&pp);
 
-    float    prev_dist_m  = imu_encoder_driver_get_distance_m();
-    float    prev_heading = imu_encoder_driver_get_yaw_rad();
-    int64_t  prev_us      = esp_timer_get_time();
-    uint32_t odom_seq     = 0;
-    bool     path_active  = false;
+    float    prev_dist_m     = imu_encoder_driver_get_distance_m();
+    float    prev_heading    = imu_encoder_driver_get_yaw_rad();
+    int64_t  prev_us         = esp_timer_get_time();
+    uint32_t odom_seq        = 0;
+    bool     path_active     = false;
+    int64_t  override_last_us = 0;   /* timestamp of last valid LP override */
+#define OVERRIDE_TIMEOUT_US 300000LL /* revert to PP if no override for 300 ms */
 
     for (;;) {
         int64_t now_us = esp_timer_get_time();
@@ -199,8 +211,49 @@ static void task_pure_pursuit(void *pvParameters)
         /* ── 3. PP command ──────────────────────────────────────────────── */
         pp_motion_command_t cmd = pp_compute_command(&pp, &front_pose);
 
-        /* ── 4. Actuate ─────────────────────────────────────────────────── */
-        if (path_active && cmd.stop) {
+        /* ── 4. Actuate ─────────────────────────────────────────────────── *
+         * Local-planner overrides from ESP32-S3 take priority over PP when  *
+         * an obstacle is detected.  The override expires after 300 ms so     *
+         * that a UART dropout reverts to normal path following automatically. */
+
+        control_frame_t lp_override;
+        bool have_override = uart_bridge_recv_control_override(&lp_override);
+        if (have_override)
+            override_last_us = now_us;
+
+        bool override_active = have_override ||
+                               (now_us - override_last_us < OVERRIDE_TIMEOUT_US);
+
+        if (override_active && have_override) {
+            /* Apply local-planner command.
+             * t_speed == 0 → full stop (LP_MODE_STOPPED / footprint occupied).
+             * |heading_err| > 90° means the planner wants to reverse (ESCAPE). */
+            if (lp_override.t_speed <= 0.0f) {
+                motor_set(0.0f);
+                servo_set_deg(90.0f);
+                task_odometry_set_steering_rad(0.0f);
+            } else {
+                float heading_err = wrap_rad(lp_override.t_heading - pose.theta);
+                bool  is_reverse  = (heading_err >  (float)(M_PI / 2.0) ||
+                                     heading_err < -(float)(M_PI / 2.0));
+                float steer_rad;
+                if (is_reverse) {
+                    /* Reverse: mirror heading error so rear of car points toward target. */
+                    steer_rad = wrap_rad(heading_err - (float)M_PI);
+                    if (steer_rad >  SERVO_MAX_STEER_RAD) steer_rad =  SERVO_MAX_STEER_RAD;
+                    if (steer_rad < -SERVO_MAX_STEER_RAD) steer_rad = -SERVO_MAX_STEER_RAD;
+                    motor_set(-lp_override.t_speed);
+                } else {
+                    steer_rad = heading_err;
+                    if (steer_rad >  SERVO_MAX_STEER_RAD) steer_rad =  SERVO_MAX_STEER_RAD;
+                    if (steer_rad < -SERVO_MAX_STEER_RAD) steer_rad = -SERVO_MAX_STEER_RAD;
+                    motor_set(lp_override.t_speed);
+                }
+                float steer_deg = 90.0f + steer_rad * (180.0f / (float)M_PI);
+                servo_set_deg(steer_deg);
+                task_odometry_set_steering_rad(steer_rad);
+            }
+        } else if (!override_active && path_active && cmd.stop) {
             motor_set(0.0f);
             servo_set_deg(90.0f);
             task_odometry_set_steering_rad(0.0f);
@@ -209,7 +262,7 @@ static void task_pure_pursuit(void *pvParameters)
             ESP_LOGI(TAG, "path complete  pose=(%.0f mm, %.0f mm, %.1f°)",
                      (double)pose.x, (double)pose.y,
                      (double)(pose.theta * 180.0f / (float)M_PI));
-        } else if (path_active && !cmd.stop) {
+        } else if (!override_active && path_active && !cmd.stop) {
             float steer_rad = (cmd.steering_deg - 90.0f) * ((float)M_PI / 180.0f);
             servo_set_deg(cmd.steering_deg);
             motor_set(cmd.speed_mm_s);

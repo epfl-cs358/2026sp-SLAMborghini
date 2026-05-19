@@ -55,11 +55,15 @@ static const char *TAG = "hybrid_astar";
 #endif
 
 #ifndef PLANNER_MAX_STEER_RAD
-#define PLANNER_MAX_STEER_RAD           1.134f
+#define PLANNER_MAX_STEER_RAD           1.134f  /* 65° — physical steering limit */
 #endif
 
 #ifndef PLANNER_ROBOT_RADIUS_MM
-#define PLANNER_ROBOT_RADIUS_MM         90.0f
+/* Half-width of car (295/2 = 147.5 mm) rounded up — the relevant lateral
+ * clearance for forward-moving paths.  The full half-diagonal (246 mm) is
+ * only needed for pure rotation and would make A* reject the start position
+ * when the car is within 246 mm of any mapped wall. */
+#define PLANNER_ROBOT_RADIUS_MM         150.0f
 #endif
 
 #ifndef HYBRID_XY_RESOLUTION_MM

@@ -84,6 +84,8 @@
 #include "src/path_streamer.h"
 #include "src/frontier_detector.h"
 #include "src/hybrid_astar.h"
+#include "src/local_planner.h"
+#include "src/obstacle_classifier.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -298,6 +300,63 @@ static void task_lidar_slam(void *arg)
                 .x_max = s_map.x_max, .y_max = s_map.y_max,
             };
             wifi_dashboard_mark_dirty(&full_dirty);
+        }
+
+        /* ── 4a. Classify LiDAR points for semantic labels ──────────────── *
+         * Convert polar scan to robot-local Cartesian, then cluster-label   *
+         * points as WALL / OBSTACLE / UNKNOWN.  The local planner uses the  *
+         * quadtree map directly; classification is available for the         *
+         * dashboard and future per-class map weighting.                      */
+        {
+            static point2f_t          s_cart[460];
+            static classified_point_t s_classified[460];
+            uint16_t cart_n = 0, class_n = 0;
+
+            for (uint16_t i = 0; i < scan.count && i < 460u; i++) {
+                float r = scan.points[i].r_mm;
+                if (r < 50.0f || r > LIDAR_PROCESS_RANGE_MM) continue;
+                float a = scan.points[i].theta_deg * ((float)M_PI / 180.0f);
+                s_cart[cart_n].x         = r * cosf(a);
+                s_cart[cart_n].y         = r * sinf(a);
+                s_cart[cart_n].intensity = scan.points[i].intensity;
+                cart_n++;
+            }
+            obstacle_classifier_classify(s_cart, cart_n, s_classified, &class_n);
+            (void)class_n; /* available for dashboard overlay in future */
+        }
+
+        /* ── 4b. Run local planner ──────────────────────────────────────── *
+         * Reads the freshly-updated map and issues a control_frame_t to the *
+         * Wemos only when an obstacle is detected (REACTIVE / ESCAPE /       *
+         * STOPPED modes).  In PURE_PURSUIT mode PP runs uninterrupted.      */
+        {
+            static path_t s_lp_path;  /* local copy to avoid holding path_mutex */
+            xSemaphoreTake(s_path_mutex, portMAX_DELAY);
+            s_lp_path = s_planned_path;
+            xSemaphoreGive(s_path_mutex);
+
+            control_frame_t lp_cmd;
+            bool lp_valid = local_planner_update(&s_map, &matched_pose,
+                                                  &s_lp_path, false, &lp_cmd);
+
+            lp_mode_t lp_mode = local_planner_get_mode();
+
+            /* Send override only when actively avoiding — leave PP in control
+             * during normal PURE_PURSUIT mode. */
+            if (lp_valid && lp_mode != LP_MODE_PURE_PURSUIT) {
+                uart_bridge_send_control(&lp_cmd);
+                printf("[LP] mode=%d  spd=%.0f  hdg=%.1f°\n",
+                       (int)lp_mode,
+                       (double)lp_cmd.t_speed,
+                       (double)(lp_cmd.t_heading * 180.0f / (float)M_PI));
+            }
+
+            if (local_planner_replan_needed()) {
+                local_planner_clear_replan();
+                if (s_h_planner)
+                    xTaskNotify(s_h_planner, 0u, eSetValueWithOverwrite);
+                printf("[LP] replan requested\n");
+            }
         }
 
         /* ── 5. Notify dashboard ─────────────────────────────────────────── *
@@ -633,7 +692,8 @@ static void task_planner(void *arg)
         no_frontier_streak = 0;
 
         /* Build a filtered copy of the frontier list, skipping blacklisted entries.
-         * Falls back to the unfiltered list if all frontiers were blacklisted. */
+         * If ALL frontiers are blacklisted, wait 3 s for the map to grow rather
+         * than falling back to the same failing frontier again. */
         frontier_t goal;
         {
             frontier_list_t avail = flist;
@@ -647,8 +707,14 @@ static void task_planner(void *arg)
                 if (bad) avail.items[i] = avail.items[--avail.count];
                 else     i++;
             }
-            const frontier_list_t *src = (avail.count > 0) ? &avail : &flist;
-            goal = frontier_detector_best(src, &pose);
+            if (avail.count == 0) {
+                wifi_dashboard_log("[PLAN] all frontiers blacklisted — waiting 3 s for map update");
+                printf("[PLAN] all frontiers blacklisted — waiting 3 s\n");
+                bl_n = 0; /* reset blacklist so next cycle tries fresh */
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                continue;
+            }
+            goal = frontier_detector_best(&avail, &pose);
         }
 
         {
@@ -794,6 +860,7 @@ static void task_path_exec(void *arg)
 
         /* Start streaming to Wemos (path_streamer_set_path copies internally) */
         path_streamer_set_path(&local_path);
+        local_planner_reset_waypoint();
 
         {
             char buf[72];
@@ -885,6 +952,7 @@ void app_main(void)
     /* UART bridge to Wemos: receives encoder + IMU odometry packets. */
     uart_bridge_init();
     path_streamer_init();
+    local_planner_init(246.0f); /* half-diagonal: sqrt((295/2)^2 + (394/2)^2) */
 
     xTaskCreatePinnedToCore(task_lidar_slam, "lscan",     6144, NULL, 7, &s_h_lidar,   0);
     xTaskCreatePinnedToCore(task_odom,      "odom",      3072, NULL, 6, &s_h_odom,    0);

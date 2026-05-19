@@ -26,9 +26,10 @@
  * ════════════════════════════════════════════════════════════════════════════ */
 
 /* Robot geometry */
-#define LP_ROBOT_RADIUS_DEFAULT_MM  120.0f
+/* Half-diagonal of car bounding box: sqrt((295/2)^2 + (394/2)^2) = 246 mm */
+#define LP_ROBOT_RADIUS_DEFAULT_MM  246.0f
 #define LP_WHEELBASE_MM             260.0f
-#define LP_MAX_STEER_RAD            1.134f   /* 65° — matches real car steering limit */
+#define LP_MAX_STEER_RAD            1.134f   /* 65° — physical steering limit */
 #define LP_BASE_SPEED_MM_S          150.0f
 #define LP_REVERSE_SPEED_MM_S        80.0f
 

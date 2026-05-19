@@ -122,8 +122,11 @@ bool uart_bridge_send_odom(const odom_t *odom)
 }
 
 /* ── Inbound packet state ─────────────────────────────────────────────────── */
-static bool         s_have_chunk = false;
-static path_chunk_t s_pending_chunk;
+static bool            s_have_chunk      = false;
+static path_chunk_t    s_pending_chunk;
+
+static bool            s_have_override   = false;
+static control_frame_t s_pending_override;
 
 static void drain_pending_packets(void)
 {
@@ -157,6 +160,12 @@ static void drain_pending_packets(void)
         memcpy(&check_buf[2], payload, payload_len);
         if (checksum_xor(check_buf, (uint8_t)(payload_len + 2u)) != received_ck) continue;
 
+        if (msg_type == MSG_CONTROL && payload_len == sizeof(control_frame_t)) {
+            memcpy(&s_pending_override, payload, sizeof(control_frame_t));
+            s_have_override = true;
+            return;  /* priority: process override before chunks in same window */
+        }
+
         if (msg_type == MSG_PATH_CHUNK && payload_len == sizeof(path_chunk_t)) {
             path_chunk_t tmp;
             memcpy(&tmp, payload, sizeof(path_chunk_t));
@@ -167,7 +176,7 @@ static void drain_pending_packets(void)
                           * when both arrive in the same 50 ms PP tick window.     */
             }
         }
-        /* MSG_CONTROL and unknown types silently dropped. */
+        /* Unknown types silently dropped. */
     }
 #endif
 }
@@ -196,4 +205,16 @@ bool uart_bridge_send_chunk_nack(uint16_t path_id, uint16_t expected_start)
     memcpy(&payload[0], &path_id,        2);
     memcpy(&payload[2], &expected_start, 2);
     return send_packet(MSG_CHUNK_NACK, payload, 4u);
+}
+
+bool uart_bridge_recv_control_override(control_frame_t *out)
+{
+    if (!out) return false;
+    drain_pending_packets();
+    if (s_have_override) {
+        *out            = s_pending_override;
+        s_have_override = false;
+        return true;
+    }
+    return false;
 }
