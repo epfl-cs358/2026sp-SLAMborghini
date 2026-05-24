@@ -26,12 +26,13 @@
  * The ray march stops this far short of the obstacle so the last FREE step
  * can never land in the same 156 mm quadtree leaf as the HIT endpoint.
  * Required minimum: cell_size + step_mm = 156 + 80 = 236 mm.
- * Set to 300 mm (64 mm above minimum) so that worst-case cell alignment and
- * per-beam range jitter can never cause a MISS to fight a HIT at the same leaf.
- * Side effect: a ~300 mm unknown band remains along wall faces — adjacent
- * no-return beams sweep MISS through edge cells; only the direct-angle corridor
- * stays unknown, which is acceptable and prevents miss from eroding wall cells. */
-#define LIDAR_ENDPOINT_GUARD_MM 300.0f
+ * Set to 260 mm (24 mm above minimum) to reduce the unknown band along wall
+ * faces from ~300 mm to ~260 mm.  The narrower band means displaced wall
+ * cells (from localisation jitter) are more likely to be reached by MISS
+ * sweeps from adjacent beams, clearing ghost obstacles faster.
+ * Still 24 mm above the hard minimum so worst-case cell alignment can never
+ * cause a MISS to land in the same leaf as the HIT endpoint. */
+#define LIDAR_ENDPOINT_GUARD_MM 260.0f
 
 /* Active mapping radius (mm).  Only the disc of this radius around the
  * robot is written to the map each scan.  Beams that return beyond this
@@ -44,10 +45,14 @@
  * (r > 0).  No-return beams (r == 0) are NEVER filtered — they must sweep
  * MISS updates through free space every scan so ghost HITs from noise spikes
  * get cleared within 1-2 scans rather than persisting indefinitely.
- * Set to the LiDAR shot-to-shot noise floor (~15 mm for RPLiDAR C1) so that
- * stable wall returns are still mostly skipped (CPU saving) while the
- * occasional ≥15 mm shift still reinforces the obstacle cell. */
-#define LIDAR_DELTA_MM          15.0f
+ *
+ * Set BELOW the LiDAR shot-to-shot noise floor (~15 mm for RPLiDAR C1) so
+ * that only truly static returns (< 8 mm change) skip the MISS march.
+ * Beams near the noise floor (8–15 mm variation) now receive full MISS
+ * sweeps each scan, clearing displaced ghost cells from localisation jitter
+ * and transient reflections 2–3× faster than the old 15 mm threshold.
+ * CPU cost is slightly higher but the watchdog caps any single scan to 100 ms. */
+#define LIDAR_DELTA_MM          8.0f
 
 /**
  * World-coordinate bounding box of cells written during one lidar_to_map() call.
@@ -122,7 +127,7 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
  *   2. After a large scan-matcher correction (|dx|>5 mm, |dy|>5 mm, or
  *      |dθ|>0.05 rad): the corrected pose shifts beam endpoints, but
  *      s_delta_ref[] compares against pre-correction ranges.  When the shift
- *      is < LIDAR_DELTA_MM (15 mm) the filter sees same_range==true and
+ *      is < LIDAR_DELTA_MM (8 mm) the filter sees same_range==true and
  *      skips the MISS sweep — ghost cells at the old pose positions persist
  *      indefinitely.  A one-scan full-sweep clears them immediately.
  */

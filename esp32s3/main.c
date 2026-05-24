@@ -288,7 +288,12 @@ static void task_lidar_slam(void *arg)
 
         bool     do_compact     = s_map.count > (uint16_t)(QT_POOL_SIZE * 85 / 100);
         uint16_t before_compact = s_map.count;
-        if (do_compact) qt_compact(&s_map, 10);
+        /* Raise min_value from 10→20: with QT_HIT_INC=15 a single-scan noise
+         * spike reaches value=15 which is < 20, so it gets wiped every compaction
+         * cycle instead of persisting as a permanent speckle.  Two confirmed hits
+         * (value≥30) are now required to survive, matching the scan-matcher's
+         * GRID_CELL_MM=100 mm resolution and producing a much cleaner map. */
+        if (do_compact) qt_compact(&s_map, 20);
         uint16_t after_compact  = s_map.count;
         xSemaphoreGive(s_map_mutex);
 
@@ -304,9 +309,11 @@ static void task_lidar_slam(void *arg)
         if (elapsed > s_l2m_us_max) s_l2m_us_max = elapsed;
 
         /* Proactive compaction at 85% pool usage — fires before the pool
-         * freezes.  qt_compact() snapshots all confident walls (value ≥ 10),
-         * wipes the pool in-place, then re-inserts the saved cells so the
-         * scan matcher and dashboard retain full wall knowledge.
+         * freezes.  qt_compact() snapshots all confident walls (value ≥ 20,
+         * i.e. ≥2 confirmed hits), wipes the pool in-place, then re-inserts
+         * the saved cells so the scan matcher and dashboard retain full wall
+         * knowledge.  Single-hit noise spikes (value=15) are intentionally
+         * discarded each cycle, keeping the map clean.
          * Headroom: re-inserting N cells uses ≤ N×7 nodes, so triggering
          * at 85% (3400/4000) leaves ≥ 600 nodes of margin. */
         if (do_compact) {
