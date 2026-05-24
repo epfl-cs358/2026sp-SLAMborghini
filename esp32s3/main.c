@@ -242,6 +242,17 @@ static void task_lidar_slam(void *arg)
             while (s_pose.theta < -(float)M_PI) s_pose.theta += 2.0f * (float)M_PI;
             xSemaphoreGive(s_pose_mutex);
 
+            /* Bug fix #3: reset delta filter on significant pose corrections.
+             * s_delta_ref[] holds ranges measured from the pre-correction pose.
+             * A correction < LIDAR_DELTA_MM (15 mm) causes same_range==true on
+             * the next scan, suppressing the MISS sweeps that would erase ghost
+             * cells left at the old pose positions.  Forcing a full sweep on the
+             * very next scan clears those ghosts in one pass. */
+            if (fabsf(sm.dx_mm)      > 5.0f ||
+                fabsf(sm.dy_mm)      > 5.0f ||
+                fabsf(sm.dtheta_rad) > 0.05f)
+                lidar_to_map_reset_delta_filter();
+
             printf("[SM] corr  odom=(%.0f,%.0f,%.1f°)  matched=(%.0f,%.0f,%.1f°)"
                    "  delta=(dx=%+.0f dy=%+.0f dθ=%+.1f°)"
                    "  score=%d(+%d)/%d(%.0f%%)  t=%lu us\n",
@@ -280,6 +291,13 @@ static void task_lidar_slam(void *arg)
         if (do_compact) qt_compact(&s_map, 10);
         uint16_t after_compact  = s_map.count;
         xSemaphoreGive(s_map_mutex);
+
+        /* Bug fix #2: reset delta filter after compaction.
+         * qt_compact() wipes then restores the pool, but the restored free
+         * cells need a full MISS sweep to re-acquire their negative log-odds.
+         * Without this, same_range==true suppresses MISS, and the re-inserted
+         * free cells stay at value=0 (unknown), re-breaking the BFS. */
+        if (do_compact) lidar_to_map_reset_delta_filter();
 
         s_l2m_calls++;
         s_l2m_us_tot += elapsed;

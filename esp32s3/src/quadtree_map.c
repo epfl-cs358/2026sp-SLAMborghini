@@ -250,15 +250,25 @@ size_t qt_memory_bytes(const QuadTreeMap *map)
 
 
 /* ── qt_compact ─────────────────────────────────────────────────────────────
- * Snapshot all confident wall cells, wipe the pool, re-insert.
+ * Snapshot wall cells AND confirmed-free cells, wipe the pool, re-insert both.
  *
- * Up to QT_COMPACT_MAX cells are saved in a static BSS buffer (no stack
- * allocation).  After the in-place pool reset, each saved cell is
- * re-inserted with qt_update(map, cx, cy, saved_value): because the leaf
- * starts at 0 after the reset, adding saved_value as the delta restores
- * the exact log-odds value in one call.
+ * BUG FIX: the old version only saved cells with value > 0 (walls).
+ * Free cells (explored corridors, value < 0) were silently discarded, causing
+ * the entire explored area to revert to "unknown" after every compaction.
+ * The frontier-detector BFS can only traverse free cells, so it would lose
+ * all exploration history and the robot would re-explore already-visited space.
+ *
+ * Two static BSS buffers — no heap allocation:
+ *   _s_compact_buf  : walls   (value >= min_value, normally >= 10)   800 cells
+ *   _s_free_buf     : free    (value <= QT_FREE_THRESH,  = -5)      1200 cells
+ *
+ * Memory: (800 + 1200) × 12 B = 24 KB in BSS — well within ESP32-S3 limits.
+ * After re-insertion the pool typically uses 1500–2500 nodes, leaving ample
+ * headroom for continued exploration before the next compaction cycle.
  * ────────────────────────────────────────────────────────────────────────── */
-#define QT_COMPACT_MAX 512
+
+/* ── Wall cell buffer ───────────────────────────────────────────────────── */
+#define QT_COMPACT_MAX    800   /* max wall cells to preserve (was 512) */
 
 typedef struct { float cx, cy; int8_t value; } _compact_cell_t;
 
@@ -269,7 +279,7 @@ static int8_t          _s_compact_min = 0;
 static void _compact_cb(float cx, float cy, int8_t value, void *ud)
 {
     (void)ud;
-    if (value < _s_compact_min)        return;
+    if (value < _s_compact_min)           return;
     if (_s_compact_cnt >= QT_COMPACT_MAX) return;
     _s_compact_buf[_s_compact_cnt].cx    = cx;
     _s_compact_buf[_s_compact_cnt].cy    = cy;
@@ -277,36 +287,103 @@ static void _compact_cb(float cx, float cy, int8_t value, void *ud)
     _s_compact_cnt++;
 }
 
+/* ── Free cell buffer ───────────────────────────────────────────────────── */
+#define QT_FREE_COMPACT_MAX   1200  /* max free-space cells to preserve */
+#define QT_FREE_COMPACT_THRESH  (-5) /* only save strongly-free cells (≤ -5) */
+
+static _compact_cell_t _s_free_buf[QT_FREE_COMPACT_MAX];
+static int             _s_free_cnt = 0;
+
+static void _compact_free_cb(float cx, float cy, int8_t value, void *ud)
+{
+    (void)ud;
+    if (_s_free_cnt >= QT_FREE_COMPACT_MAX) return;
+    _s_free_buf[_s_free_cnt].cx    = cx;
+    _s_free_buf[_s_free_cnt].cy    = cy;
+    _s_free_buf[_s_free_cnt].value = value;
+    _s_free_cnt++;
+}
+
+/* ── _iterate_all ───────────────────────────────────────────────────────────
+ * Like _iterate but visits ALL leaves where value <= threshold (negative).
+ * qt_iterate_occupied only visits value > 0 leaves and cannot reach free
+ * cells — this companion function fills that gap for compaction purposes.
+ * ────────────────────────────────────────────────────────────────────────── */
+static void _iterate_all(const QuadTreeMap *map, uint16_t idx,
+                          float xmn, float xmx, float ymn, float ymx,
+                          void (*cb)(float, float, int8_t, void *), void *ud,
+                          int8_t threshold)
+{
+    if (idx == QT_NULL) return;
+    const QTNode *n = &map->pool[idx];
+
+    /* Leaf — report if confirmed-free (value <= threshold, e.g. <= -5).
+     * Internal nodes always have value=0 and are never reported. */
+    if (n->depth >= QT_MAX_DEPTH) {
+        if (n->value <= threshold)
+            cb(0.5f*(xmn+xmx), 0.5f*(ymn+ymx), n->value, ud);
+        return;
+    }
+
+    for (int q = 0; q < 4; q++) {
+        if (n->children[q] == QT_NULL) continue;
+        float cxmn, cxmx, cymn, cymx;
+        _child_bounds(xmn, xmx, ymn, ymx, q, &cxmn, &cxmx, &cymn, &cymx);
+        _iterate_all(map, n->children[q],
+                     cxmn, cxmx, cymn, cymx, cb, ud, threshold);
+    }
+}
+
 void qt_compact(QuadTreeMap *map, int8_t min_value)
 {
     if (!map || !map->pool) return;
 
-    /* 1. Collect confident occupied cells */
+    /* 1a. Collect confident wall cells (value >= min_value) */
     _s_compact_cnt = 0;
     _s_compact_min = min_value;
     qt_iterate_occupied(map, _compact_cb, NULL);
 
-    uint16_t saved = (uint16_t)_s_compact_cnt;
-    uint16_t before = map->count;
+    /* 1b. Collect confirmed-free cells (value <= QT_FREE_COMPACT_THRESH).
+     *     These are explored corridors that MUST survive the pool wipe so the
+     *     frontier-detector BFS can still expand through them after compaction. */
+    _s_free_cnt = 0;
+    _iterate_all(map, 1,
+                 map->x_min, map->x_max, map->y_min, map->y_max,
+                 _compact_free_cb, NULL,
+                 (int8_t)QT_FREE_COMPACT_THRESH);
+
+    uint16_t saved_walls = (uint16_t)_s_compact_cnt;
+    uint16_t saved_free  = (uint16_t)_s_free_cnt;
+    uint16_t before      = map->count;
 
     /* 2. Reset pool in-place — no malloc/free, just wipe and reinitialise */
     memset(map->pool, 0, (size_t)QT_POOL_SIZE * sizeof(QTNode));
     map->count = 1;   /* slot 0 stays reserved as QT_NULL */
     _alloc(map, 1);   /* recreate root at index 1, depth 1 */
 
-    /* 3. Re-insert saved cells — leaf starts at 0, so delta = saved value */
+    /* 3a. Re-insert wall cells — leaf starts at 0, delta = saved positive value */
     for (int i = 0; i < _s_compact_cnt; i++) {
         qt_update(map, _s_compact_buf[i].cx,
                        _s_compact_buf[i].cy,
                        _s_compact_buf[i].value);
     }
 
+    /* 3b. Re-insert free cells — delta is negative, restoring confirmed-free state.
+     *     Without this step every corridor reverts to value=0 (unknown), breaking
+     *     the frontier-detector BFS and making exploration start over from scratch. */
+    for (int i = 0; i < _s_free_cnt; i++) {
+        qt_update(map, _s_free_buf[i].cx,
+                       _s_free_buf[i].cy,
+                       _s_free_buf[i].value);
+    }
+
 #if defined(ESP_PLATFORM)
-    ESP_LOGI(TAG_QT, "compact: %u→%u nodes  saved=%u cells  freed=%u nodes",
+    ESP_LOGI(TAG_QT,
+             "compact: %u→%u nodes  walls=%u  free=%u  freed=%u nodes",
              (unsigned)before, (unsigned)map->count,
-             (unsigned)saved,
+             (unsigned)saved_walls, (unsigned)saved_free,
              (unsigned)(before - map->count));
 #else
-    (void)before; (void)saved;
+    (void)before; (void)saved_walls; (void)saved_free;
 #endif
 }

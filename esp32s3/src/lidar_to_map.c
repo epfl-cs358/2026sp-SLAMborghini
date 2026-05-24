@@ -1,5 +1,6 @@
 #include "lidar_to_map.h"
 #include <math.h>
+#include <string.h>   /* memset — used by lidar_to_map_reset_delta_filter */
 
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
@@ -292,4 +293,20 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
     }
 
     s_delta_valid = true;
+}
+
+
+/* ── lidar_to_map_reset_delta_filter ───────────────────────────────────────
+ * Force the next lidar_to_map() call to perform a full MISS sweep on every
+ * beam regardless of whether the range matches the previous scan.
+ *
+ * Call after qt_compact() (free cells were wiped and need MISS re-sweep to
+ * regain their negative log-odds) and after any large scan-matcher correction
+ * (stale s_delta_ref[] entries would suppress the MISS sweeps that clear
+ * ghost obstacles left behind at the pre-correction pose).
+ * ────────────────────────────────────────────────────────────────────────── */
+void lidar_to_map_reset_delta_filter(void)
+{
+    s_delta_valid = false;
+    memset(s_delta_ref, 0, sizeof(s_delta_ref));
 }

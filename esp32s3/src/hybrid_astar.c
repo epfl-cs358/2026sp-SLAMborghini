@@ -522,18 +522,17 @@ static bool reconstruct_path(int goal_idx, path_t *out_path)
 
     if (raw_count <= 0) return false;
 
+    /* Truncate to MAX_PATH_WAYPOINTS from the START of the path.
+     * DO NOT downsample: picking non-adjacent A* nodes creates segments
+     * that were never collision-checked, causing paths through obstacles.
+     * The local planner triggers a replan when these waypoints are consumed. */
     int out_count = (raw_count < MAX_PATH_WAYPOINTS) ? raw_count : MAX_PATH_WAYPOINTS;
     out_path->length = (uint8_t)out_count;
 
+    /* reverse_buf[0] = goal node, reverse_buf[raw_count-1] = start node.
+     * Emit in start → goal order by walking the buffer in reverse. */
     for (int i = 0; i < out_count; ++i) {
-        int raw_index;
-        if (out_count == 1) {
-            raw_index = raw_count - 1;
-        } else {
-            const float alpha   = (float)i / (float)(out_count - 1);
-            const int   rev_pos = (int)lroundf((1.0f - alpha) * (float)(raw_count - 1));
-            raw_index = reverse_buf[rev_pos];
-        }
+        const int raw_index = reverse_buf[raw_count - 1 - i];
         out_path->waypoints[i].x        = g_nodes[raw_index].x;
         out_path->waypoints[i].y        = g_nodes[raw_index].y;
         out_path->waypoints[i].theta    = g_nodes[raw_index].theta;
@@ -582,7 +581,7 @@ static bool run_hybrid_astar(const quadtree_map_t *map,
         -PLANNER_MAX_STEER_RAD, 0.0f, PLANNER_MAX_STEER_RAD
     };
     static const int8_t steering_ids[3]    = {-1, 0, 1};
-    static const int    directions[1]      = {1};   /* extend to {1,-1} for reverse */
+    static const int    directions[2]      = {1, -1};  /* forward + reverse */
 
     while (g_heap_size > 0) {
         const int best = heap_pop();
@@ -711,14 +710,15 @@ static bool append_frontier_if_safe(const quadtree_map_t *map,
     const float d = dist_xy(last->x, last->y, goal->cx, goal->cy);
     if (d <= 1.0f) return true;
 
-    const bool free_seg =
-        line_is_collision_free_quadtree(map, last->x, last->y,
-                                        goal->cx, goal->cy);
-    if (!free_seg) {
-        if (d > MAX_FRONTIER_APPEND_MM)                    return true;
-        if (!is_pose_inside_map(map, goal->cx, goal->cy))  return true;
-        if (qt_query_const(map, goal->cx, goal->cy) > 0)   return true;
-    }
+    /* Only append the frontier waypoint when the direct segment is clear.
+     * The old lenient fallback (append anyway if d <= MAX_FRONTIER_APPEND_MM
+     * and the frontier cell itself isn't occupied) silently added a waypoint
+     * reachable only by driving through an obstacle: frontier cells sit on the
+     * free/unknown boundary, so qt_query_const returns 0 (unknown), not > 0,
+     * and the occupied check passed even when the segment was blocked. */
+    if (!line_is_collision_free_quadtree(map, last->x, last->y,
+                                         goal->cx, goal->cy))
+        return true;
 
     const float heading = atan2f(goal->cy - last->y, goal->cx - last->x);
     last->theta = heading;

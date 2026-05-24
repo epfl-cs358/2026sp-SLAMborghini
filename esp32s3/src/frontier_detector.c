@@ -474,7 +474,19 @@ frontier_t frontier_detector_best(const frontier_list_t *list,
          * is already sitting on a frontier cell (startup edge case). */
         if (dist < 1.0f) dist = 1.0f;
 
-        float score = (float)f->size / dist;
+        /* Heading penalty: frontiers behind the robot cost more to approach.
+         * angle_diff = 0  → frontier is dead ahead   → factor = 1.0 (no penalty)
+         * angle_diff = π  → frontier is dead behind  → factor = 2.0 (half score)
+         * This prevents the planner from picking a close-but-behind frontier
+         * over a slightly farther one that is ahead, avoiding unnecessary U-turns. */
+        float bearing    = atan2f(dy, dx);
+        float angle_diff = bearing - robot_pose->theta;
+        /* Wrap to [-π, π] */
+        while (angle_diff >  (float)M_PI) angle_diff -= 2.0f * (float)M_PI;
+        while (angle_diff < -(float)M_PI) angle_diff += 2.0f * (float)M_PI;
+        float heading_factor = 1.0f + fabsf(angle_diff) / (float)M_PI;
+
+        float score = (float)f->size / (dist * heading_factor);
         if (score > best_score) {
             best_score = score;
             best       = *f;

@@ -39,10 +39,11 @@
 
 // Log-odds increments
 // HIT:MISS ratio of 15:1 — walls resist erosion from stray free-space sweeps.
-// One HIT (+30) needs 15 MISS passes to erase, vs. 5 at the old -6 value.
-// Free-space detection is unaffected: corridor cells receive hundreds of beams
-// per scan, so even -2 saturates to QT_VALUE_MIN within one scan cycle.
-#define QT_HIT_INC 30   // obstacle confirmed → value rises
+// One HIT (+15) needs 15 MISS passes to erase.  Walls still saturate quickly
+// (each scan delivers dozens of HIT reinforcements along any visible surface).
+// Halving from 30→15 lets ghost obstacles from rare bad scans clear in ~1 scan
+// rather than accumulating until the robot revisits the same exact beam angle.
+#define QT_HIT_INC 15   // obstacle confirmed → value rises
 #define QT_MISS_DEC (-2)  // ray passed through → value drops
 #define QT_VALUE_MAX 40
 #define QT_VALUE_MIN (-40)

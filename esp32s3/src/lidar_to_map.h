@@ -109,4 +109,23 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
                            float               step_mm,
                            map_dirty_rect_t   *out_dirty);
 
+/**
+ * Reset the angular delta-filter state.
+ *
+ * Call this in two situations:
+ *   1. After qt_compact() wipes the map: the pool reset clears all free cells,
+ *      but s_delta_ref[] still holds pre-compaction ranges.  Without a reset,
+ *      stable-beam filtering (same_range == true) skips MISS sweeps on the
+ *      next scan, so the restored-but-now-unknown free cells never get
+ *      re-marked as free, and the frontier-detector BFS stays locked.
+ *
+ *   2. After a large scan-matcher correction (|dx|>5 mm, |dy|>5 mm, or
+ *      |dθ|>0.05 rad): the corrected pose shifts beam endpoints, but
+ *      s_delta_ref[] compares against pre-correction ranges.  When the shift
+ *      is < LIDAR_DELTA_MM (15 mm) the filter sees same_range==true and
+ *      skips the MISS sweep — ghost cells at the old pose positions persist
+ *      indefinitely.  A one-scan full-sweep clears them immediately.
+ */
+void lidar_to_map_reset_delta_filter(void);
+
 #endif /* LIDAR_TO_MAP_H */
