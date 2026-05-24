@@ -38,12 +38,18 @@
 #define QT_NULL 0 // no child index 
 
 // Log-odds increments
-// HIT:MISS ratio of 15:1 — walls resist erosion from stray free-space sweeps.
-// One HIT (+15) needs 15 MISS passes to erase.  Walls still saturate quickly
+// HIT:MISS ratio of 10:1 — walls resist erosion from stray free-space sweeps.
+// One HIT (+10) needs 10 MISS passes to erase.  Walls still saturate quickly
 // (each scan delivers dozens of HIT reinforcements along any visible surface).
-// Halving from 30→15 lets ghost obstacles from rare bad scans clear in ~1 scan
-// rather than accumulating until the robot revisits the same exact beam angle.
-#define QT_HIT_INC 15   // obstacle confirmed → value rises
+//
+// Using 10 instead of 15 means:
+//   1-hit noise:  value=10 → val=138 → shown as orange (unknown) — not black.
+//   2-hit noise:  value=20 → val=148 → threshold is >148 → still orange.
+//   3-hit noise:  value=30 → val=158 → shown as black (very rare transient).
+// Real walls get reinforced every scan from many beams and saturate at 40
+// within a few scans regardless. This change eliminates 2-scan noise speckles
+// without affecting wall detection or scan-matcher performance.
+#define QT_HIT_INC 10   // obstacle confirmed → value rises
 #define QT_MISS_DEC (-2)  // ray passed through → value drops
 #define QT_VALUE_MAX 40
 #define QT_VALUE_MIN (-40)

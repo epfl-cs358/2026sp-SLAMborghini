@@ -319,16 +319,36 @@ function w2c(wx, wy) {
 // Build an ImageBitmap from a raw cell grid (log-odds+128 uint8 values).
 // rawGrid is row-major [iy=0..gh-1][ix=0..gw-1]; Y is flipped for canvas.
 async function buildBitmap(rawGrid, gw, gh) {
+  // ── Noise filter: demote isolated occupied cells to unknown ────────────
+  // A cell is considered a noise speckle if it is "occupied" (val > 148)
+  // but has zero 4-connected occupied neighbours.  These single-cell black
+  // dots are almost always transient LiDAR reflections; real walls always
+  // span at least two adjacent cells.  We demote them to 128 (unknown/orange)
+  // for display only — rawGrid is not modified so delta patches still work.
+  const displayGrid = new Uint8Array(rawGrid);
+  for (let iy = 0; iy < gh; iy++) {
+    for (let ix = 0; ix < gw; ix++) {
+      const idx = iy * gw + ix;
+      if (rawGrid[idx] <= 148) continue;   // not occupied — skip quickly
+      let occ = 0;
+      if (ix > 0    && rawGrid[idx - 1]  > 148) occ++;
+      if (ix < gw-1 && rawGrid[idx + 1]  > 148) occ++;
+      if (iy > 0    && rawGrid[idx - gw] > 148) occ++;
+      if (iy < gh-1 && rawGrid[idx + gw] > 148) occ++;
+      if (occ === 0) displayGrid[idx] = 128;   // isolated speck → orange
+    }
+  }
+
   const img = new ImageData(gw, gh);
   const d   = img.data;
   for (let iy = 0; iy < gh; iy++) {
     for (let ix = 0; ix < gw; ix++) {
-      const val = rawGrid[iy * gw + ix];
+      const val = displayGrid[iy * gw + ix];
       const py  = gh - 1 - iy;   // Y-flip: iy=0 = y_min = bottom
       const k   = (py * gw + ix) * 4;
       let r, g, b;
       if      (val < 118) { r = 255; g = 255; b = 255; }   // free  → white
-      else if (val > 148) { r = 0;   g = 0;   b = 0;   }   // wall  → black (log-odds>20: requires 2 hits)
+      else if (val > 148) { r = 0;   g = 0;   b = 0;   }   // wall  → black (log-odds>20: ≥3 hits with HIT_INC=10)
       else                { r = 244; g = 162; b =  97; }   // unknown → orange
       d[k]=r; d[k+1]=g; d[k+2]=b; d[k+3]=255;
     }
