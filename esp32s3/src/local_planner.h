@@ -25,7 +25,8 @@ typedef enum {
     LP_MODE_REACTIVE,         /**< Local obstacle cluster detected — candidate steering */
     LP_MODE_ESCAPE,           /**< All reactive candidates blocked — reverse+rotate sequence */
     LP_MODE_RECOVER,          /**< High SLAM uncertainty — reduced speed, wider heading filter */
-    LP_MODE_STOPPED           /**< Footprint cell occupied — immediate stop */
+    LP_MODE_STOPPED,          /**< Obstacle cluster ahead — stop and wait (dynamic obstacle) */
+    LP_MODE_WAIT_CLEAR        /**< Post-stall: stopped, waiting for path to clear before replan */
 } lp_mode_t;
 
 /**

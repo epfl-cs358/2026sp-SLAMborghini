@@ -23,15 +23,17 @@
 #define LIDAR_PROCESS_RANGE_MM 3500.0f
 
 /* Free-traversal endpoint guard (mm).
- * The ray march stops this far short of the obstacle so the last FREE step
- * can never land in the same 156 mm quadtree leaf as the HIT endpoint.
- * Required minimum: cell_size + step_mm = 156 + 80 = 236 mm.
- * Set to 300 mm (64 mm above minimum) so that worst-case cell alignment and
- * per-beam range jitter can never cause a MISS to fight a HIT at the same leaf.
- * Side effect: a ~300 mm unknown band remains along wall faces — adjacent
- * no-return beams sweep MISS through edge cells; only the direct-angle corridor
- * stays unknown, which is acceptable and prevents miss from eroding wall cells. */
-#define LIDAR_ENDPOINT_GUARD_MM 300.0f
+ * The march loop is `t < march_to - guard`, starting at t = step_mm.
+ * Guard = 0 is safe: t starts at step_mm (not 0), so the last miss step
+ * lands at most (march_to - step_mm) — never at march_to itself.  Even
+ * if the last miss and the HIT land in the same 156 mm quadtree leaf the
+ * 30:1 HIT:MISS ratio (net +29) keeps the cell firmly occupied.
+ * Setting guard > 0 creates an unknown band of that width along every wall
+ * face, which the frontier detector misreads as unexplored space.
+ * HIT:MISS ratio is QT_HIT_INC(30) : |QT_MISS_DEC|(2) = 15:1, so the last
+ * march step and the HIT landing in the same 156 mm leaf still leaves
+ * net +28 per scan — the cell stays firmly occupied. */
+#define LIDAR_ENDPOINT_GUARD_MM 0.0f
 
 /* Active mapping radius (mm).  Only the disc of this radius around the
  * robot is written to the map each scan.  Beams that return beyond this
@@ -40,14 +42,6 @@
  * enlarge to map further ahead at planning time. */
 #define LIDAR_MAP_RADIUS_MM    3000.0f
 
-/* Angular delta filter threshold (mm).  Applied only to finite-range beams
- * (r > 0).  No-return beams (r == 0) are NEVER filtered — they must sweep
- * MISS updates through free space every scan so ghost HITs from noise spikes
- * get cleared within 1-2 scans rather than persisting indefinitely.
- * Set to the LiDAR shot-to-shot noise floor (~15 mm for RPLiDAR C1) so that
- * stable wall returns are still mostly skipped (CPU saving) while the
- * occasional ≥15 mm shift still reinforces the obstacle cell. */
-#define LIDAR_DELTA_MM          15.0f
 
 /**
  * World-coordinate bounding box of cells written during one lidar_to_map() call.

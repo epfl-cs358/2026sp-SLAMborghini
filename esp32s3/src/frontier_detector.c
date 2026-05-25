@@ -42,13 +42,20 @@
 #include <stdlib.h>
 
 /* ── Occupancy thresholds (matching quadtree_map conventions) ─────────────
- *   0  – 50  : free
- *   77 – 178 : unknown  (~128 centre)
- *   179 – 255: occupied
- * The gap 51-76 is treated as "transitioning" — we never expand through it.
+ * quadtree_map_query maps int8 raw log-odds to uint8: query = raw + 128.
+ *
+ *   query ≤ 115 : free      (raw ≤ -13, ~7 MISS sweeps at MISS_DEC=-2)
+ *   120 – 178   : unknown   (raw -8…+50; never-observed centre = 128)
+ *   179 – 255   : occupied  (raw > 50;   2 HITs at HIT_INC=30 → raw=60)
+ *   gap 116-119 : hysteresis — neither free nor unknown; BFS won't expand
+ *
+ * OCC_FREE_MAX raised from 50→115 so that cells swept ~7 times in one
+ * scan register as free immediately instead of after 39 sweeps.  This
+ * eliminates the "unknown cell in front of every wall" phantom-frontier
+ * artifact that came from the old threshold requiring raw ≤ -78.
  * ──────────────────────────────────────────────────────────────────────── */
-#define OCC_FREE_MAX     50u
-#define OCC_UNK_MIN      77u
+#define OCC_FREE_MAX    115u
+#define OCC_UNK_MIN     120u
 #define OCC_UNK_MAX     178u
 
 /* ── Robot footprint ─────────────────────────────────────────────────────────
@@ -60,10 +67,11 @@
 #define ROBOT_CLEAR_CELLS  2    /* Chebyshev clearance radius in grid cells  */
 
 /* ── Tuning constants ────────────────────────────────────────────────────── */
-#define MIN_CLUSTER_SIZE    5    /* discard clusters with fewer free cells (was 3) */
-#define MIN_ADJACENT_UNK    4    /* min unknown cells touching the cluster —
-                                  * hole artifacts typically have 1-2; real walls
-                                  * have many more. Rejects isolated map holes.  */
+#define MIN_CLUSTER_SIZE    5    /* discard clusters with fewer frontier free cells */
+#define MIN_ADJACENT_UNK    6    /* min unknown-cell touches on the cluster —
+                                  * wall-shadow phantoms: 1 unknown/cell → ~5 total
+                                  * real frontiers:      2-3 unknown/cell → 10-20
+                                  * threshold 6 rejects phantoms, keeps real walls  */
 #define CLEARANCE_RADIUS    3    /* Chebyshev radius (cells) for open-space check */
 #define MIN_CLEARANCE_CELLS 12   /* min free cells in the (2R+1)²=49 box around
                                   * the target — 12/49≈25% keeps 2-cell corridors
@@ -138,6 +146,11 @@ static inline bool cell_is_unknown(const quadtree_map_t *m, float x, float y)
     return v >= OCC_UNK_MIN && v <= OCC_UNK_MAX;
 }
 
+static inline bool cell_is_occupied(const quadtree_map_t *m, float x, float y)
+{
+    return quadtree_map_query(m, x, y) > OCC_UNK_MAX;
+}
+
 /* ═══════════════════════ is_frontier ══════════════════════════════════════
  * Returns true if cell (ix, iy) is free AND has at least one 4-connected
  * neighbour that is unknown. This is the canonical WFD frontier definition.
@@ -170,6 +183,9 @@ static bool is_safe_cell(const quadtree_map_t *m, int ix, int iy,
             int nx = ix + dx;
             int ny = iy + dy;
             if (!in_bounds(nx, ny, mw, mh)) continue;
+            /* Reject if any cell in the box is not confirmed free (unknown or occupied).
+             * This pushes the target 2 cells away from walls AND away from wall-shadow
+             * unknown cells, so the robot never drives right up to a wall. */
             if (!cell_is_free(m, cx_mm(nx, res), cy_mm(ny, res))) return false;
         }
     }
@@ -183,10 +199,12 @@ static bool is_safe_cell(const quadtree_map_t *m, int ix, int iy,
  *
  * Adapted from SLAMaleykoum get_safe_neighbor() — proven on hardware.
  * ══════════════════════════════════════════════════════════════════════════ */
-static void safety_spiral(const quadtree_map_t *m, int *ix, int *iy,
+/* Returns true if a safe cell was found (ix/iy updated), false if the
+ * spiral exhausted all candidates — caller must skip this frontier entirely. */
+static bool safety_spiral(const quadtree_map_t *m, int *ix, int *iy,
                            float res, int mw, int mh)
 {
-    if (is_safe_cell(m, *ix, *iy, res, mw, mh)) return;
+    if (is_safe_cell(m, *ix, *iy, res, mw, mh)) return true;
 
     for (int r = 1; r <= SPIRAL_STEPS; r++) {
         for (int dy = -r; dy <= r; dy++) {
@@ -200,12 +218,12 @@ static void safety_spiral(const quadtree_map_t *m, int *ix, int *iy,
                 if (is_safe_cell(m, nx, ny, res, mw, mh)) {
                     *ix = nx;
                     *iy = ny;
-                    return;
+                    return true;
                 }
             }
         }
     }
-    /* No safe cell within spiral range — keep original (better than nothing) */
+    return false;   /* no safe cell found — drop this frontier */
 }
 
 /* ═══════════════════════ count_adjacent_unknown ════════════════════════════
@@ -384,7 +402,7 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
 
             int tix, tiy;
             nearest_to_centroid(cnt, &tix, &tiy);
-            safety_spiral(map, &tix, &tiy, res, mw, mh);
+            if (!safety_spiral(map, &tix, &tiy, res, mw, mh)) goto next_bfs;
 
             /* Filter 3: open-space clearance — reject tight spots the robot
              * cannot comfortably navigate (1-cell tunnels, blind corners).
@@ -407,6 +425,9 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
                     result.items[result.count].size = (uint8_t)(clr > 255 ? 255 : clr);
                     result.count++;
                 }
+                /* 8 forward frontiers is plenty for the selector — stop BFS
+                 * early to bound the time the map mutex is held. */
+                if (result.count >= 8) goto bfs_done;
             } else if (fallback_tix < 0) {
                 fallback_tix = tix;
                 fallback_tiy = tiy;
@@ -432,6 +453,7 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
             bit_set(s_vis, nx, ny);
         }
     }
+    bfs_done:;
 
     /* No "ahead" frontier passed all filters — fall back to the nearest
      * behind-robot frontier so exploration doesn't deadlock. */
@@ -481,4 +503,169 @@ frontier_t frontier_detector_best(const frontier_list_t *list,
         }
     }
     return best;
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * frontier_selector_pick  —  Option C: heading-aligned tiered selection
+ *
+ * Four tiers of angular tolerance (widening cone) with distance cap:
+ *   Tier 0: ±30°,  max 3000 mm — prefer nearby, aligned frontiers
+ *   Tier 1: ±60°,  max 4000 mm — widen if tier 0 empty
+ *   Tier 2: ±120°, max 6000 mm — widen further
+ *   Tier 3: ±180°, no cap      — guaranteed fallback (no feasibility check)
+ *
+ * Tiers 0-2 apply a three-part curvature feasibility pre-filter:
+ *   1. Steering reach  — bicycle model: dist >= 2*R_min*|sin(heading_err)|
+ *   2. Corridor width  — lateral clearance at 200 mm ahead >= 300 mm total
+ *   3. Rollout         — < 2 of 4 cells along robot→frontier are occupied
+ *
+ * Tier 3 skips feasibility to prevent permanent deadlock.
+ * Within a passing tier the nearest candidate is returned.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* Bicycle model parameters */
+#define _FS_WHEELBASE_MM    260.0f
+#define _FS_MAX_STEER_RAD   1.134f   /* ~65° measured from hardware */
+
+/* Corridor width check */
+#define _FS_WIDTH_MIN_MM    300.0f   /* minimum total corridor width */
+#define _FS_LATERAL_FWD_MM  200.0f   /* look-ahead distance along heading */
+#define _FS_LATERAL_STEP_MM  50.0f   /* lateral probe step size */
+#define _FS_LATERAL_STEPS      4     /* steps each side = 200 mm max */
+
+/* Mini rollout */
+#define _FS_ROLLOUT_STEPS      4     /* probe points */
+#define _FS_ROLLOUT_STEP_MM  200.0f  /* spacing of probe points */
+#define _FS_ROLLOUT_MAX_OCC    2     /* reject if 2+ occupied cells on direct path */
+
+static float _fs_wrap_pi(float a)
+{
+    while (a >  (float)M_PI) a -= 2.0f * (float)M_PI;
+    while (a < -(float)M_PI) a += 2.0f * (float)M_PI;
+    return a;
+}
+
+/* Bicycle model: can the robot reach the frontier without exceeding max
+ * steering angle?  Required turning arc: dist >= 2*R_min*|sin(delta)|. */
+static bool _fs_check_steer(const pose_t *robot, const frontier_t *f)
+{
+    float dx = f->cx - robot->x;
+    float dy = f->cy - robot->y;
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist < 1.0f) return true;
+    float goal_hdg = atan2f(dy, dx);
+    float herr = fabsf(_fs_wrap_pi(goal_hdg - robot->theta));
+    /* R_min = L / tan(max_steer); precomputed at compile time */
+    float r_min = _FS_WHEELBASE_MM / tanf(_FS_MAX_STEER_RAD);
+    return dist >= 2.0f * r_min * sinf(herr);
+}
+
+/* Corridor width: probe laterally at _FS_LATERAL_FWD_MM ahead and count
+ * free steps on each side before hitting an obstacle. */
+static bool _fs_check_width(const pose_t *robot, const frontier_t *f,
+                              const quadtree_map_t *map)
+{
+    float dx = f->cx - robot->x;
+    float dy = f->cy - robot->y;
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist < 1.0f) return true;
+
+    float ux = dx / dist, uy = dy / dist;   /* unit vec toward frontier */
+    float lx = -uy,       ly =  ux;         /* left perpendicular (+90°) */
+
+    float px = robot->x + ux * _FS_LATERAL_FWD_MM;
+    float py = robot->y + uy * _FS_LATERAL_FWD_MM;
+
+    int lw = 0, rw = 0;
+    for (int s = 1; s <= _FS_LATERAL_STEPS; s++) {
+        float step = (float)s * _FS_LATERAL_STEP_MM;
+        if (qt_query_const(map, px + lx * step, py + ly * step) > 0) break;
+        lw++;
+    }
+    for (int s = 1; s <= _FS_LATERAL_STEPS; s++) {
+        float step = (float)s * _FS_LATERAL_STEP_MM;
+        if (qt_query_const(map, px - lx * step, py - ly * step) > 0) break;
+        rw++;
+    }
+    return ((float)(lw + rw) * _FS_LATERAL_STEP_MM) >= _FS_WIDTH_MIN_MM;
+}
+
+/* Rollout: sample 4 cells along the straight line robot→frontier.
+ * Reject if 2 or more are occupied. */
+static bool _fs_check_rollout(const pose_t *robot, const frontier_t *f,
+                               const quadtree_map_t *map)
+{
+    float dx = f->cx - robot->x;
+    float dy = f->cy - robot->y;
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist < 1.0f) return true;
+
+    float ux = dx / dist, uy = dy / dist;
+    int occ = 0;
+    for (int s = 1; s <= _FS_ROLLOUT_STEPS; s++) {
+        float step = (float)s * _FS_ROLLOUT_STEP_MM;
+        if (step >= dist) break;
+        if (qt_query_const(map, robot->x + ux * step, robot->y + uy * step) > 0)
+            occ++;
+    }
+    return occ < _FS_ROLLOUT_MAX_OCC;
+}
+
+static bool _fs_feasible(const pose_t *robot, const frontier_t *f,
+                          const quadtree_map_t *map)
+{
+    return _fs_check_steer(robot, f) &&
+           _fs_check_width(robot, f, map) &&
+           _fs_check_rollout(robot, f, map);
+}
+
+typedef struct { float half_angle_rad; float max_dist_mm; } _fs_tier_t;
+
+frontier_t frontier_selector_pick(const frontier_list_t *list,
+                                   const pose_t *robot,
+                                   const quadtree_map_t *map)
+{
+    if (!list || !robot || list->count == 0) {
+        frontier_t z = {0}; return z;
+    }
+
+    static const _fs_tier_t tiers[] = {
+        {  30.0f * (float)M_PI / 180.0f, 3000.0f },
+        {  60.0f * (float)M_PI / 180.0f, 4000.0f },
+        { 120.0f * (float)M_PI / 180.0f, 6000.0f },
+        { (float)M_PI,                   1e9f     },  /* fallback — no feasibility */
+    };
+    const int N_TIERS = (int)(sizeof(tiers) / sizeof(tiers[0]));
+
+    for (int t = 0; t < N_TIERS; t++) {
+        float best_dist = 1e9f;
+        int   best_idx  = -1;
+        bool  do_feasibility = (t < N_TIERS - 1);
+
+        for (uint8_t i = 0; i < list->count; i++) {
+            const frontier_t *f = &list->items[i];
+            float dx = f->cx - robot->x;
+            float dy = f->cy - robot->y;
+            float dist = sqrtf(dx * dx + dy * dy);
+            if (dist < 1.0f) dist = 1.0f;
+
+            if (dist > tiers[t].max_dist_mm) continue;
+
+            float goal_hdg = atan2f(dy, dx);
+            float herr = fabsf(_fs_wrap_pi(goal_hdg - robot->theta));
+            if (herr > tiers[t].half_angle_rad) continue;
+
+            if (do_feasibility && !_fs_feasible(robot, f, map)) continue;
+
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx  = i;
+            }
+        }
+
+        if (best_idx >= 0) return list->items[best_idx];
+    }
+
+    return list->items[0];   /* should never reach: tier 3 = ±180° with no cap */
 }

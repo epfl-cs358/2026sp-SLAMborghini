@@ -11,7 +11,7 @@
  *     2. Snapshot the current pose AFTER the scan (most current estimate)
  *     3. Ray-march the scan into the quadtree occupancy map  (~15 ms)
  *     4. Push updated map + scan overlay to the browser dashboard
- *     5. Sleep 100 ms to yield CPU to WiFi / httpd / _dash_task
+ *     5. Sleep 20 ms to yield CPU to httpd / _dash_task
  *     Repeat.
  *
  *   task_odom  (prio 6)
@@ -62,12 +62,25 @@
  * ════════════════════════════════════════════════════════════════════════════
  * CPU PRIORITY NOTE
  * ════════════════════════════════════════════════════════════════════════════
- *   IDF WiFi driver tasks run at priority 23 — they will always preempt our
- *   tasks so the radio stays alive.
+ *   IDF WiFi driver tasks run at priority 23 — always preempt our tasks.
  *   IDF LwIP/TCP stack runs at priority 18 — also above us.
- *   httpd server runs at priority 5 — BELOW our tasks.
- *   → The 100 ms vTaskDelay after each scan is mandatory: it gives httpd
- *     time to flush TCP ACKs so the WebSocket does not stall.
+ *   httpd server runs at priority 5 — below our tasks.
+ *   → 20 ms vTaskDelay after each scan gives httpd (prio 5) CPU to flush
+ *     TCP ACKs. The scan UART-read already yields ~100 ms when no buffered
+ *     scan is ready; the explicit delay matters only when scans are pre-buffered.
+ *
+ *   User task priority layout (Core → Pri):
+ *     task_lidar_slam  Core 0  prio 7  — scan-match + map write + LOCAL PLANNER
+ *     task_odom        Core 0  prio 6  — wheel/IMU odometry + path streamer tick
+ *     task_path_exec   Core 1  prio 4  — must preempt task_planner immediately
+ *                                        when a new path is published, especially
+ *                                        after an LP-triggered replan
+ *     task_planner     Core 1  prio 3  — A* + frontier selection (holds map mutex)
+ *     task_perf_mon    Core 1  prio 1  — stats only
+ *
+ *   The local planner runs INSIDE task_lidar_slam (prio 7) immediately after
+ *   the map write.  It reads the map without s_map_mutex — safe because it is
+ *   in the same task that just finished writing, and qt_query_const never writes.
  */
 
 /* ── Wi-Fi credentials — fill in before flashing ───────────────────────── */
@@ -182,7 +195,14 @@ static void task_lidar_slam(void *arg)
         /* ── 1. Acquire one full 360° scan ──────────────────────────────── *
          * Blocks until the LiDAR motor completes one rotation (~100 ms).    *
          * If the UART ring buffer already holds a complete buffered scan    *
-         * it returns in ~0 ms.                                              */
+         * it returns in ~0 ms.                                              *
+         * Snapshot pose BEFORE the read so lidar_deskew_and_map can         *
+         * interpolate each beam at its capture time within the 100 ms scan. */
+        pose_t pre_pose;
+        xSemaphoreTake(s_pose_mutex, portMAX_DELAY);
+        pre_pose = s_pose;
+        xSemaphoreGive(s_pose_mutex);
+
         int64_t t_read  = esp_timer_get_time();
         bool    read_ok = lidar_driver_read_scan(&scan);
         uint32_t read_us = (uint32_t)(esp_timer_get_time() - t_read);
@@ -264,44 +284,54 @@ static void task_lidar_slam(void *arg)
         }
 
         /* ── 4. Ray-march scan into quadtree map ────────────────────────── *
-         * Uses the scan-matched pose for map integration.                    *
-         * s_map_mutex blocks concurrent planner reads (frontier + A*).       */
-        map_dirty_rect_t dirty;
-        xSemaphoreTake(s_map_mutex, portMAX_DELAY);
-        int64_t t0 = esp_timer_get_time();
-        lidar_to_map(&s_map, &scan, &matched_pose,
-                     LIDAR_PROCESS_RANGE_MM,
-                     80.0f,
-                     &dirty);
-        uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t0);
+         * Gate: skip map write when SM rejected AND the car is in ESCAPE.   *
+         * During ESCAPE, odometry can drift 50-200 mm before the manoeuvre  *
+         * ends; writing at a known-wrong pose corrupts the map.  We only    *
+         * skip when BOTH conditions hold — a rejected SM during normal       *
+         * driving still writes (map-sparse case, same as before).           *
+         * s_map_mutex blocks concurrent planner reads (frontier + A*).      */
+        lp_mode_t pre_lp_mode = local_planner_get_mode();
+        map_dirty_rect_t dirty = { .valid = false };
+        if (sm_ok || pre_lp_mode != LP_MODE_ESCAPE)
+        {
+            xSemaphoreTake(s_map_mutex, portMAX_DELAY);
+            int64_t t0 = esp_timer_get_time();
+            lidar_deskew_and_map(&s_map, &scan,
+                                 &pre_pose,    t_read,
+                                 &matched_pose, t_read + (int64_t)read_us,
+                                 LIDAR_PROCESS_RANGE_MM,
+                                 80.0f,
+                                 &dirty);
+            uint32_t elapsed = (uint32_t)(esp_timer_get_time() - t0);
 
-        bool     do_compact     = s_map.count > (uint16_t)(QT_POOL_SIZE * 85 / 100);
-        uint16_t before_compact = s_map.count;
-        if (do_compact) qt_compact(&s_map, 10);
-        uint16_t after_compact  = s_map.count;
-        xSemaphoreGive(s_map_mutex);
+            bool     do_compact     = s_map.count > (uint16_t)(QT_POOL_SIZE * 85 / 100);
+            uint16_t before_compact = s_map.count;
+            if (do_compact) qt_compact(&s_map, 1);
+            uint16_t after_compact  = s_map.count;
+            xSemaphoreGive(s_map_mutex);
 
-        s_l2m_calls++;
-        s_l2m_us_tot += elapsed;
-        if (elapsed > s_l2m_us_max) s_l2m_us_max = elapsed;
+            s_l2m_calls++;
+            s_l2m_us_tot += elapsed;
+            if (elapsed > s_l2m_us_max) s_l2m_us_max = elapsed;
 
-        /* Proactive compaction at 85% pool usage — fires before the pool
-         * freezes.  qt_compact() snapshots all confident walls (value ≥ 10),
-         * wipes the pool in-place, then re-inserts the saved cells so the
-         * scan matcher and dashboard retain full wall knowledge.
-         * Headroom: re-inserting N cells uses ≤ N×7 nodes, so triggering
-         * at 85% (3400/4000) leaves ≥ 600 nodes of margin. */
-        if (do_compact) {
-            printf("[MAP] compact  before=%u  after=%u  freed=%u nodes\n",
-                   (unsigned)before_compact, (unsigned)after_compact,
-                   (unsigned)(before_compact - after_compact));
-            /* Force dashboard to resample the full map after compaction */
-            map_dirty_rect_t full_dirty = {
-                .valid = true,
-                .x_min = s_map.x_min, .y_min = s_map.y_min,
-                .x_max = s_map.x_max, .y_max = s_map.y_max,
-            };
-            wifi_dashboard_mark_dirty(&full_dirty);
+            /* Proactive compaction at 85% pool usage — fires before the pool
+             * freezes.  qt_compact() snapshots all positive-value wall cells
+             * (value ≥ 1) and deeply-free corridor cells (value ≤ FREE_KEEP),
+             * wipes the pool in-place, then re-inserts them.
+             * Headroom: re-inserting N cells uses ≤ N×7 nodes, so triggering
+             * at 85% (3400/4000) leaves ≥ 600 nodes of margin. */
+            if (do_compact) {
+                printf("[MAP] compact  before=%u  after=%u  freed=%u nodes\n",
+                       (unsigned)before_compact, (unsigned)after_compact,
+                       (unsigned)(before_compact - after_compact));
+                /* Force dashboard to resample the full map after compaction */
+                map_dirty_rect_t full_dirty = {
+                    .valid = true,
+                    .x_min = s_map.x_min, .y_min = s_map.y_min,
+                    .x_max = s_map.x_max, .y_max = s_map.y_max,
+                };
+                wifi_dashboard_mark_dirty(&full_dirty);
+            }
         }
 
         /* ── 4a. Classify LiDAR points for semantic labels ──────────────── *
@@ -317,7 +347,7 @@ static void task_lidar_slam(void *arg)
             for (uint16_t i = 0; i < scan.count && i < 460u; i++) {
                 float r = scan.points[i].r_mm;
                 if (r < 50.0f || r > LIDAR_PROCESS_RANGE_MM) continue;
-                float a = scan.points[i].theta_deg * ((float)M_PI / 180.0f);
+                float a = -scan.points[i].theta_deg * ((float)M_PI / 180.0f);
                 s_cart[cart_n].x         = r * cosf(a);
                 s_cart[cart_n].y         = r * sinf(a);
                 s_cart[cart_n].intensity = scan.points[i].intensity;
@@ -376,8 +406,10 @@ static void task_lidar_slam(void *arg)
         wifi_dashboard_broadcast_raw_pose(&raw_pose);
         wifi_dashboard_broadcast_state(&matched_pose, s_target_fx, s_target_fy, s_has_target, 0);
 
-        /* ── 5. Yield — gives httpd CPU to flush TCP ACKs ────────────────── */
-        vTaskDelay(pdMS_TO_TICKS(100));
+        /* ── 5. Yield — 20 ms lets httpd flush TCP ACKs on Core 0.
+         * The UART-blocking scan read already yields ~100 ms per cycle;
+         * this extra delay is redundant when scans are buffered.          */
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -648,6 +680,7 @@ static void task_planner(void *arg)
 
     for (;;) {
         plan_cycle++;
+        vTaskDelay(pdMS_TO_TICKS(3));   /* yield to LIDAR/odom tasks */
 
         /* Snapshot pose */
         pose_t pose;
@@ -655,10 +688,34 @@ static void task_planner(void *arg)
         pose = s_pose;
         xSemaphoreGive(s_pose_mutex);
 
-        /* Frontier detection under map mutex */
+        /* Frontier detection + selection under map mutex.
+         * frontier_selector_pick probes the map for corridor width and
+         * rollout, so it must run while s_map_mutex is held. */
         xSemaphoreTake(s_map_mutex, portMAX_DELAY);
         uint16_t map_nodes = s_map.count;
         frontier_list_t flist = frontier_detector_detect(&s_map, &pose);
+
+        frontier_t goal = {0};
+        bool goal_found = false;
+
+        if (flist.count > 0) {
+            /* Build a filtered copy of the frontier list, skipping blacklisted entries. */
+            frontier_list_t avail = flist;
+            for (int i = 0; i < (int)avail.count; ) {
+                bool bad = false;
+                for (int j = 0; j < bl_n; j++) {
+                    float dx = avail.items[i].cx - bl[j].cx;
+                    float dy = avail.items[i].cy - bl[j].cy;
+                    if (dx*dx + dy*dy < 200.0f*200.0f) { bad = true; break; }
+                }
+                if (bad) avail.items[i] = avail.items[--avail.count];
+                else     i++;
+            }
+            if (avail.count > 0) {
+                goal = frontier_selector_pick(&avail, &pose, &s_map);
+                goal_found = true;
+            }
+        }
         xSemaphoreGive(s_map_mutex);
 
         {
@@ -693,30 +750,13 @@ static void task_planner(void *arg)
         }
         no_frontier_streak = 0;
 
-        /* Build a filtered copy of the frontier list, skipping blacklisted entries.
-         * If ALL frontiers are blacklisted, wait 3 s for the map to grow rather
-         * than falling back to the same failing frontier again. */
-        frontier_t goal;
-        {
-            frontier_list_t avail = flist;
-            for (int i = 0; i < (int)avail.count; ) {
-                bool bad = false;
-                for (int j = 0; j < bl_n; j++) {
-                    float dx = avail.items[i].cx - bl[j].cx;
-                    float dy = avail.items[i].cy - bl[j].cy;
-                    if (dx*dx + dy*dy < 200.0f*200.0f) { bad = true; break; }
-                }
-                if (bad) avail.items[i] = avail.items[--avail.count];
-                else     i++;
-            }
-            if (avail.count == 0) {
-                wifi_dashboard_log("[PLAN] all frontiers blacklisted — waiting 1.5 s for map update");
-                printf("[PLAN] all frontiers blacklisted — waiting 1.5 s\n");
-                bl_n = 0; /* reset blacklist so next cycle tries fresh */
-                vTaskDelay(pdMS_TO_TICKS(1500));
-                continue;
-            }
-            goal = frontier_detector_best(&avail, &pose);
+        if (!goal_found) {
+            /* All frontiers blacklisted — wait for map to grow, then retry fresh. */
+            wifi_dashboard_log("[PLAN] all frontiers blacklisted — waiting 1.5 s for map update");
+            printf("[PLAN] all frontiers blacklisted — waiting 1.5 s\n");
+            bl_n = 0;
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            continue;
         }
 
         {
@@ -981,5 +1021,5 @@ void app_main(void)
     xTaskCreatePinnedToCore(task_odom,      "odom",      3072, NULL, 6, &s_h_odom,    0);
     xTaskCreatePinnedToCore(task_perf_mon,  "perf_mon",  3072, NULL, 1, &s_h_perf,    1);
     xTaskCreatePinnedToCore(task_planner,   "planner",   6144, NULL, 3, &s_h_planner, 1);
-    xTaskCreatePinnedToCore(task_path_exec, "path_exec", 5120, NULL, 3, &s_h_exec,    1);
+    xTaskCreatePinnedToCore(task_path_exec, "path_exec", 5120, NULL, 4, &s_h_exec,    1);
 }

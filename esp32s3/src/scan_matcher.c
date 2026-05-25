@@ -48,9 +48,9 @@
 
 /* ── Accept/reject thresholds ───────────────────────────────────────────── */
 #define SM_MIN_HIT_RATE    0.10f    /* ≥10% absolute hit rate (map sparse guard) */
-#define SM_MIN_IMPROVEMENT 5        /* must beat odometry baseline by ≥5 hits */
-#define SM_MAX_XY_MM       25.0f    /* clamp: reject if |dx| or |dy| > 25 mm */
-#define SM_MAX_DTHETA_DEG  5.0f     /* clamp: reject if |dθ| > 5° */
+#define SM_MIN_IMPROVEMENT 3        /* must beat odometry baseline by ≥3 hits */
+#define SM_MAX_XY_MM       80.0f    /* clamp: reject if |dx| or |dy| > 80 mm (search radius 120 mm) */
+#define SM_MAX_DTHETA_DEG  10.0f    /* clamp: reject if |dθ| > 10° */
 
 /* ── Coarse search grid ─────────────────────────────────────────────────── */
 static const float k_c_xy[] = { -100.f, -50.f, 0.f, 50.f, 100.f };  /* mm */

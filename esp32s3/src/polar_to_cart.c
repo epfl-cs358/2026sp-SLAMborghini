@@ -22,8 +22,8 @@ void polar_to_cart_convert(const lidar_scan_t *scan,
         float r = scan->points[i].r_mm;
         if (r <= 0.0f) continue;
 
-        /* Polar → local Cartesian */
-        float rad = scan->points[i].theta_deg * ((float)M_PI / 180.0f);
+        /* Polar → local Cartesian — LiDAR scans clockwise, trig expects CCW */
+        float rad = -scan->points[i].theta_deg * ((float)M_PI / 180.0f);
         float lx  = r * cosf(rad);
         float ly  = r * sinf(rad);
 

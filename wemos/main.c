@@ -110,6 +110,7 @@ static float wrap_rad(float a)
  * Stored here (not inside the PP struct) so it survives between chunks. */
 static uint16_t s_tf_path_id = 0xFFFFu;  /* UINT16_MAX = no valid transform */
 static float    s_tf_c, s_tf_sv;          /* cos(dth), sin(dth) */
+static float    s_tf_dth = 0.0f;          /* heading offset: Wemos_theta - S3_theta */
 static float    s_tf_base_x, s_tf_base_y, s_tf_base_th;
 static float    s_tf_wx, s_tf_wy, s_tf_wth;
 
@@ -167,6 +168,7 @@ static void task_pure_pursuit(void *pvParameters)
                 float dth    = wrap_rad(s_tf_wth - s_tf_base_th);
                 s_tf_c       = cosf(dth);
                 s_tf_sv      = sinf(dth);
+                s_tf_dth     = dth;
                 s_tf_path_id = chunk.path_id;
                 path_active  = true;
                 ESP_LOGI(TAG, "new path id=%u  local_start=(%.0f, %.0f)",
@@ -209,18 +211,21 @@ static void task_pure_pursuit(void *pvParameters)
             .theta = pose.theta,
         };
 
-        /* ── 3. PP command ──────────────────────────────────────────────── */
-        pp_motion_command_t cmd = pp_compute_command(&pp, &front_pose);
+        /* ── 3 & 4. Override check, then PP command ──────────────────────── *
+         * IMPORTANT: pp_compute_command() must NOT be called during an       *
+         * override.  That function advances pursuit_idx (and frees ring      *
+         * slots) based on the robot's current position.  While the Wemos is  *
+         * executing a reactive/escape manoeuvre the robot is off-path, so    *
+         * pursuit_idx would skip forward to a later segment.  When the       *
+         * override expires PP would then resume at the wrong waypoint,        *
+         * silently skipping the section of the A* path the car never drove.  */
 
-        /* ── 4. Actuate ─────────────────────────────────────────────────── *
-         * Local-planner overrides from ESP32-S3 take priority over PP when  *
-         * an obstacle is detected.  The override expires after 300 ms so     *
-         * that a UART dropout reverts to normal path following automatically. */
+        float applied_steer_deg = 90.0f;
 
         control_frame_t lp_override;
         bool have_override = uart_bridge_recv_control_override(&lp_override);
         if (have_override) {
-            last_override = lp_override;
+            last_override    = lp_override;
             override_last_us = now_us;
         }
 
@@ -237,15 +242,27 @@ static void task_pure_pursuit(void *pvParameters)
                 servo_set_deg(90.0f);
                 task_odometry_set_steering_rad(0.0f);
             } else {
-                float heading_err = wrap_rad(lp_override.t_heading - pose.theta);
+                /* Convert S3 world-frame heading to Wemos local frame using the
+                 * stored SE(2) angular offset (captured at last path receipt).
+                 * Without this, the π/2 initial heading difference between frames
+                 * makes forward reactive/escape commands trigger reverse. */
+                float t_hdg = (s_tf_path_id != 0xFFFFu)
+                              ? wrap_rad(lp_override.t_heading + s_tf_dth)
+                              : lp_override.t_heading;
+                float heading_err = wrap_rad(t_hdg - pose.theta);
                 bool  is_reverse  = (heading_err >  (float)(M_PI / 2.0) ||
                                      heading_err < -(float)(M_PI / 2.0));
                 float steer_rad;
                 if (is_reverse) {
-                    /* Reverse: mirror heading error so rear of car points toward target. */
                     steer_rad = wrap_rad(heading_err - (float)M_PI);
                     if (steer_rad >  SERVO_MAX_STEER_RAD) steer_rad =  SERVO_MAX_STEER_RAD;
                     if (steer_rad < -SERVO_MAX_STEER_RAD) steer_rad = -SERVO_MAX_STEER_RAD;
+                    ESP_LOGI(TAG, "REVERSE  t_hdg=%.0f° pose.th=%.0f° err=%.0f° spd=%.0f override_age=%lld us",
+                             (double)(t_hdg * 180.0f / (float)M_PI),
+                             (double)(pose.theta * 180.0f / (float)M_PI),
+                             (double)(heading_err * 180.0f / (float)M_PI),
+                             (double)lp_override.t_speed,
+                             (long long)(now_us - override_last_us));
                     motor_set(-lp_override.t_speed);
                 } else {
                     steer_rad = heading_err;
@@ -254,23 +271,29 @@ static void task_pure_pursuit(void *pvParameters)
                     motor_set(lp_override.t_speed);
                 }
                 float steer_deg = 90.0f + steer_rad * (180.0f / (float)M_PI);
+                applied_steer_deg = steer_deg;
                 servo_set_deg(steer_deg);
                 task_odometry_set_steering_rad(steer_rad);
             }
-        } else if (!override_active && path_active && cmd.stop) {
-            motor_set(0.0f);
-            servo_set_deg(90.0f);
-            task_odometry_set_steering_rad(0.0f);
-            uart_bridge_send_path_done();
-            path_active = false;
-            ESP_LOGI(TAG, "path complete  pose=(%.0f mm, %.0f mm, %.1f°)",
-                     (double)pose.x, (double)pose.y,
-                     (double)(pose.theta * 180.0f / (float)M_PI));
-        } else if (!override_active && path_active && !cmd.stop) {
-            float steer_rad = (cmd.steering_deg - 90.0f) * ((float)M_PI / 180.0f);
-            servo_set_deg(cmd.steering_deg);
-            motor_set(cmd.speed_mm_s);
-            task_odometry_set_steering_rad(steer_rad);
+        } else if (path_active) {
+            /* Only advance pursuit_idx when PP is actually in control */
+            pp_motion_command_t cmd = pp_compute_command(&pp, &front_pose);
+            if (cmd.stop) {
+                motor_set(0.0f);
+                servo_set_deg(90.0f);
+                task_odometry_set_steering_rad(0.0f);
+                uart_bridge_send_path_done();
+                path_active = false;
+                ESP_LOGI(TAG, "path complete  pose=(%.0f mm, %.0f mm, %.1f°)",
+                         (double)pose.x, (double)pose.y,
+                         (double)(pose.theta * 180.0f / (float)M_PI));
+            } else {
+                float steer_rad = (cmd.steering_deg - 90.0f) * ((float)M_PI / 180.0f);
+                applied_steer_deg = cmd.steering_deg;
+                servo_set_deg(cmd.steering_deg);
+                motor_set(cmd.speed_mm_s);
+                task_odometry_set_steering_rad(steer_rad);
+            }
         } else {
             motor_set(0.0f);
             servo_set_deg(90.0f);
@@ -300,7 +323,7 @@ static void task_pure_pursuit(void *pvParameters)
         ESP_LOGD(TAG,
                  "odom: disp=%.2f mm  rate=%.3f r/s  steer=%.1f°  ring=%u  active=%d",
                  (double)pkt.linear_disp_mm, (double)pkt.yaw_rate_imu,
-                 (double)cmd.steering_deg,
+                 (double)applied_steer_deg,
                  (unsigned)pp_get_expected_start_idx(&pp), (int)path_active);
 
         vTaskDelay(pdMS_TO_TICKS(PP_PERIOD_MS));

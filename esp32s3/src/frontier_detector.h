@@ -39,4 +39,27 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
  */
 frontier_t frontier_detector_best(const frontier_list_t *list, const pose_t *robot_pose);
 
+/**
+ * Select the next frontier using a heading-aligned tiered cone search with
+ * curvature feasibility pre-filtering (Option C).
+ *
+ * Four tiers of angular tolerance (widening cone) are tried in order:
+ *   Tier 0: ±30°,  max 3000 mm
+ *   Tier 1: ±60°,  max 4000 mm
+ *   Tier 2: ±120°, max 6000 mm
+ *   Tier 3: ±180°, no cap (fallback, no feasibility check)
+ *
+ * Tiers 0-2 apply steering-reach, corridor-width, and rollout feasibility
+ * checks before accepting a candidate. The nearest feasible candidate in
+ * the first non-empty tier is returned.
+ *
+ * @param list   Frontier list from frontier_detector_detect() (blacklist already applied).
+ * @param robot  Current robot pose (x, y in mm; theta in rad).
+ * @param map    Occupancy map — used for corridor-width and rollout probing.
+ * @return       Nearest feasible frontier, or zero-initialized if list is empty.
+ */
+frontier_t frontier_selector_pick(const frontier_list_t *list,
+                                   const pose_t *robot,
+                                   const quadtree_map_t *map);
+
 #endif /* FRONTIER_DETECTOR_H */

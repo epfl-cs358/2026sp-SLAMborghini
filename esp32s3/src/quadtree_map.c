@@ -250,43 +250,85 @@ size_t qt_memory_bytes(const QuadTreeMap *map)
 
 
 /* ── qt_compact ─────────────────────────────────────────────────────────────
- * Snapshot all confident wall cells, wipe the pool, re-insert.
+ * Snapshot confident wall cells AND deeply-free corridor cells, wipe the
+ * pool in-place, re-insert both sets.
  *
- * Up to QT_COMPACT_MAX cells are saved in a static BSS buffer (no stack
- * allocation).  After the in-place pool reset, each saved cell is
- * re-inserted with qt_update(map, cx, cy, saved_value): because the leaf
- * starts at 0 after the reset, adding saved_value as the delta restores
- * the exact log-odds value in one call.
+ * Budget split (total ≤ 500 → worst-case 500×7 = 3500 nodes < pool of 4000):
+ *   QT_COMPACT_WALL_MAX = 350 — cells with value ≥ min_value  (walls)
+ *   QT_COMPACT_FREE_MAX = 250 — cells with value ≤ FREE_KEEP   (corridors)
+ *
+ * Preserving free cells prevents re-corruption: after compact, explored
+ * corridors stay negative so a single drifted HIT (+30) cannot instantly
+ * flip them to occupied.
  * ────────────────────────────────────────────────────────────────────────── */
-#define QT_COMPACT_MAX 512
+#define QT_COMPACT_WALL_MAX  350
+#define QT_COMPACT_FREE_MAX  250
+#define QT_COMPACT_MAX       (QT_COMPACT_WALL_MAX + QT_COMPACT_FREE_MAX)
+#define QT_COMPACT_FREE_KEEP (-2)   /* preserve free cells at or below this (1× QT_MISS_DEC) */
 
 typedef struct { float cx, cy; int8_t value; } _compact_cell_t;
 
+/* Wall cells occupy indices [0, wall_n).
+ * Free cells occupy indices [QT_COMPACT_WALL_MAX, QT_COMPACT_WALL_MAX+free_n). */
 static _compact_cell_t _s_compact_buf[QT_COMPACT_MAX];
-static int             _s_compact_cnt = 0;
-static int8_t          _s_compact_min = 0;
+static int             _s_compact_wall_n = 0;
+static int             _s_compact_free_n = 0;
+static int8_t          _s_compact_min    = 0;
+
+/* Internal: iterate ALL non-zero leaf nodes (occupied AND free). */
+static void _iterate_all_leaves(const QuadTreeMap *map, uint16_t idx,
+                                 float xmn, float xmx, float ymn, float ymx,
+                                 void (*cb)(float, float, int8_t, void *),
+                                 void *ud)
+{
+    if (idx == QT_NULL) return;
+    const QTNode *n = &map->pool[idx];
+    if (n->depth >= QT_MAX_DEPTH) {
+        if (n->value != 0)
+            cb(0.5f*(xmn+xmx), 0.5f*(ymn+ymx), n->value, ud);
+        return;
+    }
+    for (int q = 0; q < 4; q++) {
+        if (n->children[q] == QT_NULL) continue;
+        float cxmn, cxmx, cymn, cymx;
+        _child_bounds(xmn, xmx, ymn, ymx, q, &cxmn, &cxmx, &cymn, &cymx);
+        _iterate_all_leaves(map, n->children[q],
+                            cxmn, cxmx, cymn, cymx, cb, ud);
+    }
+}
 
 static void _compact_cb(float cx, float cy, int8_t value, void *ud)
 {
     (void)ud;
-    if (value < _s_compact_min)        return;
-    if (_s_compact_cnt >= QT_COMPACT_MAX) return;
-    _s_compact_buf[_s_compact_cnt].cx    = cx;
-    _s_compact_buf[_s_compact_cnt].cy    = cy;
-    _s_compact_buf[_s_compact_cnt].value = value;
-    _s_compact_cnt++;
+    if (value >= _s_compact_min) {
+        if (_s_compact_wall_n >= QT_COMPACT_WALL_MAX) return;
+        _s_compact_buf[_s_compact_wall_n].cx    = cx;
+        _s_compact_buf[_s_compact_wall_n].cy    = cy;
+        _s_compact_buf[_s_compact_wall_n].value = value;
+        _s_compact_wall_n++;
+    } else if (value <= QT_COMPACT_FREE_KEEP) {
+        if (_s_compact_free_n >= QT_COMPACT_FREE_MAX) return;
+        int idx = QT_COMPACT_WALL_MAX + _s_compact_free_n;
+        _s_compact_buf[idx].cx    = cx;
+        _s_compact_buf[idx].cy    = cy;
+        _s_compact_buf[idx].value = value;
+        _s_compact_free_n++;
+    }
 }
 
 void qt_compact(QuadTreeMap *map, int8_t min_value)
 {
     if (!map || !map->pool) return;
 
-    /* 1. Collect confident occupied cells */
-    _s_compact_cnt = 0;
-    _s_compact_min = min_value;
-    qt_iterate_occupied(map, _compact_cb, NULL);
+    /* 1. Collect walls AND deeply-free corridor cells */
+    _s_compact_wall_n = 0;
+    _s_compact_free_n = 0;
+    _s_compact_min    = min_value;
+    _iterate_all_leaves(map, 1,
+                        map->x_min, map->x_max, map->y_min, map->y_max,
+                        _compact_cb, NULL);
 
-    uint16_t saved = (uint16_t)_s_compact_cnt;
+    uint16_t saved  = (uint16_t)(_s_compact_wall_n + _s_compact_free_n);
     uint16_t before = map->count;
 
     /* 2. Reset pool in-place — no malloc/free, just wipe and reinitialise */
@@ -294,16 +336,25 @@ void qt_compact(QuadTreeMap *map, int8_t min_value)
     map->count = 1;   /* slot 0 stays reserved as QT_NULL */
     _alloc(map, 1);   /* recreate root at index 1, depth 1 */
 
-    /* 3. Re-insert saved cells — leaf starts at 0, so delta = saved value */
-    for (int i = 0; i < _s_compact_cnt; i++) {
+    /* 3. Re-insert walls — leaf starts at 0, so delta = saved value */
+    for (int i = 0; i < _s_compact_wall_n; i++) {
         qt_update(map, _s_compact_buf[i].cx,
                        _s_compact_buf[i].cy,
                        _s_compact_buf[i].value);
     }
 
+    /* 4. Re-insert free cells — same trick, delta = saved negative value */
+    for (int i = 0; i < _s_compact_free_n; i++) {
+        int idx = QT_COMPACT_WALL_MAX + i;
+        qt_update(map, _s_compact_buf[idx].cx,
+                       _s_compact_buf[idx].cy,
+                       _s_compact_buf[idx].value);
+    }
+
 #if defined(ESP_PLATFORM)
-    ESP_LOGI(TAG_QT, "compact: %u→%u nodes  saved=%u cells  freed=%u nodes",
+    ESP_LOGI(TAG_QT, "compact: %u→%u nodes  walls=%u free=%u saved=%u freed=%u nodes",
              (unsigned)before, (unsigned)map->count,
+             (unsigned)_s_compact_wall_n, (unsigned)_s_compact_free_n,
              (unsigned)saved,
              (unsigned)(before - map->count));
 #else
