@@ -186,6 +186,11 @@ typedef struct {
     uint8_t   wait_clear_cycles;    /* cycles spent in STOPPED or WAIT_CLEAR */
     uint8_t   stopped_clear_streak; /* consecutive clear cycles in STOPPED (hysteresis) */
     bool      escape_is_stall;      /* true = stall escape (1 m back + 50°); false = FP escape */
+
+    /* Stall-loop obstacle injection */
+    uint8_t   stall_escape_count;        /* incremented each time a stall triggers ESCAPE */
+    bool      inject_obstacle_requested;
+    float     inject_x, inject_y;       /* world coords for virtual obstacle */
 } lp_state_t;
 
 static lp_state_t s; /* zero-initialised by BSS */
@@ -843,6 +848,19 @@ lp_mode_t local_planner_get_mode(void)      { return s.mode; }
 bool      local_planner_replan_needed(void) { return s.replan_requested; }
 void      local_planner_clear_replan(void)  { s.replan_requested = false; }
 
+bool local_planner_obstacle_inject_needed(float *x, float *y)
+{
+    if (!s.inject_obstacle_requested) return false;
+    if (x) *x = s.inject_x;
+    if (y) *y = s.inject_y;
+    return true;
+}
+
+void local_planner_clear_obstacle_inject(void)
+{
+    s.inject_obstacle_requested = false;
+}
+
 
 bool local_planner_update(const quadtree_map_t *map,
                           const pose_t         *raw_pose,
@@ -879,6 +897,7 @@ bool local_planner_update(const quadtree_map_t *map,
         if (s.stall_cycles >= LP_STALL_CYCLES) {
             s.mode              = LP_MODE_ESCAPE;
             s.escape_is_stall   = true;
+            s.stall_escape_count++;
             s.committed_side    = 0;
             s.pp_stable_count   = 0;
             s.escape_phase      = 0;
@@ -887,6 +906,16 @@ bool local_planner_update(const quadtree_map_t *map,
             s.escape_rot_acc    = 0.0f;
             s.escape_start_cyc  = s.cycle_count;
             s.stall_cycles      = 0;
+            /* On the 2nd consecutive stall the obstacle is below LiDAR height —
+             * inject a virtual obstacle so A* routes around it next replan. */
+            if (s.stall_escape_count >= 2) {
+                s.inject_x = raw_pose->x + s.robot_radius * cosf(raw_pose->theta);
+                s.inject_y = raw_pose->y + s.robot_radius * sinf(raw_pose->theta);
+                s.inject_obstacle_requested = true;
+                printf("[LP] stall #%u — injecting obstacle at (%.0f,%.0f)\n",
+                       (unsigned)s.stall_escape_count,
+                       (double)s.inject_x, (double)s.inject_y);
+            }
             printf("[LP] stall detected (%u cycles) — ESCAPE: 1 m reverse + 50° reorient\n",
                    (unsigned)LP_STALL_CYCLES);
         }
@@ -989,6 +1018,8 @@ bool local_planner_update(const quadtree_map_t *map,
         s.pp_stable_count++;
         if (s.pp_stable_count >= 5)
             s.committed_side = 0;
+        if (s.pp_stable_count >= 20)
+            s.stall_escape_count = 0;
         *out_cmd  = lp_pure_pursuit_stub(global_path, raw_pose);
         cmd_valid = true;
 

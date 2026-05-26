@@ -389,6 +389,22 @@ static void task_lidar_slam(void *arg)
                     xTaskNotify(s_h_planner, 0u, eSetValueWithOverwrite);
                 printf("[LP] replan requested\n");
             }
+
+            /* Sub-LiDAR obstacle injection: write two hits at the stall point so
+             * A* routes around it.  Two QT_HIT_INC writes (2×30) reach VALUE_MAX=40
+             * and the cell registers as wall on the very next A* run. */
+            {
+                float inj_x, inj_y;
+                if (local_planner_obstacle_inject_needed(&inj_x, &inj_y)) {
+                    xSemaphoreTake(s_map_mutex, portMAX_DELAY);
+                    qt_update(&s_map, inj_x, inj_y, QT_HIT_INC);
+                    qt_update(&s_map, inj_x, inj_y, QT_HIT_INC);
+                    xSemaphoreGive(s_map_mutex);
+                    local_planner_clear_obstacle_inject();
+                    printf("[LP] injected obstacle at (%.0f,%.0f)\n",
+                           (double)inj_x, (double)inj_y);
+                }
+            }
         }
 
         /* ── 5. Notify dashboard ─────────────────────────────────────────── *
@@ -699,14 +715,24 @@ static void task_planner(void *arg)
         bool goal_found = false;
 
         if (flist.count > 0) {
-            /* Build a filtered copy of the frontier list, skipping blacklisted entries. */
+            /* Build a filtered copy of the frontier list, skipping bad entries. */
+            static const float k_margin = 600.0f; /* stay 600 mm inside map bounds */
             frontier_list_t avail = flist;
             for (int i = 0; i < (int)avail.count; ) {
                 bool bad = false;
-                for (int j = 0; j < bl_n; j++) {
-                    float dx = avail.items[i].cx - bl[j].cx;
-                    float dy = avail.items[i].cy - bl[j].cy;
-                    if (dx*dx + dy*dy < 200.0f*200.0f) { bad = true; break; }
+                /* Reject frontiers near the map perimeter — prevents random behaviour
+                 * when the robot drifts outside the 10 m × 10 m arena. */
+                if (avail.items[i].cx < s_map.x_min + k_margin ||
+                    avail.items[i].cx > s_map.x_max - k_margin ||
+                    avail.items[i].cy < s_map.y_min + k_margin ||
+                    avail.items[i].cy > s_map.y_max - k_margin)
+                    bad = true;
+                if (!bad) {
+                    for (int j = 0; j < bl_n; j++) {
+                        float dx = avail.items[i].cx - bl[j].cx;
+                        float dy = avail.items[i].cy - bl[j].cy;
+                        if (dx*dx + dy*dy < 200.0f*200.0f) { bad = true; break; }
+                    }
                 }
                 if (bad) avail.items[i] = avail.items[--avail.count];
                 else     i++;

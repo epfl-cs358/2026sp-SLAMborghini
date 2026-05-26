@@ -67,6 +67,18 @@ bool local_planner_replan_needed(void);
 void local_planner_clear_replan(void);
 
 /**
+ * Return true if the planner wants to inject a virtual obstacle into the map
+ * (repeated stall against a sub-LiDAR object).  Fills *x and *y with the
+ * world coordinates where the obstacle should be written.
+ * Caller must hold s_map_mutex before calling qt_update(), then call
+ * local_planner_clear_obstacle_inject() to reset the flag.
+ */
+bool local_planner_obstacle_inject_needed(float *x, float *y);
+
+/** Clear the obstacle-inject request after the caller has written to the map. */
+void local_planner_clear_obstacle_inject(void);
+
+/**
  * Reset the waypoint cursor to 0.
  * Must be called whenever a new global path is supplied.
  */
