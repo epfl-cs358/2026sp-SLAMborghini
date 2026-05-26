@@ -88,8 +88,11 @@
 #define LP_ESCAPE_TIMEOUT_CYCLES     30      /* 3 s @ 100 ms */
 #define LP_ESCAPE_ROT_STEP_RAD        0.262f /* 15° per cycle */
 #define LP_ESCAPE_FULL_ROT_RAD        6.283f /* 360° — full rotation = failure */
-#define LP_ESCAPE_REVERSE_CYCLES      4      /* 4 cycles of reverse for FP escape */
-#define LP_ESCAPE_REVERSE_MM         60.0f   /* commanded backward offset */
+#define LP_ESCAPE_REVERSE_MM         60.0f   /* target point behind robot for reverse command */
+#define LP_ESCAPE_FP_BACKUP_MM      180.0f   /* actual odometry distance for footprint escape */
+#define LP_ESCAPE_STALL_BACKUP_MM   320.0f   /* actual odometry distance for stall escape */
+#define LP_ESCAPE_FP_REV_TIMEOUT     25      /* 2.5 s max reverse attempt */
+#define LP_ESCAPE_STALL_REV_TIMEOUT  55      /* 5.5 s max reverse attempt */
 #define LP_ESCAPE_MIN_ROT_RAD         1.571f /* must rotate 90° before testing reactive */
 
 /* STOPPED: stop and wait when obstacle cluster detected (dynamic obstacle assumed) */
@@ -97,8 +100,7 @@
 #define LP_WAIT_CLEAR_CLEAR_STREAK    2      /* consecutive clear cycles to resume from STOPPED */
 /* WAIT_CLEAR: stop after stall escape, wait for path, then replan */
 #define LP_WAIT_CLEAR_TIMEOUT_CYCLES 50      /* 5 s max wait before forced replan */
-/* Stall escape: 1 m reverse then 50° reorient */
-#define LP_ESCAPE_STALL_REV_CYCLES   17      /* 17 × 60 mm ≈ 1020 mm ≈ 1 m */
+/* Stall escape: measured reverse then 50° reorient */
 #define LP_ESCAPE_STEER_MAX_RAD       0.873f /* 50° cap on stall-escape rotation */
 
 /* Speed scaling */
@@ -156,6 +158,8 @@ typedef struct {
     /* ESCAPE */
     uint8_t   escape_phase;      /* 0 = reversing, 1 = rotating */
     uint8_t   escape_rev_cycles;
+    float     escape_start_x;
+    float     escape_start_y;
     float     escape_heading;    /* heading at ESCAPE entry */
     float     escape_rot_acc;    /* total rotation accumulated (rad) */
     uint32_t  escape_start_cyc;
@@ -604,10 +608,10 @@ static bool lp_escape(const quadtree_map_t *map,
                       const path_t *path,
                       control_frame_t *out_cmd)
 {
-    /* Timeout: stall escape gets extra time for the longer reverse */
-    uint32_t timeout = s.escape_is_stall
-                     ? (uint32_t)(LP_ESCAPE_STALL_REV_CYCLES + LP_ESCAPE_TIMEOUT_CYCLES)
-                     : LP_ESCAPE_TIMEOUT_CYCLES;
+    uint32_t reverse_timeout = s.escape_is_stall
+                             ? (uint32_t)LP_ESCAPE_STALL_REV_TIMEOUT
+                             : (uint32_t)LP_ESCAPE_FP_REV_TIMEOUT;
+    uint32_t timeout = reverse_timeout + LP_ESCAPE_TIMEOUT_CYCLES;
     if (s.cycle_count - s.escape_start_cyc >= timeout) {
         if (!s.escape_is_stall) s.replan_requested = true;
         return false; /* caller decides next mode */
@@ -619,9 +623,29 @@ static bool lp_escape(const quadtree_map_t *map,
         return false;
     }
 
-    /* Phase 0: reverse.  Stall escape reverses ~1 m; FP escape reverses ~240 mm. */
-    uint8_t rev_target = s.escape_is_stall ? LP_ESCAPE_STALL_REV_CYCLES
-                                           : LP_ESCAPE_REVERSE_CYCLES;
+    /* Phase 0: reverse until odometry confirms real backward travel.
+     * Counting command cycles is unreliable when the car slips or is stuck. */
+    if (s.escape_phase == 0) {
+        float dx = rx - s.escape_start_x;
+        float dy = ry - s.escape_start_y;
+        float forward_x = cosf(s.escape_heading);
+        float forward_y = sinf(s.escape_heading);
+        float backed_up_mm = -(dx * forward_x + dy * forward_y);
+        if (backed_up_mm < 0.0f) backed_up_mm = 0.0f;
+
+        float backup_target = s.escape_is_stall ? LP_ESCAPE_STALL_BACKUP_MM
+                                                : LP_ESCAPE_FP_BACKUP_MM;
+        if (backed_up_mm >= backup_target) {
+            printf("[LP] escape reverse done: backed %.0f/%.0f mm\n",
+                   (double)backed_up_mm, (double)backup_target);
+            s.escape_phase = 1;
+        } else if (s.escape_rev_cycles >= reverse_timeout) {
+            printf("[LP] escape reverse timeout: backed %.0f/%.0f mm\n",
+                   (double)backed_up_mm, (double)backup_target);
+            s.escape_phase = 1;
+        }
+    }
+
     if (s.escape_phase == 0) {
         float rear_a = rtheta + LP_PI; /* cosf/sinf are periodic, no wrap needed */
         float rear_r = inflate_r * 0.65f;
@@ -633,8 +657,6 @@ static bool lp_escape(const quadtree_map_t *map,
             out_cmd->t_heading = rear_a;
             out_cmd->t_speed   = LP_REVERSE_SPEED_MM_S;
             s.escape_rev_cycles++;
-            if (s.escape_rev_cycles >= rev_target)
-                s.escape_phase = 1;
             return true;
         }
         /* rear wall detected — skip reversal, go straight to rotation */
@@ -902,6 +924,8 @@ bool local_planner_update(const quadtree_map_t *map,
             s.pp_stable_count   = 0;
             s.escape_phase      = 0;
             s.escape_rev_cycles = 0;
+            s.escape_start_x    = raw_pose->x;
+            s.escape_start_y    = raw_pose->y;
             s.escape_heading    = raw_pose->theta;
             s.escape_rot_acc    = 0.0f;
             s.escape_start_cyc  = s.cycle_count;
@@ -916,8 +940,8 @@ bool local_planner_update(const quadtree_map_t *map,
                        (unsigned)s.stall_escape_count,
                        (double)s.inject_x, (double)s.inject_y);
             }
-            printf("[LP] stall detected (%u cycles) — ESCAPE: 1 m reverse + 50° reorient\n",
-                   (unsigned)LP_STALL_CYCLES);
+            printf("[LP] stall detected (%u cycles) — ESCAPE: %.0f mm reverse + 50° reorient\n",
+                   (unsigned)LP_STALL_CYCLES, (double)LP_ESCAPE_STALL_BACKUP_MM);
         }
     }
 
@@ -954,6 +978,8 @@ bool local_planner_update(const quadtree_map_t *map,
             s.pp_stable_count   = 0;
             s.escape_phase      = 0;
             s.escape_rev_cycles = 0;
+            s.escape_start_x    = raw_pose->x;
+            s.escape_start_y    = raw_pose->y;
             s.escape_heading    = theta_f;
             s.escape_rot_acc    = 0.0f;
             s.escape_start_cyc  = s.cycle_count;
