@@ -26,10 +26,10 @@
 #define HEADER_LEN         4u
 #define MAX_PAYLOAD_LEN    255u
 
-static uint8_t checksum_xor(const uint8_t *data, uint8_t len)
+static uint8_t checksum_xor(const uint8_t *data, size_t len)
 {
     uint8_t ck = 0;
-    for (uint8_t i = 0; i < len; i++) {
+    for (size_t i = 0; i < len; i++) {
         ck ^= data[i];
     }
     return ck;
@@ -57,7 +57,7 @@ void uart_bridge_init(void)
 #endif
 }
 
-static bool send_packet(uint8_t msg_type, const void *payload, uint8_t payload_len)
+static bool send_packet(uint8_t msg_type, const void *payload, size_t payload_len)
 {
     if (!payload || payload_len > MAX_PAYLOAD_LEN) {
         return false;
@@ -69,19 +69,19 @@ static bool send_packet(uint8_t msg_type, const void *payload, uint8_t payload_l
     buf[0] = SYNC_A;
     buf[1] = SYNC_B;
     buf[2] = msg_type;
-    buf[3] = payload_len;
+    buf[3] = (uint8_t)payload_len;
 
     memcpy(&buf[4], payload, payload_len);
 
     /* checksum covers: msg_type + payload_len + payload */
     buf[4 + payload_len] = checksum_xor(&buf[2], payload_len + 2);
 
-    const int total_len = HEADER_LEN + payload_len + 1;
+    const size_t total_len = HEADER_LEN + payload_len + 1u;
     int written = uart_write_bytes(BRIDGE_UART_PORT,
                                    (const char *)buf,
                                    total_len);
 
-    return written == total_len;
+    return written == (int)total_len;
 #else
     (void)msg_type;
     (void)payload;
@@ -160,7 +160,7 @@ bool uart_bridge_recv_odom(odom_t *out)
             msg_type != MSG_PATH_DONE &&
             msg_type != MSG_CHUNK_NACK) {
             uint8_t skip[MAX_PAYLOAD_LEN + 1u];
-            uint8_t skip_len = payload_len + 1u;
+            size_t skip_len = (size_t)payload_len + 1u;
             if (skip_len > 0u)
                 uart_read_bytes(BRIDGE_UART_PORT, skip, skip_len, pdMS_TO_TICKS(50));
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
@@ -178,7 +178,7 @@ bool uart_bridge_recv_odom(odom_t *out)
         check_buf[1] = payload_len;
         memcpy(&check_buf[2], payload, payload_len);
 
-        if (checksum_xor(check_buf, (uint8_t)(payload_len + 2u)) != received_ck) {
+        if (checksum_xor(check_buf, (size_t)payload_len + 2u) != received_ck) {
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
             continue;
         }

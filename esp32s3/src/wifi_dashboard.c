@@ -99,6 +99,13 @@ static const char *TAG = "wifi_dash";
 #define TILE_H    16u   /* cells per tile row    */
 #define TILES_ALL  ((uint32_t)((1u << (TILE_COLS * TILE_ROWS)) - 1u))
 
+/* A dashboard cell is 200 mm on a 10 m map, while quadtree leaves are
+ * ~156 mm. Sampling only the display-cell centre can make a visibly explored
+ * square stay orange if that one point falls in an untouched leaf. Use a small
+ * cross pattern for visualization, without changing the actual SLAM map. */
+#define DASH_SAMPLE_COUNT 5u
+#define DASH_SAMPLE_FRAC  0.30f
+
 static uint8_t s_map_buf[MAP_BUF_SIZE];                            /* full map or delta  */
 static uint8_t s_pose_buf[24u];                                    /* pose frame         */
 static uint8_t s_raw_pose_buf[13u];                                /* raw odometry frame */
@@ -181,6 +188,47 @@ static int64_t s_last_map_us  = 0;
 /* ── Command flags ──────────────────────────────────────────────────────── */
 static volatile bool s_start_requested = false;
 static volatile bool s_stop_requested  = false;
+
+
+static uint8_t _sample_dashboard_cell(const quadtree_map_t *map,
+                                      float cx, float cy,
+                                      float sx, float sy)
+{
+    static const float k_offsets[DASH_SAMPLE_COUNT][2] = {
+        { 0.0f,  0.0f},
+        {-1.0f,  0.0f},
+        { 1.0f,  0.0f},
+        { 0.0f, -1.0f},
+        { 0.0f,  1.0f},
+    };
+
+    uint8_t free_count = 0u;
+    uint8_t wall_count = 0u;
+    int8_t  strongest_wall = 0;
+    int8_t  strongest_free = 0;
+
+    for (uint8_t i = 0; i < DASH_SAMPLE_COUNT; i++) {
+        float x = cx + k_offsets[i][0] * sx;
+        float y = cy + k_offsets[i][1] * sy;
+        int8_t v = qt_query_const(map, x, y);
+
+        if (v < 0) {
+            free_count++;
+            if (v < strongest_free) strongest_free = v;
+        } else if (v > 0) {
+            wall_count++;
+            if (v > strongest_wall) strongest_wall = v;
+        }
+    }
+
+    if (wall_count >= 2u || (wall_count > 0u && free_count == 0u))
+        return (uint8_t)((int16_t)strongest_wall + 128);
+
+    if (free_count > 0u)
+        return (uint8_t)((int16_t)strongest_free + 128);
+
+    return 128u;
+}
 
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -270,10 +318,13 @@ static uint32_t _tiles_from_rect(const map_dirty_rect_t *dr)
     float tile_w_mm = (map_w / (float)DASH_GW) * (float)TILE_W;
     float tile_h_mm = (map_h / (float)DASH_GH) * (float)TILE_H;
 
-    int col_min = (int)((dr->x_min - map->x_min) / tile_w_mm);
-    int col_max = (int)((dr->x_max - map->x_min) / tile_w_mm);
-    int row_min = (int)((dr->y_min - map->y_min) / tile_h_mm);
-    int row_max = (int)((dr->y_max - map->y_min) / tile_h_mm);
+    float pad_x = (map_w / (float)DASH_GW) * DASH_SAMPLE_FRAC;
+    float pad_y = (map_h / (float)DASH_GH) * DASH_SAMPLE_FRAC;
+
+    int col_min = (int)((dr->x_min - pad_x - map->x_min) / tile_w_mm);
+    int col_max = (int)((dr->x_max + pad_x - map->x_min) / tile_w_mm);
+    int row_min = (int)((dr->y_min - pad_y - map->y_min) / tile_h_mm);
+    int row_max = (int)((dr->y_max + pad_y - map->y_min) / tile_h_mm);
 
     if (col_min < 0)               col_min = 0;
     if (col_max >= (int)TILE_COLS) col_max = (int)TILE_COLS - 1;
@@ -320,6 +371,8 @@ static void _do_map_send(uint32_t dirty_tiles)
     float cx_step = map_w / (float)DASH_GW;
     float cy_step = map_h / (float)DASH_GH;
     float cell_mm = cx_step;
+    float sx = cx_step * DASH_SAMPLE_FRAC;
+    float sy = cy_step * DASH_SAMPLE_FRAC;
 
     xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
     bool shadow_ok = s_shadow_valid;
@@ -339,8 +392,8 @@ static void _do_map_send(uint32_t dirty_tiles)
             uint32_t tile_idx = tile_row * TILE_COLS + (uint32_t)(ix / TILE_W);
             if (!((dirty_tiles >> tile_idx) & 1u)) continue;
             float cx = map->x_min + (ix + 0.5f) * cx_step;
-            int8_t v = qt_query_const(map, cx, cy);
-            s_new_cells[iy * DASH_GW + ix] = (uint8_t)((int16_t)v + 128);
+            s_new_cells[iy * DASH_GW + ix] =
+                _sample_dashboard_cell(map, cx, cy, sx, sy);
         }
     }
 
