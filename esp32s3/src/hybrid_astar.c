@@ -58,13 +58,11 @@ static const char *TAG = "hybrid_astar";
 #define PLANNER_MAX_STEER_RAD           1.134f  /* 65° — physical steering limit */
 #endif
 
-#ifndef PLANNER_ROBOT_RADIUS_MM
-/* Half-width of car (295/2 = 147.5 mm) rounded up — the relevant lateral
- * clearance for forward-moving paths.  The full half-diagonal (246 mm) is
- * only needed for pure rotation and would make A* reject the start position
- * when the car is within 246 mm of any mapped wall. */
-#define PLANNER_ROBOT_RADIUS_MM         150.0f
-#endif
+/* Car bounding-box half-dimensions (physical measurements, mm).
+ * Used for the heading-aware rectangular footprint check in A*.
+ * Body: 394 mm long × 295 mm wide → half-diagonal ≈ 246 mm. */
+#define PLANNER_CAR_HALF_LENGTH_MM      197.0f   /* 394 / 2 */
+#define PLANNER_CAR_HALF_WIDTH_MM       148.0f   /* 295 / 2, rounded up */
 
 #ifndef HYBRID_XY_RESOLUTION_MM
 #define HYBRID_XY_RESOLUTION_MM         100.0f
@@ -79,7 +77,7 @@ static const char *TAG = "hybrid_astar";
 #endif
 
 #ifndef HYBRID_COLLISION_STEP_MM
-#define HYBRID_COLLISION_STEP_MM        30.0f
+#define HYBRID_COLLISION_STEP_MM        60.0f
 #endif
 
 #ifndef HYBRID_GOAL_TOLERANCE_MM
@@ -387,29 +385,45 @@ static int find_nearest_free_leaf(const qt_free_leaf_t *leaves, int count,
 /* Collision checking                                                          */
 /* -------------------------------------------------------------------------- */
 
-static bool point_robot_collision_free(const quadtree_map_t *map, float x, float y)
+/* Heading-aware rectangular footprint check.
+ * Probes 5 points (centre + 4 corners) of the car's
+ * bounding box rotated to the current heading.  Any probe that lands on an
+ * occupied OR unknown cell (log-odds >= 0) is treated as a collision — the
+ * planner must only route through confirmed-free space (log-odds < 0). */
+static bool point_robot_collision_free(const quadtree_map_t *map,
+                                       float x, float y, float theta)
 {
     if (!is_pose_inside_map(map, x, y)) return false;
 
-    static const float dirs[9][2] = {
-        { 0.0000f,  0.0000f},
-        { 1.0000f,  0.0000f}, {-1.0000f,  0.0000f},
-        { 0.0000f,  1.0000f}, { 0.0000f, -1.0000f},
-        { 0.7071f,  0.7071f}, {-0.7071f,  0.7071f},
-        { 0.7071f, -0.7071f}, {-0.7071f, -0.7071f}
+    const float ct = cosf(theta), st = sinf(theta);
+    const float L  = PLANNER_CAR_HALF_LENGTH_MM;
+    const float W  = PLANNER_CAR_HALF_WIDTH_MM;
+
+    /* 5 probe points in world frame: centre + corners. The local planner still
+     * does dense near-field obstacle checks before the car actually moves. */
+    const float pts[5][2] = {
+        {  0.0f,         0.0f        },   /* centre        */
+        {  L*ct - W*st,  L*st + W*ct },   /* front-left    */
+        {  L*ct + W*st,  L*st - W*ct },   /* front-right   */
+        { -L*ct - W*st, -L*st + W*ct },   /* rear-left     */
+        { -L*ct + W*st, -L*st - W*ct },   /* rear-right    */
     };
-    for (int i = 0; i < 9; ++i) {
-        const float sx = x + dirs[i][0] * PLANNER_ROBOT_RADIUS_MM;
-        const float sy = y + dirs[i][1] * PLANNER_ROBOT_RADIUS_MM;
+
+    for (int i = 0; i < 5; ++i) {
+        const float sx = x + pts[i][0];
+        const float sy = y + pts[i][1];
         if (!is_pose_inside_map(map, sx, sy)) return false;
-        if (qt_query_const(map, sx, sy) > 0)   return false;
+        /* Treat unknown (== 0) and occupied (> 0) as blocked */
+        if (qt_query_const(map, sx, sy) >= 0) return false;
     }
     return true;
 }
 
+/* theta is the constant heading for the segment (straight-line approach). */
 static bool line_is_collision_free_quadtree(const quadtree_map_t *map,
                                             float x0, float y0,
-                                            float x1, float y1)
+                                            float x1, float y1,
+                                            float theta)
 {
     const float dx = x1 - x0, dy = y1 - y0;
     const float d  = sqrtf(dx * dx + dy * dy);
@@ -417,7 +431,7 @@ static bool line_is_collision_free_quadtree(const quadtree_map_t *map,
     if (samples < 1) samples = 1;
     for (int i = 0; i <= samples; ++i) {
         const float t = (float)i / (float)samples;
-        if (!point_robot_collision_free(map, x0 + t*dx, y0 + t*dy)) return false;
+        if (!point_robot_collision_free(map, x0 + t*dx, y0 + t*dy, theta)) return false;
     }
     return true;
 }
@@ -435,7 +449,7 @@ static bool simulate_primitive(const quadtree_map_t *map,
     const float ds = ((float)direction * HYBRID_PRIMITIVE_STEP_MM) / (float)ns;
 
     float x = x0, y = y0, theta = theta0;
-    if (!point_robot_collision_free(map, x, y)) return false;
+    if (!point_robot_collision_free(map, x, y, theta)) return false;
 
     for (int i = 0; i < ns; ++i) {
         if (fabsf(steer) < 1.0e-4f) {
@@ -450,7 +464,7 @@ static bool simulate_primitive(const quadtree_map_t *map,
             theta  = next_theta;
         }
         theta = wrap_pi(theta);
-        if (!point_robot_collision_free(map, x, y)) return false;
+        if (!point_robot_collision_free(map, x, y, theta)) return false;
     }
     *x_out = x; *y_out = y; *theta_out = wrap_pi(theta);
     return true;
@@ -682,7 +696,10 @@ static bool choose_goal_approach_pose(const quadtree_map_t *map,
     if (!map_is_valid(map) || !goal || !goal_x || !goal_y) return false;
     if (!is_pose_inside_map(map, goal->cx, goal->cy))      return false;
 
-    if (point_robot_collision_free(map, goal->cx, goal->cy)) {
+    /* Heading unknown at this stage; check at theta=0 (worst-case axis-aligned).
+     * The frontier safety_spiral already guarantees a 5×5-cell free box around
+     * the target, so this check nearly always passes. */
+    if (point_robot_collision_free(map, goal->cx, goal->cy, 0.0f)) {
         *goal_x = goal->cx; *goal_y = goal->cy;
         return true;
     }
@@ -711,16 +728,18 @@ static bool append_frontier_if_safe(const quadtree_map_t *map,
     const float d = dist_xy(last->x, last->y, goal->cx, goal->cy);
     if (d <= 1.0f) return true;
 
+    /* Heading for the final straight segment to the frontier */
+    const float heading = atan2f(goal->cy - last->y, goal->cx - last->x);
+
     const bool free_seg =
         line_is_collision_free_quadtree(map, last->x, last->y,
-                                        goal->cx, goal->cy);
+                                        goal->cx, goal->cy, heading);
     if (!free_seg) {
         if (d > MAX_FRONTIER_APPEND_MM)                    return true;
         if (!is_pose_inside_map(map, goal->cx, goal->cy))  return true;
-        if (qt_query_const(map, goal->cx, goal->cy) > 0)   return true;
+        /* Treat unknown (== 0) as blocked, same as in the collision check */
+        if (qt_query_const(map, goal->cx, goal->cy) >= 0)  return true;
     }
-
-    const float heading = atan2f(goal->cy - last->y, goal->cx - last->x);
     last->theta = heading;
     path->waypoints[path->length].x        = goal->cx;
     path->waypoints[path->length].y        = goal->cy;
@@ -744,7 +763,7 @@ path_t hybrid_astar_plan(const quadtree_map_t *map,
     if (!map_is_valid(map) || !start || !goal)           return path;
     if (!is_pose_inside_map(map, start->x, start->y) ||
         !is_pose_inside_map(map, goal->cx, goal->cy))    return path;
-    if (!point_robot_collision_free(map, start->x, start->y)) {
+    if (!point_robot_collision_free(map, start->x, start->y, start->theta)) {
         ESP_LOGW(TAG, "start pose is not in known-free space");
         return path;
     }

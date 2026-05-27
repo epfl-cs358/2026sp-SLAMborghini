@@ -533,17 +533,43 @@ frontier_t frontier_detector_best(const frontier_list_t *list,
 #define _FS_LATERAL_FWD_MM  200.0f   /* look-ahead distance along heading */
 #define _FS_LATERAL_STEP_MM  50.0f   /* lateral probe step size */
 #define _FS_LATERAL_STEPS      4     /* steps each side = 200 mm max */
+#define _FS_ROBOT_RADIUS_MM 246.0f   /* half-diagonal of the car footprint */
 
 /* Mini rollout */
 #define _FS_ROLLOUT_STEPS      4     /* probe points */
 #define _FS_ROLLOUT_STEP_MM  200.0f  /* spacing of probe points */
-#define _FS_ROLLOUT_MAX_OCC    2     /* reject if 2+ occupied cells on direct path */
 
 static float _fs_wrap_pi(float a)
 {
     while (a >  (float)M_PI) a -= 2.0f * (float)M_PI;
     while (a < -(float)M_PI) a += 2.0f * (float)M_PI;
     return a;
+}
+
+static bool _fs_not_occupied(const quadtree_map_t *map, float x, float y)
+{
+    return qt_query_const(map, x, y) <= 0;
+}
+
+static bool _fs_footprint_clear(const quadtree_map_t *map,
+                                float x, float y, float theta)
+{
+    static const float fp_off[8] = {
+        0.0f, 0.7854f, 1.5708f, 2.3562f,
+        3.1416f, 3.9270f, 4.7124f, 5.4978f
+    };
+
+    if (!_fs_not_occupied(map, x, y)) return false;
+
+    for (int i = 0; i < 8; i++) {
+        float a = theta + fp_off[i];
+        if (!_fs_not_occupied(map,
+                              x + _FS_ROBOT_RADIUS_MM * cosf(a),
+                              y + _FS_ROBOT_RADIUS_MM * sinf(a)))
+            return false;
+    }
+
+    return true;
 }
 
 /* Bicycle model: can the robot reach the frontier without exceeding max
@@ -580,19 +606,21 @@ static bool _fs_check_width(const pose_t *robot, const frontier_t *f,
     int lw = 0, rw = 0;
     for (int s = 1; s <= _FS_LATERAL_STEPS; s++) {
         float step = (float)s * _FS_LATERAL_STEP_MM;
-        if (qt_query_const(map, px + lx * step, py + ly * step) > 0) break;
+        if (!_fs_not_occupied(map, px + lx * step, py + ly * step)) break;
         lw++;
     }
     for (int s = 1; s <= _FS_LATERAL_STEPS; s++) {
         float step = (float)s * _FS_LATERAL_STEP_MM;
-        if (qt_query_const(map, px - lx * step, py - ly * step) > 0) break;
+        if (!_fs_not_occupied(map, px - lx * step, py - ly * step)) break;
         rw++;
     }
     return ((float)(lw + rw) * _FS_LATERAL_STEP_MM) >= _FS_WIDTH_MIN_MM;
 }
 
-/* Rollout: sample 4 cells along the straight line robot→frontier.
- * Reject if 2 or more are occupied. */
+/* Rollout: sample the full robot footprint along the straight line
+ * robot→frontier. This selector is a cheap pre-filter, so unknown is allowed:
+ * frontiers live next to unknown by definition. Hybrid A* remains the final
+ * strict validator before the path is executed. */
 static bool _fs_check_rollout(const pose_t *robot, const frontier_t *f,
                                const quadtree_map_t *map)
 {
@@ -602,14 +630,20 @@ static bool _fs_check_rollout(const pose_t *robot, const frontier_t *f,
     if (dist < 1.0f) return true;
 
     float ux = dx / dist, uy = dy / dist;
-    int occ = 0;
+    float heading = atan2f(dy, dx);
+    if (!_fs_footprint_clear(map, f->cx, f->cy, heading))
+        return false;
+
     for (int s = 1; s <= _FS_ROLLOUT_STEPS; s++) {
         float step = (float)s * _FS_ROLLOUT_STEP_MM;
         if (step >= dist) break;
-        if (qt_query_const(map, robot->x + ux * step, robot->y + uy * step) > 0)
-            occ++;
+        if (!_fs_footprint_clear(map,
+                                 robot->x + ux * step,
+                                 robot->y + uy * step,
+                                 heading))
+            return false;
     }
-    return occ < _FS_ROLLOUT_MAX_OCC;
+    return true;
 }
 
 static bool _fs_feasible(const pose_t *robot, const frontier_t *f,
@@ -641,8 +675,6 @@ frontier_t frontier_selector_pick(const frontier_list_t *list,
     for (int t = 0; t < N_TIERS; t++) {
         float best_dist = 1e9f;
         int   best_idx  = -1;
-        bool  do_feasibility = (t < N_TIERS - 1);
-
         for (uint8_t i = 0; i < list->count; i++) {
             const frontier_t *f = &list->items[i];
             float dx = f->cx - robot->x;
@@ -656,7 +688,7 @@ frontier_t frontier_selector_pick(const frontier_list_t *list,
             float herr = fabsf(_fs_wrap_pi(goal_hdg - robot->theta));
             if (herr > tiers[t].half_angle_rad) continue;
 
-            if (do_feasibility && !_fs_feasible(robot, f, map)) continue;
+            if (!_fs_feasible(robot, f, map)) continue;
 
             if (dist < best_dist) {
                 best_dist = dist;
@@ -667,5 +699,25 @@ frontier_t frontier_selector_pick(const frontier_list_t *list,
         if (best_idx >= 0) return list->items[best_idx];
     }
 
-    return list->items[0];   /* should never reach: tier 3 = ±180° with no cap */
+    /* Strict feasibility can be too conservative in narrow corridors because
+     * frontier targets intentionally sit on the boundary of unknown space.
+     * Fall back to the highest-clearance candidate instead of idling forever;
+     * Hybrid A* still performs the strict full-path validation before motion. */
+    float best_score = -1.0f;
+    int best_idx = -1;
+    for (uint8_t i = 0; i < list->count; i++) {
+        const frontier_t *f = &list->items[i];
+        float dx = f->cx - robot->x;
+        float dy = f->cy - robot->y;
+        float dist = sqrtf(dx * dx + dy * dy);
+        if (dist < 1.0f) dist = 1.0f;
+
+        float score = (float)f->size / dist;
+        if (score > best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    return (best_idx >= 0) ? list->items[best_idx] : (frontier_t){0};
 }

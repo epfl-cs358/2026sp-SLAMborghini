@@ -110,6 +110,26 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#ifndef LP_DEBUG
+#define LP_DEBUG 0
+#endif
+
+#if LP_DEBUG
+#define LP_LOG(...) printf(__VA_ARGS__)
+#else
+#define LP_LOG(...) do {} while (0)
+#endif
+
+#ifndef SM_DEBUG
+#define SM_DEBUG 0
+#endif
+
+#if SM_DEBUG
+#define SM_LOG(...) printf(__VA_ARGS__)
+#else
+#define SM_LOG(...) do {} while (0)
+#endif
+
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Shared state
@@ -262,7 +282,7 @@ static void task_lidar_slam(void *arg)
             while (s_pose.theta < -(float)M_PI) s_pose.theta += 2.0f * (float)M_PI;
             xSemaphoreGive(s_pose_mutex);
 
-            printf("[SM] corr  odom=(%.0f,%.0f,%.1f°)  matched=(%.0f,%.0f,%.1f°)"
+            SM_LOG("[SM] corr  odom=(%.0f,%.0f,%.1f°)  matched=(%.0f,%.0f,%.1f°)"
                    "  delta=(dx=%+.0f dy=%+.0f dθ=%+.1f°)"
                    "  score=%d(+%d)/%d(%.0f%%)  t=%lu us\n",
                    (double)raw_pose.x, (double)raw_pose.y,
@@ -277,7 +297,7 @@ static void task_lidar_slam(void *arg)
         } else {
             matched_pose = raw_pose;
             if (sm.samples > 0)
-                printf("[SM] skip  score=%d(+%d)/%d(%.0f%%)  t=%lu us\n",
+                SM_LOG("[SM] skip  score=%d(+%d)/%d(%.0f%%)  t=%lu us\n",
                        sm.score, sm.score - sm.baseline, sm.samples,
                        (double)(100.0f * sm.score / sm.samples),
                        (unsigned long)sm.elapsed_us);
@@ -377,7 +397,7 @@ static void task_lidar_slam(void *arg)
              * during normal PURE_PURSUIT mode. */
             if (lp_valid && lp_mode != LP_MODE_PURE_PURSUIT) {
                 uart_bridge_send_control(&lp_cmd);
-                printf("[LP] mode=%d  spd=%.0f  hdg=%.1f°\n",
+                LP_LOG("[LP] mode=%d  spd=%.0f  hdg=%.1f°\n",
                        (int)lp_mode,
                        (double)lp_cmd.t_speed,
                        (double)(lp_cmd.t_heading * 180.0f / (float)M_PI));
@@ -739,7 +759,7 @@ static void task_planner(void *arg)
             }
             if (avail.count > 0) {
                 goal = frontier_selector_pick(&avail, &pose, &s_map);
-                goal_found = true;
+                goal_found = (goal.size > 0);
             }
         }
         xSemaphoreGive(s_map_mutex);
@@ -777,9 +797,10 @@ static void task_planner(void *arg)
         no_frontier_streak = 0;
 
         if (!goal_found) {
-            /* All frontiers blacklisted — wait for map to grow, then retry fresh. */
-            wifi_dashboard_log("[PLAN] all frontiers blacklisted — waiting 1.5 s for map update");
-            printf("[PLAN] all frontiers blacklisted — waiting 1.5 s\n");
+            /* No safe, feasible frontier right now — wait for map to grow,
+             * then retry fresh. */
+            wifi_dashboard_log("[PLAN] no safe frontier — waiting 1.5 s for map update");
+            printf("[PLAN] no safe frontier — waiting 1.5 s\n");
             bl_n = 0;
             vTaskDelay(pdMS_TO_TICKS(1500));
             continue;

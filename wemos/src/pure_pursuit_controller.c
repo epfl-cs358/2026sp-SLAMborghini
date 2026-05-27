@@ -244,8 +244,7 @@ pp_motion_command_t pp_compute_command(pure_pursuit_controller_t *pp,
     waypoint_t target_r = to_robot_frame(pose, target_g);
 
     if (target_r.y <= -300.0f) {
-        pp_motion_command_t straight = { pp->fixed_speed_mm_s, 90.0f, false };
-        return straight;
+        return stop;
     }
 
     float ld_sq = target_r.x*target_r.x + target_r.y*target_r.y;

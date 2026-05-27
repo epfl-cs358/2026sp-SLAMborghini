@@ -11,6 +11,9 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=512
 
+# This Wemos reports 2 MB flash; keep ESP-IDF from assuming esp32dev's 4 MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+
 # ── WiFi DRAM reduction ──────────────────────────────────────────────────────
 # Default WiFi needs ~80-100 KB contiguous DRAM. Wemos only has 106 KB total.
 # These cuts bring WiFi to ~55 KB, leaving room for the pool (24 KB) + stack.

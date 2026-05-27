@@ -22,6 +22,16 @@
 #define LP_PI   3.14159265f
 #define LP_2PI  6.28318530f
 
+#ifndef LP_DEBUG
+#define LP_DEBUG 0
+#endif
+
+#if LP_DEBUG
+#define LP_LOG(...) printf(__VA_ARGS__)
+#else
+#define LP_LOG(...) do {} while (0)
+#endif
+
 /* ════════════════════════════════════════════════════════════════════════════
  * Physical / tuning constants
  * ════════════════════════════════════════════════════════════════════════════ */
@@ -31,8 +41,8 @@
 #define LP_ROBOT_RADIUS_DEFAULT_MM  246.0f
 #define LP_WHEELBASE_MM             260.0f
 #define LP_MAX_STEER_RAD            1.134f   /* 65° — physical steering limit */
-#define LP_BASE_SPEED_MM_S          150.0f
-#define LP_REVERSE_SPEED_MM_S        80.0f
+#define LP_BASE_SPEED_MM_S          120.0f
+#define LP_REVERSE_SPEED_MM_S        70.0f
 
 /* Pose filter */
 #define LP_THETA_ALPHA               0.3f    /* weight on new raw sample (EMA) */
@@ -45,10 +55,11 @@
 #define LP_FWD_ANGLES                 5
 #define LP_FWD_DISTANCES              3
 #define LP_FWD_TOTAL                 15      /* 5 × 3 forward cells */
-#define LP_FOOT_CELLS                 4
-#define LP_FWD_NEAR_MM              150.0f
-#define LP_FWD_MID_MM               200.0f
-#define LP_FWD_FAR_MM               300.0f  /* 30 cm — max detection distance */
+#define LP_FOOT_CELLS                 8
+#define LP_FWD_NEAR_MM              200.0f
+#define LP_FWD_MID_MM               350.0f
+#define LP_FWD_FAR_MM               500.0f  /* 50 cm — max detection distance */
+#define LP_FWD_DANGER_MM            500.0f  /* single centre hit inside this range interrupts PP */
 #define LP_CLUSTER_THRESH             3      /* 3 occupied cells in the forward arc
                                              * triggers STOPPED; a flat wall at 300 mm
                                              * hits 3+ beams (0°, ±22.5°) → triggers.
@@ -92,8 +103,8 @@
 #define LP_ESCAPE_REVERSE_MM         60.0f   /* commanded backward offset */
 #define LP_ESCAPE_MIN_ROT_RAD         1.571f /* must rotate 90° before testing reactive */
 
-/* STOPPED: stop and wait when obstacle cluster detected (dynamic obstacle assumed) */
-#define LP_WAIT_CLEAR_MAX_CYCLES     30      /* 3 s in STOPPED before treating as static → replan */
+/* STOPPED: stop briefly when no safe local avoidance exists. */
+#define LP_WAIT_CLEAR_MAX_CYCLES      5      /* 0.5 s in STOPPED before treating as static → replan */
 #define LP_WAIT_CLEAR_CLEAR_STREAK    2      /* consecutive clear cycles to resume from STOPPED */
 /* WAIT_CLEAR: stop after stall escape, wait for path, then replan */
 #define LP_WAIT_CLEAR_TIMEOUT_CYCLES 50      /* 5 s max wait before forced replan */
@@ -119,6 +130,8 @@
 
 typedef struct {
     bool    footprint_occupied;
+    bool    footprint_front_occupied;
+    bool    forward_danger;
     uint8_t occ_count;
     uint8_t unk_count;
     uint8_t free_count;
@@ -223,6 +236,32 @@ static bool lp_occupied(const quadtree_map_t *map, float x, float y)
     return qt_query_const(map, x, y) > 0;
 }
 
+static bool lp_footprint_occupied(const quadtree_map_t *map,
+                                  float rx, float ry, float rtheta,
+                                  float inflate_r,
+                                  bool *front_hit)
+{
+    static const float fp_off[LP_FOOT_CELLS] = {
+        0.0f, 0.7854f, 1.5708f, 2.3562f,
+        3.1416f, 3.9270f, 4.7124f, 5.4978f
+    };
+
+    bool hit = false;
+    bool front = false;
+
+    for (int i = 0; i < LP_FOOT_CELLS; i++) {
+        float a = rtheta + fp_off[i];
+        if (lp_occupied(map, rx + inflate_r * cosf(a), ry + inflate_r * sinf(a))) {
+            hit = true;
+            if (cosf(fp_off[i]) > 0.35f)
+                front = true;
+        }
+    }
+
+    if (front_hit) *front_hit = front;
+    return hit;
+}
+
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Step 1 — Pose filter
@@ -307,24 +346,17 @@ static void lp_query_window(const quadtree_map_t *map,
                             float inflate_r,
                             lp_window_t *w)
 {
-    /* A. Footprint cells at 4 cardinal directions */
-    w->footprint_occupied = false;
-    float fp_r = inflate_r * 0.65f;
-    const float fp_off[LP_FOOT_CELLS] = { 0.0f, 1.5708f, 3.1416f, 4.7124f };
-    for (int i = 0; i < LP_FOOT_CELLS; i++) {
-        float a = rtheta + fp_off[i];
-        if (lp_occupied(map, rx + fp_r * cosf(a), ry + fp_r * sinf(a))) {
-            w->footprint_occupied = true;
-            return;
-        }
+    memset(w, 0, sizeof(*w));
+
+    /* A. Footprint cells around the full inflated robot radius. */
+    bool front_hit = false;
+    if (lp_footprint_occupied(map, rx, ry, rtheta, inflate_r, &front_hit)) {
+        w->footprint_occupied = true;
+        w->footprint_front_occupied = front_hit;
+        return;
     }
 
-    /* B. Forward arc: 5 angles × 4 distances = 20 cells */
-    w->occ_count         = 0;
-    w->unk_count         = 0;
-    w->free_count        = 0;
-    w->occ_bearing_count = 0;
-
+    /* B. Forward arc: 5 angles × 3 distances = 15 cells */
     static const float ang[LP_FWD_ANGLES] = {
         -0.7854f, -0.3927f, 0.0f, 0.3927f, 0.7854f  /* ±45°, ±22.5°, 0° */
     };
@@ -339,6 +371,11 @@ static void lp_query_window(const quadtree_map_t *map,
             float cy = ry + dist[di] * sinf(a);
             int8_t v = lp_cell(map, cx, cy);
             if (v > 0) {
+                if (di < LP_FWD_DISTANCES &&
+                    dist[di] <= LP_FWD_DANGER_MM &&
+                    fabsf(ang[ai]) < 0.05f) {
+                    w->forward_danger = true;
+                }
                 w->occ_count++;
                 if (w->occ_bearing_count < LP_FWD_TOTAL) {
                     w->occ_bearings[w->occ_bearing_count++] =
@@ -475,6 +512,10 @@ static lp_cand_t lp_rollout(const quadtree_map_t *map,
         y      += step * sinf(heading);
         dist   += step;
         steps++;
+
+        if (lp_footprint_occupied(map, x, y, heading, s.inflate_radius, NULL)) {
+            return r; /* body/corner collision */
+        }
 
         int8_t v = lp_cell(map, x, y);
 
@@ -633,8 +674,13 @@ static bool lp_escape(const quadtree_map_t *map,
             out_cmd->t_heading = rear_a;
             out_cmd->t_speed   = LP_REVERSE_SPEED_MM_S;
             s.escape_rev_cycles++;
-            if (s.escape_rev_cycles >= rev_target)
+            if (s.escape_rev_cycles >= rev_target) {
+                if (!s.escape_is_stall) {
+                    s.replan_requested = true;
+                    return false;
+                }
                 s.escape_phase = 1;
+            }
             return true;
         }
         /* rear wall detected — skip reversal, go straight to rotation */
@@ -659,7 +705,7 @@ static bool lp_escape(const quadtree_map_t *map,
 
     /* Stall escape: stop after rotating 50° toward safe area → WAIT_CLEAR */
     if (s.escape_is_stall && s.escape_rot_acc >= LP_ESCAPE_STEER_MAX_RAD) {
-        printf("[LP] stall escape: 50° reorient done — entering WAIT_CLEAR\n");
+        LP_LOG("[LP] stall escape: 50° reorient done — entering WAIT_CLEAR\n");
         return false; /* caller sets mode = WAIT_CLEAR */
     }
 
@@ -671,7 +717,7 @@ static bool lp_escape(const quadtree_map_t *map,
             s.escape_rot_acc >= LP_ESCAPE_MIN_ROT_RAD) {
         if (s.escape_is_stall) {
             /* Stall: found safe direction before 50° — stop and wait for replan */
-            printf("[LP] stall escape: clear direction found — entering WAIT_CLEAR\n");
+            LP_LOG("[LP] stall escape: clear direction found — entering WAIT_CLEAR\n");
             return false; /* caller sets mode = WAIT_CLEAR */
         }
         /* FP escape: exit with a reactive command from current heading */
@@ -706,23 +752,24 @@ static bool lp_handle_stopped(const lp_window_t *w, float theta_f,
 
     s.wait_clear_cycles++;
 
-    if (!w->footprint_occupied && w->occ_count < LP_CLUSTER_THRESH) {
+    if (!w->footprint_occupied && !w->forward_danger &&
+        w->occ_count < LP_CLUSTER_THRESH) {
         s.stopped_clear_streak++;
         if (s.stopped_clear_streak >= LP_WAIT_CLEAR_CLEAR_STREAK) {
             /* Dynamic obstacle cleared — resume current path, no replan */
             s.mode                 = LP_MODE_PURE_PURSUIT;
             s.wait_clear_cycles    = 0;
             s.stopped_clear_streak = 0;
-            printf("[LP] STOPPED: obstacle cleared — resuming PP\n");
+            LP_LOG("[LP] STOPPED: obstacle cleared — resuming PP\n");
         }
     } else {
         s.stopped_clear_streak = 0;
         if (s.wait_clear_cycles >= LP_WAIT_CLEAR_MAX_CYCLES) {
-            /* Still blocked after 3 s — treat as static, request replan */
+            /* Still blocked after the short wait — treat as static, request replan */
             s.replan_requested  = true;
             s.mode              = LP_MODE_PURE_PURSUIT;
             s.wait_clear_cycles = 0;
-            printf("[LP] STOPPED: timeout — treating obstacle as static, replanning\n");
+            LP_LOG("[LP] STOPPED: timeout — treating obstacle as static, replanning\n");
         }
     }
 
@@ -745,18 +792,19 @@ static bool lp_handle_wait_clear(const lp_window_t *w, float theta_f,
 
     s.wait_clear_cycles++;
 
-    if (!w->footprint_occupied && w->occ_count < LP_CLUSTER_THRESH) {
+    if (!w->footprint_occupied && !w->forward_danger &&
+        w->occ_count < LP_CLUSTER_THRESH) {
         /* Path clear — replan (stall may have caused odometry drift) */
         s.replan_requested  = true;
         s.mode              = LP_MODE_PURE_PURSUIT;
         s.wait_clear_cycles = 0;
-        printf("[LP] WAIT_CLEAR: path clear — replanning\n");
+        LP_LOG("[LP] WAIT_CLEAR: path clear — replanning\n");
     } else if (s.wait_clear_cycles >= LP_WAIT_CLEAR_TIMEOUT_CYCLES) {
         /* Force replan after 5 s to avoid deadlock */
         s.replan_requested  = true;
         s.mode              = LP_MODE_PURE_PURSUIT;
         s.wait_clear_cycles = 0;
-        printf("[LP] WAIT_CLEAR: timeout — forcing replan\n");
+        LP_LOG("[LP] WAIT_CLEAR: timeout — forcing replan\n");
     }
 
     return true;
@@ -873,6 +921,22 @@ bool local_planner_update(const quadtree_map_t *map,
     /* Step 2: Override — emergency layer has control, skip entirely */
     if (override_flag) return false;
 
+    bool path_active = global_path && global_path->length > 0;
+
+    /* The local planner is an exception layer on top of active navigation.
+     * When no path is being executed (dashboard idle, no frontier, A* failed),
+     * it must not initiate ESCAPE just because the mapped footprint is close
+     * to a wall.  Otherwise a stationary robot in a tight room can start
+     * reversing by itself as soon as the map marks nearby cells occupied. */
+    if (!path_active) {
+        s.prev_cmd_speed = 0.0f;
+        s.stall_cycles   = 0;
+        s.fp_occ_streak  = 0;
+        if (s.mode != LP_MODE_RECOVER)
+            s.mode = LP_MODE_PURE_PURSUIT;
+        return false;
+    }
+
     /* Stall detection — triggers ESCAPE when a path is active but the car has
      * not moved for LP_STALL_CYCLES consecutive cycles.  Catches two failure
      * modes: (1) LP stays in PURE_PURSUIT while physically jammed against a
@@ -886,7 +950,6 @@ bool local_planner_update(const quadtree_map_t *map,
         s.prev_x   = raw_pose->x;
         s.prev_y   = raw_pose->y;
 
-        bool path_active = global_path && global_path->length > 0;
         if (path_active && s.mode != LP_MODE_ESCAPE && disp < LP_STALL_DISP_MM
                 && s.prev_cmd_speed > 30.0f) {
             s.stall_cycles++;
@@ -912,11 +975,11 @@ bool local_planner_update(const quadtree_map_t *map,
                 s.inject_x = raw_pose->x + s.robot_radius * cosf(raw_pose->theta);
                 s.inject_y = raw_pose->y + s.robot_radius * sinf(raw_pose->theta);
                 s.inject_obstacle_requested = true;
-                printf("[LP] stall #%u — injecting obstacle at (%.0f,%.0f)\n",
+                LP_LOG("[LP] stall #%u — injecting obstacle at (%.0f,%.0f)\n",
                        (unsigned)s.stall_escape_count,
                        (double)s.inject_x, (double)s.inject_y);
             }
-            printf("[LP] stall detected (%u cycles) — ESCAPE: 1 m reverse + 50° reorient\n",
+            LP_LOG("[LP] stall detected (%u cycles) — ESCAPE: 1 m reverse + 50° reorient\n",
                    (unsigned)LP_STALL_CYCLES);
         }
     }
@@ -936,17 +999,33 @@ bool local_planner_update(const quadtree_map_t *map,
     lp_window_t w;
     lp_query_window(map, raw_pose->x, raw_pose->y, theta_f, inflate_r, &w);
 
-    bool has_cluster = (w.occ_count >= LP_CLUSTER_THRESH);
+    bool has_cluster = w.forward_danger || (w.occ_count >= LP_CLUSTER_THRESH);
     bool cmd_valid   = false;
 
-    /* A. Footprint occupied → ESCAPE (wall is inside car body, must back up).
-     * Require 2 consecutive fp_occ=1 cycles (hysteresis) to avoid triggering
-     * ESCAPE on single-cell map noise from pose drift.
-     * Do NOT use STOPPED here — it has no exit and the car freezes forever. */
-    if (w.footprint_occupied) s.fp_occ_streak++;
-    else                      s.fp_occ_streak = 0;
+    /* A. Front footprint occupied → ESCAPE (wall is in front of the car, must
+     * back up).  Side footprint hits are common in narrow corridors and should
+     * not create a stop/reverse loop: PP can still steer through the corridor,
+     * while the forward arc below stops if the path ahead is actually blocked.
+     * Require 2 consecutive front hits (hysteresis) to avoid triggering ESCAPE
+     * on single-cell map noise from pose drift.  The first hit still commands
+     * a hard stop so the car never keeps driving into a frontal obstacle while
+     * the hysteresis confirms the collision. */
+    if (w.footprint_front_occupied) s.fp_occ_streak++;
+    else                            s.fp_occ_streak = 0;
 
-    if (w.footprint_occupied && s.fp_occ_streak >= 2) {
+    if (w.footprint_front_occupied && s.fp_occ_streak < 2) {
+        if (s.mode != LP_MODE_ESCAPE)
+            s.mode = LP_MODE_STOPPED;
+        out_cmd->tx        = 0.0f;
+        out_cmd->ty        = 0.0f;
+        out_cmd->t_heading = theta_f;
+        out_cmd->t_speed   = 0.0f;
+        s.prev_cmd_speed   = 0.0f;
+        s.cycle_count++;
+        return true;
+    }
+
+    if (w.footprint_front_occupied && s.fp_occ_streak >= 2) {
         if (s.mode != LP_MODE_ESCAPE) {
             s.mode              = LP_MODE_ESCAPE;
             s.escape_is_stall   = false;
@@ -970,7 +1049,7 @@ bool local_planner_update(const quadtree_map_t *map,
             out_cmd->t_speed   = 0.0f;
             cmd_valid          = true;
         }
-        printf("[LP] mode=%d phase=%d rtheta=%.0f° cmd_hdg=%.0f° spd=%.0f sigma=%.3f fp_occ=1 streak=%u occ=%u\n",
+        LP_LOG("[LP] mode=%d phase=%d rtheta=%.0f° cmd_hdg=%.0f° spd=%.0f sigma=%.3f fp_front=1 streak=%u occ=%u\n",
                (int)s.mode, (int)s.escape_phase,
                (double)(theta_f * 180.0f / LP_PI),
                (double)(out_cmd->t_heading * 180.0f / LP_PI),
@@ -1024,17 +1103,25 @@ bool local_planner_update(const quadtree_map_t *map,
         cmd_valid = true;
 
     } else {
-        /* Obstacle cluster in forward arc — stop and wait (assume dynamic object) */
-        if (s.mode != LP_MODE_STOPPED) {
-            s.mode                 = LP_MODE_STOPPED;
-            s.wait_clear_cycles    = 0;
-            s.stopped_clear_streak = 0;
-            s.committed_side       = 0;
-            s.pp_stable_count      = 0;
-            printf("[LP] obstacle cluster occ=%u — entering STOPPED\n",
-                   (unsigned)w.occ_count);
+        /* Obstacle cluster in the forward arc: try to steer around it first.
+         * STOPPED is only the fallback when all local candidates collide. */
+        s.mode            = LP_MODE_REACTIVE;
+        s.pp_stable_count = 0;
+        cmd_valid = lp_reactive(map, raw_pose->x, raw_pose->y, theta_f,
+                                inflate_r, &w, global_path, out_cmd);
+
+        if (!cmd_valid) {
+            if (s.mode != LP_MODE_STOPPED) {
+                s.mode                 = LP_MODE_STOPPED;
+                s.wait_clear_cycles    = 0;
+                s.stopped_clear_streak = 0;
+                s.committed_side       = 0;
+                s.pp_stable_count      = 0;
+                LP_LOG("[LP] obstacle cluster occ=%u — no reactive path, STOPPED\n",
+                       (unsigned)w.occ_count);
+            }
+            cmd_valid = lp_handle_stopped(&w, theta_f, out_cmd);
         }
-        cmd_valid = lp_handle_stopped(&w, theta_f, out_cmd);
     }
 
     /* Step 10: Speed scaling */
@@ -1042,15 +1129,24 @@ bool local_planner_update(const quadtree_map_t *map,
         lp_scale_speed(out_cmd, &w, inflate_r, in_recover);
 
     if (cmd_valid && s.mode != LP_MODE_PURE_PURSUIT)
-        printf("[LP] mode=%d phase=%d rtheta=%.0f° cmd_hdg=%.0f° spd=%.0f sigma=%.3f fp_occ=%d streak=%u occ=%u\n",
+        LP_LOG("[LP] mode=%d phase=%d rtheta=%.0f° cmd_hdg=%.0f° spd=%.0f sigma=%.3f fp_occ=%d fp_front=%d danger=%d streak=%u occ=%u\n",
                (int)s.mode, (int)s.escape_phase,
                (double)(theta_f * 180.0f / LP_PI),
                (double)(out_cmd->t_heading * 180.0f / LP_PI),
                (double)out_cmd->t_speed,
                (double)s.sigma, (int)w.footprint_occupied,
+               (int)w.footprint_front_occupied,
+               (int)w.forward_danger,
                (unsigned)s.fp_occ_streak, (unsigned)w.occ_count);
 
-    s.prev_cmd_speed = cmd_valid ? out_cmd->t_speed : 0.0f;
+    /* In PURE_PURSUIT mode this module only computes a stub command to keep
+     * its state machine coherent; the command is not sent to the Wemos.  Stall
+     * detection must therefore ignore PURE_PURSUIT speed here, otherwise the
+     * planner can falsely conclude "commanded forward but not moving" while a
+     * newly-streamed path is still starting, then trigger ESCAPE/reverse. */
+    s.prev_cmd_speed = (cmd_valid && s.mode != LP_MODE_PURE_PURSUIT)
+                       ? out_cmd->t_speed
+                       : 0.0f;
     s.cycle_count++;
     return cmd_valid;
 }

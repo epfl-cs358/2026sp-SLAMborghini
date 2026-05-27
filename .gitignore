@@ -6,6 +6,9 @@
 build/
 
 # ESP-IDF specific
+sdkconfig
+sdkconfig.*
+!sdkconfig.defaults
 sdkconfig.old
 .cache/
 managed_components/

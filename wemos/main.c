@@ -204,13 +204,6 @@ static void task_pure_pursuit(void *pvParameters)
             .theta = op.theta,
         };
 
-        /* Shift reference forward to the front axle (260 mm ahead). */
-        pose_t front_pose = {
-            .x     = pose.x + cosf(pose.theta) * 260.0f,
-            .y     = pose.y + sinf(pose.theta) * 260.0f,
-            .theta = pose.theta,
-        };
-
         /* ── 3 & 4. Override check, then PP command ──────────────────────── *
          * IMPORTANT: pp_compute_command() must NOT be called during an       *
          * override.  That function advances pursuit_idx (and frees ring      *
@@ -277,7 +270,7 @@ static void task_pure_pursuit(void *pvParameters)
             }
         } else if (path_active) {
             /* Only advance pursuit_idx when PP is actually in control */
-            pp_motion_command_t cmd = pp_compute_command(&pp, &front_pose);
+            pp_motion_command_t cmd = pp_compute_command(&pp, &pose);
             if (cmd.stop) {
                 motor_set(0.0f);
                 servo_set_deg(90.0f);

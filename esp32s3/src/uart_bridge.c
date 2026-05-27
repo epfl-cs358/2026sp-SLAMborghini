@@ -59,7 +59,7 @@ void uart_bridge_init(void)
 
 static bool send_packet(uint8_t msg_type, const void *payload, uint8_t payload_len)
 {
-    if (!payload || payload_len > MAX_PAYLOAD_LEN) {
+    if (!payload) {
         return false;
     }
 

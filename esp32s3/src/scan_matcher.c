@@ -47,10 +47,10 @@
 #define SM_MIN_RANGE_MM  200.0f     /* ignore very close returns (robot body) */
 
 /* ── Accept/reject thresholds ───────────────────────────────────────────── */
-#define SM_MIN_HIT_RATE    0.10f    /* ≥10% absolute hit rate (map sparse guard) */
-#define SM_MIN_IMPROVEMENT 3        /* must beat odometry baseline by ≥3 hits */
-#define SM_MAX_XY_MM       80.0f    /* clamp: reject if |dx| or |dy| > 80 mm (search radius 120 mm) */
-#define SM_MAX_DTHETA_DEG  10.0f    /* clamp: reject if |dθ| > 10° */
+#define SM_MIN_HIT_RATE    0.18f    /* reject weak matches that make walls shimmer */
+#define SM_MIN_IMPROVEMENT 5        /* must clearly beat odometry baseline */
+#define SM_MAX_XY_MM       40.0f    /* keep map corrections incremental */
+#define SM_MAX_DTHETA_DEG   4.0f    /* avoid false angular snaps in corridors */
 
 /* ── Coarse search grid ─────────────────────────────────────────────────── */
 static const float k_c_xy[] = { -100.f, -50.f, 0.f, 50.f, 100.f };  /* mm */

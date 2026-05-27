@@ -18,10 +18,10 @@
 #include "driver/gpio.h"
 #endif
 
-#define BRIDGE_UART_PORT   WEMOS_BRIDGE_UART_PORT
-#define BRIDGE_TX_PIN      WEMOS_BRIDGE_TX_PIN
-#define BRIDGE_RX_PIN      WEMOS_BRIDGE_RX_PIN
-#define BRIDGE_UART_BAUD   WEMOS_BRIDGE_BAUD
+#define WEMOS_UART_PORT    WEMOS_BRIDGE_UART_PORT
+#define WEMOS_TX_PIN       WEMOS_BRIDGE_TX_PIN
+#define WEMOS_RX_PIN       WEMOS_BRIDGE_RX_PIN
+#define WEMOS_UART_BAUD    WEMOS_BRIDGE_BAUD
 #define BRIDGE_RX_BUF      1024
 
 #define SYNC_A             0xAAu
@@ -34,7 +34,7 @@
 #define MSG_CHUNK_NACK     0x07u
 
 #define HEADER_LEN         4u
-#define MAX_PAYLOAD_LEN    256u
+#define MAX_PAYLOAD_LEN    255u
 
 static uint8_t checksum_xor(const uint8_t *data, uint8_t len)
 {
@@ -47,28 +47,28 @@ void uart_bridge_init(void)
 {
 #ifdef ESP_PLATFORM
     uart_config_t cfg = {
-        .baud_rate = BRIDGE_UART_BAUD,
+        .baud_rate = WEMOS_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_driver_delete(BRIDGE_UART_PORT);
-    uart_param_config(BRIDGE_UART_PORT, &cfg);
-    uart_set_pin(BRIDGE_UART_PORT,
-                 BRIDGE_TX_PIN, BRIDGE_RX_PIN,
+    uart_driver_delete(WEMOS_UART_PORT);
+    uart_param_config(WEMOS_UART_PORT, &cfg);
+    uart_set_pin(WEMOS_UART_PORT,
+                 WEMOS_TX_PIN, WEMOS_RX_PIN,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(BRIDGE_UART_PORT, BRIDGE_RX_BUF, BRIDGE_RX_BUF, 0, NULL, 0);
-    uart_flush_input(BRIDGE_UART_PORT);
+    uart_driver_install(WEMOS_UART_PORT, BRIDGE_RX_BUF, BRIDGE_RX_BUF, 0, NULL, 0);
+    uart_flush_input(WEMOS_UART_PORT);
     printf("[UART] init: UART%d TX=%d RX=%d baud=%d\n",
-           BRIDGE_UART_PORT, BRIDGE_TX_PIN, BRIDGE_RX_PIN, BRIDGE_UART_BAUD);
+           WEMOS_UART_PORT, WEMOS_TX_PIN, WEMOS_RX_PIN, WEMOS_UART_BAUD);
 #endif
 }
 
 static bool send_packet(uint8_t msg_type, const void *payload, uint8_t payload_len)
 {
-    if (!payload || payload_len > MAX_PAYLOAD_LEN) return false;
+    if (!payload) return false;
 
 #ifdef ESP_PLATFORM
     uint8_t buf[HEADER_LEN + MAX_PAYLOAD_LEN + 1];
@@ -79,7 +79,7 @@ static bool send_packet(uint8_t msg_type, const void *payload, uint8_t payload_l
     memcpy(&buf[4], payload, payload_len);
     buf[4 + payload_len] = checksum_xor(&buf[2], payload_len + 2);
     const int total_len = HEADER_LEN + payload_len + 1;
-    return uart_write_bytes(BRIDGE_UART_PORT, (const char *)buf, total_len) == total_len;
+    return uart_write_bytes(WEMOS_UART_PORT, (const char *)buf, total_len) == total_len;
 #else
     (void)msg_type; (void)payload; (void)payload_len;
     return false;
@@ -133,26 +133,26 @@ static void drain_pending_packets(void)
 #ifdef ESP_PLATFORM
     for (;;) {
         size_t avail = 0;
-        uart_get_buffered_data_len(BRIDGE_UART_PORT, &avail);
+        uart_get_buffered_data_len(WEMOS_UART_PORT, &avail);
         if (avail == 0) return;
 
         uint8_t b = 0;
-        if (uart_read_bytes(BRIDGE_UART_PORT, &b, 1, 0) != 1) return;
+        if (uart_read_bytes(WEMOS_UART_PORT, &b, 1, 0) != 1) return;
         if (b != SYNC_A) continue;
 
-        if (uart_read_bytes(BRIDGE_UART_PORT, &b, 1, pdMS_TO_TICKS(5)) != 1) return;
+        if (uart_read_bytes(WEMOS_UART_PORT, &b, 1, pdMS_TO_TICKS(5)) != 1) return;
         if (b != SYNC_B) continue;
 
         uint8_t msg_type = 0, payload_len = 0;
-        if (uart_read_bytes(BRIDGE_UART_PORT, &msg_type,    1, pdMS_TO_TICKS(5)) != 1) return;
-        if (uart_read_bytes(BRIDGE_UART_PORT, &payload_len, 1, pdMS_TO_TICKS(5)) != 1) return;
+        if (uart_read_bytes(WEMOS_UART_PORT, &msg_type,    1, pdMS_TO_TICKS(5)) != 1) return;
+        if (uart_read_bytes(WEMOS_UART_PORT, &payload_len, 1, pdMS_TO_TICKS(5)) != 1) return;
 
         uint8_t payload[MAX_PAYLOAD_LEN];
-        if (uart_read_bytes(BRIDGE_UART_PORT, payload, payload_len,
+        if (uart_read_bytes(WEMOS_UART_PORT, payload, payload_len,
                             pdMS_TO_TICKS(50)) != (int)payload_len) return;
 
         uint8_t received_ck = 0;
-        if (uart_read_bytes(BRIDGE_UART_PORT, &received_ck, 1, pdMS_TO_TICKS(10)) != 1) return;
+        if (uart_read_bytes(WEMOS_UART_PORT, &received_ck, 1, pdMS_TO_TICKS(10)) != 1) return;
 
         uint8_t check_buf[2 + MAX_PAYLOAD_LEN];
         check_buf[0] = msg_type;
