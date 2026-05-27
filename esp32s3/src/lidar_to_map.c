@@ -17,8 +17,32 @@ static inline int64_t _now_us(void) {
 
 #define LIDAR_TO_MAP_WATCHDOG_US  100000LL   /* 100 ms per scan */
 #define LIDAR_TO_MAP_WATCHDOG_CHK 32          /* check timer every N beams */
+#define LIDAR_HIT_SUPPORT_SPAN    3           /* neighbouring beams to check */
+#define LIDAR_HIT_SUPPORT_DELTA_MM 280.0f     /* max range difference for same surface */
 
 static inline bool _valid(float v) { return isfinite(v); }
+
+static bool _hit_has_neighbour_support(const lidar_scan_t *scan, uint16_t idx, float r)
+{
+    for (int off = 1; off <= LIDAR_HIT_SUPPORT_SPAN; off++) {
+        if (idx >= (uint16_t)off) {
+            float rn = scan->points[idx - (uint16_t)off].r_mm;
+            if (rn >= 100.0f && rn <= LIDAR_PROCESS_RANGE_MM &&
+                fabsf(rn - r) <= LIDAR_HIT_SUPPORT_DELTA_MM) {
+                return true;
+            }
+        }
+        uint16_t j = (uint16_t)(idx + (uint16_t)off);
+        if (j < scan->count) {
+            float rn = scan->points[j].r_mm;
+            if (rn >= 100.0f && rn <= LIDAR_PROCESS_RANGE_MM &&
+                fabsf(rn - r) <= LIDAR_HIT_SUPPORT_DELTA_MM) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
                             const lidar_scan_t *scan,
@@ -102,6 +126,9 @@ IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
             march_to     = r;
             has_obstacle = true;
         }
+        if (has_obstacle && !_hit_has_neighbour_support(scan, i, r)) {
+            has_obstacle = false;
+        }
 
         float ex = x0 + ux * march_to;
         float ey = y0 + uy * march_to;
@@ -169,10 +196,15 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
         float theta_deg = scan->points[i].theta_deg;
         if (!_valid(theta_deg)) continue;
 
-        /* Interpolate robot pose at this beam's capture time */
+        /* Interpolate robot pose at this beam's capture time.
+         * Use uint32 subtraction from scan_start_us so the result is correct
+         * even after esp_timer wraps at ~71 min (abs int64 comparison breaks). */
         float alpha = 0.0f;
         if (has_motion) {
-            alpha = (float)((int64_t)scan->points[i].timestamp_us - pre_time_us) / dt_total;
+            uint32_t beam_off  = scan->points[i].timestamp_us - scan->scan_start_us;
+            float    scan_span = (scan->rotation_period_us > 0u)
+                                 ? (float)scan->rotation_period_us : dt_total;
+            alpha = (scan_span > 1.0f) ? ((float)beam_off / scan_span) : 0.0f;
             if (alpha < 0.0f) alpha = 0.0f;
             if (alpha > 1.0f) alpha = 1.0f;
         }
@@ -201,6 +233,9 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
         } else {
             march_to     = r;
             has_obstacle = true;
+        }
+        if (has_obstacle && !_hit_has_neighbour_support(scan, i, r)) {
+            has_obstacle = false;
         }
 
         float ex = sx + ux * march_to;

@@ -120,6 +120,9 @@ static IRAM_ATTR void _update(QuadTreeMap *map, uint16_t idx,
 
     // max depth = this is a leaf -> update value + return.
     if (n->depth >= QT_MAX_DEPTH) {
+        if (delta < 0 && n->value >= QT_OCC_CONFIRMED) {
+            return;
+        }
         n->value = _clamp((int)n->value + (int)delta);
         return;
     }
@@ -253,16 +256,24 @@ size_t qt_memory_bytes(const QuadTreeMap *map)
  * Snapshot confident wall cells AND deeply-free corridor cells, wipe the
  * pool in-place, re-insert both sets.
  *
- * Budget split (total ≤ 500 → worst-case 500×7 = 3500 nodes < pool of 4000):
- *   QT_COMPACT_WALL_MAX = 350 — cells with value ≥ min_value  (walls)
- *   QT_COMPACT_FREE_MAX = 250 — cells with value ≤ FREE_KEEP   (corridors)
+ * Budget: re-inserting N cells into a fresh quadtree uses far fewer than
+ * N×7 nodes because spatially adjacent cells share parent nodes.  A 10 m
+ * wall (64 cells) uses only ~130 nodes after sharing.  1000 cells in a
+ * typical indoor environment use ≈ 1500–2000 nodes — well within the 4000-
+ * node pool.  The worst conceivable case (all cells maximally spread out)
+ * would approach N×7 nodes, but that is geometrically impossible for
+ * contiguous wall segments.
  *
+ *   QT_COMPACT_WALL_MAX = 700 — cells with value ≥ min_value  (walls)
+ *   QT_COMPACT_FREE_MAX = 300 — cells with value ≤ FREE_KEEP   (corridors)
+ *
+ * 700 wall cells covers ≈ 2 full 10 m room perimeters at 156 mm resolution.
  * Preserving free cells prevents re-corruption: after compact, explored
  * corridors stay negative so a single drifted HIT (+30) cannot instantly
  * flip them to occupied.
  * ────────────────────────────────────────────────────────────────────────── */
-#define QT_COMPACT_WALL_MAX  350
-#define QT_COMPACT_FREE_MAX  250
+#define QT_COMPACT_WALL_MAX  700
+#define QT_COMPACT_FREE_MAX  300
 #define QT_COMPACT_MAX       (QT_COMPACT_WALL_MAX + QT_COMPACT_FREE_MAX)
 #define QT_COMPACT_FREE_KEEP (-2)   /* preserve free cells at or below this (1× QT_MISS_DEC) */
 

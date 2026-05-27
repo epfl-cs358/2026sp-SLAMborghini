@@ -121,8 +121,9 @@ void path_streamer_update(uint16_t consumed_wp_idx, uint16_t consumed_path_id)
         return;
     }
 
-    /* Only advance — never go backwards. */
+    /* Only advance — never go backwards, never past what we've sent. */
     if (consumed_wp_idx > s_consumed_idx) {
+        if (consumed_wp_idx > s_next_send_idx) consumed_wp_idx = s_next_send_idx;
         s_consumed_idx = consumed_wp_idx;
     }
 

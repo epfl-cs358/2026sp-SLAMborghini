@@ -56,6 +56,7 @@
                                              * occupied cells → no false trigger. */
 
 /* Reactive */
+#define LP_HALF_WIDTH_MM            130.0f   /* lateral probe distance — slightly under car half-width (148 mm) */
 #define LP_CANDS                      5
 #define LP_NARROW_MARGIN_MM          50.0f
 #define LP_FORBIDDEN_HALF_MAX        0.611f  /* 35° cap on forbidden sector */
@@ -220,7 +221,7 @@ static int8_t lp_cell(const quadtree_map_t *map, float x, float y)
 
 static bool lp_occupied(const quadtree_map_t *map, float x, float y)
 {
-    return qt_query_const(map, x, y) > 0;
+    return qt_query_const(map, x, y) >= QT_OCC_CAUTION;
 }
 
 
@@ -479,7 +480,16 @@ static lp_cand_t lp_rollout(const quadtree_map_t *map,
         int8_t v = lp_cell(map, x, y);
 
         if (v > LP_OCCUPIED_HARD_THRESH) {
-            return r; /* hard collision */
+            return r; /* hard collision — center */
+        }
+
+        /* Lateral clearance: check both sides of car body */
+        {
+            float px = -sinf(heading);
+            float py =  cosf(heading);
+            if (lp_cell(map, x + LP_HALF_WIDTH_MM * px, y + LP_HALF_WIDTH_MM * py) > LP_OCCUPIED_HARD_THRESH ||
+                lp_cell(map, x - LP_HALF_WIDTH_MM * px, y - LP_HALF_WIDTH_MM * py) > LP_OCCUPIED_HARD_THRESH)
+                return r; /* hard collision — car side */
         }
 
         if (v > 0) {

@@ -11,12 +11,30 @@
 #include "quadtree_map.h"
 
 /* ── LiDAR extrinsic calibration (sensor origin relative to robot centre) ─── *
- * Set to measured values once the sensor is mounted and measured.             *
- * Positive X_MM = sensor is forward of centre; positive Y_MM = port side.    *
- * THETA_RAD: sensor yaw relative to robot forward axis (positive = CCW).     */
-#define LIDAR_OFFSET_X_MM      0.0f
-#define LIDAR_OFFSET_Y_MM      0.0f
-#define LIDAR_OFFSET_THETA_RAD 0.0f
+ *                                                                              *
+ * *** CALIBRATION REQUIRED — all three values are currently zero ***          *
+ *                                                                              *
+ * If the LiDAR is NOT mounted exactly above the robot's centre of rotation,   *
+ * the map will be smeared: walls appear at different positions depending on    *
+ * the robot heading, making them look "fat" or duplicated.                     *
+ *                                                                              *
+ * How to measure:                                                              *
+ *   1. Place the robot against a flat wall and drive a known straight path.    *
+ *   2. Check the dashboard: the wall should be a single straight line.         *
+ *      If it curves or is thick, adjust X_MM (forward offset of sensor).       *
+ *   3. Rotate the robot in place in front of a wall, watch the map.            *
+ *      If the wall sweeps in an arc, the LIDAR is offset laterally — adjust    *
+ *      Y_MM (port/starboard offset) until the wall stays stationary.           *
+ *   4. If the entire map is rotated relative to the robot heading, adjust       *
+ *      THETA_RAD (sensor yaw). One degree = 0.01745 rad.                       *
+ *                                                                              *
+ * Sign conventions:                                                            *
+ *   X_MM > 0   : sensor is forward  of the rear-axle centre                   *
+ *   Y_MM > 0   : sensor is to port  (left when facing forward)                 *
+ *   THETA_RAD  : sensor yaw relative to robot forward axis (CCW positive)      */
+#define LIDAR_OFFSET_X_MM      0.0f   /* TODO: measure and set */
+#define LIDAR_OFFSET_Y_MM      0.0f   /* TODO: measure and set */
+#define LIDAR_OFFSET_THETA_RAD 0.0f   /* TODO: measure and set */
 
 /* Hard range filter — beams beyond this are silently dropped before any
  * processing.  Set to the sensor's reliable physical limit. */

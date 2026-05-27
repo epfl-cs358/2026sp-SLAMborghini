@@ -24,7 +24,7 @@
 #define MSG_CHUNK_NACK     0x07u  /* Wemos → ESP32-S3: out-of-order signal   */
 
 #define HEADER_LEN         4u
-#define MAX_PAYLOAD_LEN    255u
+#define MAX_PAYLOAD_LEN    256u
 
 static uint8_t checksum_xor(const uint8_t *data, uint8_t len)
 {
@@ -159,8 +159,8 @@ bool uart_bridge_recv_odom(odom_t *out)
         if (msg_type != MSG_ODOM &&
             msg_type != MSG_PATH_DONE &&
             msg_type != MSG_CHUNK_NACK) {
-            uint8_t skip[MAX_PAYLOAD_LEN + 1u];
-            uint8_t skip_len = payload_len + 1u;
+            uint8_t  skip[MAX_PAYLOAD_LEN + 1u];
+            uint16_t skip_len = (uint16_t)payload_len + 1u;
             if (skip_len > 0u)
                 uart_read_bytes(BRIDGE_UART_PORT, skip, skip_len, pdMS_TO_TICKS(50));
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);

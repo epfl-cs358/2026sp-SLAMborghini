@@ -47,6 +47,14 @@
 #define QT_VALUE_MAX 40
 #define QT_VALUE_MIN (-40)
 
+/* Confidence thresholds used by planners and dashboard visualisation.
+ * A single endpoint hit is +30; require a second consistent observation before
+ * treating a cell as a stable wall.  Free cells need several ray passes so one
+ * stray MISS does not immediately open unknown space. */
+#define QT_OCC_CONFIRMED   35
+#define QT_FREE_CONFIRMED (-8)
+#define QT_OCC_CAUTION      1
+
 // Node 
 typedef struct {
     uint16_t children[4]; // pool indices; QT_NULL = absent 

@@ -59,11 +59,21 @@ static const char *TAG = "hybrid_astar";
 #endif
 
 #ifndef PLANNER_ROBOT_RADIUS_MM
-/* Half-width of car (295/2 = 147.5 mm) rounded up — the relevant lateral
- * clearance for forward-moving paths.  The full half-diagonal (246 mm) is
- * only needed for pure rotation and would make A* reject the start position
- * when the car is within 246 mm of any mapped wall. */
-#define PLANNER_ROBOT_RADIUS_MM         150.0f
+/* Clearance enforced at EVERY NODE along the planned path.
+ * Must be > half-width (147.5 mm) so the car body clears mapped walls.
+ * 200 mm gives a ~52 mm margin over the physical half-width; corridors
+ * narrower than 400 mm cannot be planned through (acceptable for indoor use).
+ * Corner safety handled additionally at execution time by the lateral rollout probe. */
+#define PLANNER_ROBOT_RADIUS_MM         200.0f
+#endif
+
+#ifndef PLANNER_START_RADIUS_MM
+/* Loose check applied only to the START and GOAL poses — ensures the robot
+ * centre is not already inside a mapped wall when planning begins.
+ * Using PLANNER_ROBOT_RADIUS_MM (200 mm) here would abort planning whenever
+ * the robot is near a wall it just drove past; 80 mm only fails if the centre
+ * is literally inside a wall cell. */
+#define PLANNER_START_RADIUS_MM         80.0f
 #endif
 
 #ifndef HYBRID_XY_RESOLUTION_MM
@@ -387,7 +397,9 @@ static int find_nearest_free_leaf(const qt_free_leaf_t *leaves, int count,
 /* Collision checking                                                          */
 /* -------------------------------------------------------------------------- */
 
-static bool point_robot_collision_free(const quadtree_map_t *map, float x, float y)
+/* Probe a 9-point circle of given radius around (x,y).  Returns true iff all
+ * probe points are inside the map and below QT_OCC_CAUTION. */
+static bool _circle_free(const quadtree_map_t *map, float x, float y, float radius)
 {
     if (!is_pose_inside_map(map, x, y)) return false;
 
@@ -399,12 +411,24 @@ static bool point_robot_collision_free(const quadtree_map_t *map, float x, float
         { 0.7071f, -0.7071f}, {-0.7071f, -0.7071f}
     };
     for (int i = 0; i < 9; ++i) {
-        const float sx = x + dirs[i][0] * PLANNER_ROBOT_RADIUS_MM;
-        const float sy = y + dirs[i][1] * PLANNER_ROBOT_RADIUS_MM;
+        const float sx = x + dirs[i][0] * radius;
+        const float sy = y + dirs[i][1] * radius;
         if (!is_pose_inside_map(map, sx, sy)) return false;
-        if (qt_query_const(map, sx, sy) > 0)   return false;
+        if (qt_query_const(map, sx, sy) >= QT_OCC_CAUTION) return false;
     }
     return true;
+}
+
+/* Path-node check: 200 mm clearance — used at every step of the A* search. */
+static bool point_robot_collision_free(const quadtree_map_t *map, float x, float y)
+{
+    return _circle_free(map, x, y, PLANNER_ROBOT_RADIUS_MM);
+}
+
+/* Start/goal check: 80 mm clearance — only verifies the centre isn't inside a wall. */
+static bool start_pose_free(const quadtree_map_t *map, float x, float y)
+{
+    return _circle_free(map, x, y, PLANNER_START_RADIUS_MM);
 }
 
 static bool line_is_collision_free_quadtree(const quadtree_map_t *map,
@@ -682,7 +706,7 @@ static bool choose_goal_approach_pose(const quadtree_map_t *map,
     if (!map_is_valid(map) || !goal || !goal_x || !goal_y) return false;
     if (!is_pose_inside_map(map, goal->cx, goal->cy))      return false;
 
-    if (point_robot_collision_free(map, goal->cx, goal->cy)) {
+    if (start_pose_free(map, goal->cx, goal->cy)) {
         *goal_x = goal->cx; *goal_y = goal->cy;
         return true;
     }
@@ -715,9 +739,13 @@ static bool append_frontier_if_safe(const quadtree_map_t *map,
         line_is_collision_free_quadtree(map, last->x, last->y,
                                         goal->cx, goal->cy);
     if (!free_seg) {
-        if (d > MAX_FRONTIER_APPEND_MM)                    return true;
-        if (!is_pose_inside_map(map, goal->cx, goal->cy))  return true;
-        if (qt_query_const(map, goal->cx, goal->cy) > 0)   return true;
+        /* Segment crosses some occupied cells, but frontier cells are at the edge
+         * of the known map and may only be weakly confirmed (single hit, value=30).
+         * Allow the append if the frontier cell itself is not a confirmed wall, and
+         * the frontier is close enough that the car will reach it before replanning. */
+        if (d > MAX_FRONTIER_APPEND_MM)                        return true;
+        if (!is_pose_inside_map(map, goal->cx, goal->cy))      return true;
+        if (qt_query_const(map, goal->cx, goal->cy) >= QT_OCC_CONFIRMED) return true;
     }
 
     const float heading = atan2f(goal->cy - last->y, goal->cx - last->x);
@@ -744,7 +772,7 @@ path_t hybrid_astar_plan(const quadtree_map_t *map,
     if (!map_is_valid(map) || !start || !goal)           return path;
     if (!is_pose_inside_map(map, start->x, start->y) ||
         !is_pose_inside_map(map, goal->cx, goal->cy))    return path;
-    if (!point_robot_collision_free(map, start->x, start->y)) {
+    if (!start_pose_free(map, start->x, start->y)) {
         ESP_LOGW(TAG, "start pose is not in known-free space");
         return path;
     }

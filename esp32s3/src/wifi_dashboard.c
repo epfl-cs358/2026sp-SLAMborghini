@@ -340,7 +340,13 @@ static void _do_map_send(uint32_t dirty_tiles)
             if (!((dirty_tiles >> tile_idx) & 1u)) continue;
             float cx = map->x_min + (ix + 0.5f) * cx_step;
             int8_t v = qt_query_const(map, cx, cy);
-            s_new_cells[iy * DASH_GW + ix] = (uint8_t)((int16_t)v + 128);
+            uint8_t occ = 128u;
+            if (v <= QT_FREE_CONFIRMED) {
+                occ = 20u;
+            } else if (v >= QT_OCC_CONFIRMED) {
+                occ = 230u;
+            }
+            s_new_cells[iy * DASH_GW + ix] = occ;
         }
     }
 

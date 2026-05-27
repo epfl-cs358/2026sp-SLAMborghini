@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\yelha\\\\OneDrive\\\\Desktop\\\\SLAMborghini\\\\2026sp-SLAMborghini\" -Recurse -File -Include \"*.h\", \"*.c\", \"*.cpp\", \"platformio.ini\")",
+      "Bash(Select-Object FullName)"
+    ]
+  }
+}

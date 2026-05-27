@@ -580,12 +580,12 @@ static bool _fs_check_width(const pose_t *robot, const frontier_t *f,
     int lw = 0, rw = 0;
     for (int s = 1; s <= _FS_LATERAL_STEPS; s++) {
         float step = (float)s * _FS_LATERAL_STEP_MM;
-        if (qt_query_const(map, px + lx * step, py + ly * step) > 0) break;
+        if (qt_query_const(map, px + lx * step, py + ly * step) >= QT_OCC_CAUTION) break;
         lw++;
     }
     for (int s = 1; s <= _FS_LATERAL_STEPS; s++) {
         float step = (float)s * _FS_LATERAL_STEP_MM;
-        if (qt_query_const(map, px - lx * step, py - ly * step) > 0) break;
+        if (qt_query_const(map, px - lx * step, py - ly * step) >= QT_OCC_CAUTION) break;
         rw++;
     }
     return ((float)(lw + rw) * _FS_LATERAL_STEP_MM) >= _FS_WIDTH_MIN_MM;
@@ -606,7 +606,7 @@ static bool _fs_check_rollout(const pose_t *robot, const frontier_t *f,
     for (int s = 1; s <= _FS_ROLLOUT_STEPS; s++) {
         float step = (float)s * _FS_ROLLOUT_STEP_MM;
         if (step >= dist) break;
-        if (qt_query_const(map, robot->x + ux * step, robot->y + uy * step) > 0)
+        if (qt_query_const(map, robot->x + ux * step, robot->y + uy * step) >= QT_OCC_CAUTION)
             occ++;
     }
     return occ < _FS_ROLLOUT_MAX_OCC;
