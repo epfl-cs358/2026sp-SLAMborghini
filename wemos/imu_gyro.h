@@ -1,7 +1,7 @@
 /**
  * imu_gyro.h
- * Minimal ICM-20948 gyro-Z driver for ESP-IDF.
- * Pins/address/bias copied from 2025fa-SLAMurai icm_control/config.hpp.
+ * ICM-20948 / MPU-6050 gyro-Z driver for ESP-IDF.
+ * Auto-detects which chip is present at boot — see imu_gyro.c for details.
  */
 #ifndef IMU_GYRO_H
 #define IMU_GYRO_H
@@ -9,7 +9,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Returns true if the ICM-20948 was found and configured. */
+/**
+ * Initialise the I2C bus and auto-detect the IMU chip (ICM-20948 or MPU-6050).
+ * Returns false only if the I2C bus itself cannot be initialised.
+ * If no IMU chip is found, returns true and all read functions become no-ops.
+ */
 bool  imu_gyro_init(void);
 
 /* Read gyro Z in rad/s (bias-corrected). Returns 0 on I2C error. */
