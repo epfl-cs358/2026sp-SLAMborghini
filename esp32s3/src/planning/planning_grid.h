@@ -1,3 +1,11 @@
+/**
+ * planning_grid.h
+ *
+ * Dense occupancy grid helper used by planning code that wants array-style
+ * cell access instead of recursive quadtree queries.  Cells can be populated
+ * from the quadtree and inflated to account for robot clearance.
+ */
+
 #ifndef PLANNING_GRID_H
 #define PLANNING_GRID_H
 

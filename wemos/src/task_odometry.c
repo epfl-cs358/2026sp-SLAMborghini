@@ -1,3 +1,12 @@
+/**
+ * task_odometry.c
+ *
+ * Wemos 100 Hz odometry task.  Serializes shared I2C access to the AS5600 and
+ * ICM-20948, applies stationary gyro-bias correction, updates Ackermann/IMU
+ * fused pose, and publishes an atomic pose snapshot for the path-following
+ * task and UART bridge.
+ */
+
 #include "task_odometry.h"
 
 #include "encoder_ackermann_odometry.h"

@@ -1,3 +1,12 @@
+/**
+ * lidar_to_map.c
+ *
+ * Converts LiDAR scan returns into quadtree occupancy updates.
+ * Handles sensor extrinsics, free-space ray marching, obstacle endpoint
+ * insertion, dirty-rectangle tracking for dashboard refresh, and optional
+ * deskewing when the robot moves during one 360 degree scan.
+ */
+
 #include "lidar_to_map.h"
 #include <math.h>
 

@@ -1,3 +1,11 @@
+/**
+ * test_quadtree_map.c
+ *
+ * Host-side regression tests for the quadtree occupancy map.  The suite checks
+ * insertion/query correctness, log-odds clamping, memory usage, occupied-cell
+ * iteration, and out-of-bounds safety.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

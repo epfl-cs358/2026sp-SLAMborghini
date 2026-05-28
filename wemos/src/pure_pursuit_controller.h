@@ -1,3 +1,11 @@
+/**
+ * pure_pursuit_controller.h
+ *
+ * Streaming pure-pursuit controller for the Wemos.  It accepts waypoint chunks
+ * from the ESP32-S3, stores them in a small ring buffer, reports consumed path
+ * progress, and computes steering/speed commands from the current local pose.
+ */
+
 #pragma once
 
 #include <stdint.h>

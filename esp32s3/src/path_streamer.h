@@ -1,3 +1,11 @@
+/**
+ * path_streamer.h
+ *
+ * Path streaming API used by the ESP32-S3 planner/executor boundary.
+ * It hides waypoint chunking, path_id versioning, Wemos ring-buffer refill,
+ * and retransmission after out-of-order chunk reports.
+ */
+
 #ifndef PATH_STREAMER_H
 #define PATH_STREAMER_H
 

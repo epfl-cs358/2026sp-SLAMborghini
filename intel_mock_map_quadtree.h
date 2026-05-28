@@ -1,3 +1,11 @@
+/**
+ * intel_mock_map_quadtree.h
+ *
+ * Generated static quadtree fixture used by tests and demos.  The node array
+ * encodes a prebuilt occupancy map; edit the generator rather than hand-editing
+ * the table below.
+ */
+
 #ifndef QUADTREE_MAP_H
 #define QUADTREE_MAP_H
 

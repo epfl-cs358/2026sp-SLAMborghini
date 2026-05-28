@@ -1,3 +1,11 @@
+/**
+ * encoder_ackermann_odometry.h
+ *
+ * State and API for local Wemos odometry fusion.  The module integrates
+ * encoder distance with Ackermann steering geometry and corrects heading with
+ * the IMU when the yaw sample passes jump sanity checks.
+ */
+
 #ifndef ENCODER_ACKERMANN_ODOMETRY_H
 #define ENCODER_ACKERMANN_ODOMETRY_H
 

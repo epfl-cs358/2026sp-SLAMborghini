@@ -1,3 +1,11 @@
+/**
+ * uart_bridge.c
+ *
+ * ESP32-S3 side of the UART link to the Wemos motion controller.
+ * Sends control overrides and path chunks, receives compact odometry,
+ * path-complete notifications, and chunk retransmission requests.
+ */
+
 #include "uart_bridge.h"
 #include "../../hardware_pins.h"
 

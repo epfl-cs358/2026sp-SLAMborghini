@@ -1,3 +1,11 @@
+/**
+ * uart_bridge.h
+ *
+ * ESP32-S3 UART bridge API for the two-board architecture.
+ * This side sends control/path packets to the Wemos and receives odometry,
+ * path completion, and chunk NACK feedback.
+ */
+
 #ifndef UART_BRIDGE_H
 #define UART_BRIDGE_H
 

@@ -1,3 +1,11 @@
+/**
+ * hybrid_astar.h
+ *
+ * Public interface for the ESP32-S3 global planner.  Hybrid A* turns the
+ * current quadtree map, robot pose, and selected frontier into a bounded list
+ * of waypoints that downstream controllers can stream to the Wemos.
+ */
+
 #ifndef HYBRID_ASTAR_H
 #define HYBRID_ASTAR_H
 

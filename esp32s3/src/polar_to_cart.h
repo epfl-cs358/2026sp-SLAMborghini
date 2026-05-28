@@ -1,3 +1,10 @@
+/**
+ * polar_to_cart.h
+ *
+ * Utility conversion from raw polar LiDAR scan samples to world-frame
+ * Cartesian points using the current robot pose.
+ */
+
 #ifndef POLAR_TO_CART_H
 #define POLAR_TO_CART_H
 

@@ -1,3 +1,11 @@
+/**
+ * uart_bridge.h
+ *
+ * Wemos side of the UART protocol.  Sends compact odometry/progress feedback
+ * to the ESP32-S3, receives streaming waypoint chunks, and exposes emergency
+ * local-planner override commands.
+ */
+
 #ifndef UART_BRIDGE_H
 #define UART_BRIDGE_H
 

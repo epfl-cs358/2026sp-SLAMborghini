@@ -1,3 +1,11 @@
+/**
+ * task_odometry.h
+ *
+ * Public API for the Wemos odometry task.  Other tasks use this module to get
+ * a coherent fused pose snapshot, publish the current steering angle, and
+ * share the I2C bus mutex with the encoder/IMU reader.
+ */
+
 #ifndef TASK_ODOMETRY_H
 #define TASK_ODOMETRY_H
 

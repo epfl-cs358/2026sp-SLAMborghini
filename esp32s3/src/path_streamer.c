@@ -1,3 +1,12 @@
+/**
+ * path_streamer.c
+ *
+ * Owns the active Hybrid A* path on the ESP32-S3 and streams it to the Wemos
+ * in fixed-size waypoint chunks.  The streamer keeps the Wemos pure-pursuit
+ * ring buffer topped up, tracks consumed waypoint progress from odometry
+ * packets, and rewinds on chunk NACKs.
+ */
+
 #include "path_streamer.h"
 #include "uart_bridge.h"
 

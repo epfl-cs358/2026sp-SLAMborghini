@@ -1,3 +1,10 @@
+/**
+ * motor_pid.h
+ *
+ * Public interface for the Wemos drive-motor PID loop.  The controller maps a
+ * target wheel speed in m/s to an 8-bit LEDC duty cycle using encoder feedback.
+ */
+
 #ifndef MOTOR_PID_H
 #define MOTOR_PID_H
 

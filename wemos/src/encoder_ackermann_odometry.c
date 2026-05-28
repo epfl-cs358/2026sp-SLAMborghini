@@ -1,3 +1,12 @@
+/**
+ * encoder_ackermann_odometry.c
+ *
+ * Fuses wheel encoder distance, servo steering angle, and IMU yaw into a
+ * local Ackermann odometry pose.  The IMU is treated as the primary heading
+ * measurement, while the Ackermann model provides a sanity-checked prediction
+ * and fallback when IMU jumps are implausible.
+ */
+
 #include "encoder_ackermann_odometry.h"
 #include <math.h>
 

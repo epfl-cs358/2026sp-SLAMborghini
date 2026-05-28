@@ -1,3 +1,11 @@
+/**
+ * motor_pid.c
+ *
+ * Closed-loop speed controller for the Wemos drive motor.  The PID task reads
+ * measured wheel speed from the encoder driver and adjusts PWM duty so the
+ * commanded speed is less sensitive to battery voltage and surface friction.
+ */
+
 #include "motor_pid.h"
 #include "imu_encoder_driver.h"
 
