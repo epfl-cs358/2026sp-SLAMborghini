@@ -525,7 +525,7 @@ frontier_t frontier_detector_best(const frontier_list_t *list,
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /* Bicycle model parameters */
-#define _FS_WHEELBASE_MM    260.0f
+#define _FS_WHEELBASE_MM    258.0f
 #define _FS_MAX_STEER_RAD   1.134f   /* ~65° measured from hardware */
 
 /* Corridor width check */

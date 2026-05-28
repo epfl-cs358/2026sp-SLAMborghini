@@ -50,7 +50,7 @@ static inline uint16_t ring_tail(const pure_pursuit_controller_t *pp) {
 void pp_init(pure_pursuit_controller_t *pp) {
     if (!pp) return;
     memset(pp, 0, sizeof(*pp));
-    pp->wheelbase_mm      = 260.0f;
+    pp->wheelbase_mm      = 258.0f;
     pp->lookahead_mm      = 300.0f;
     pp->fixed_speed_mm_s  = 200.0f;
     pp->kp                = 1.0f;
