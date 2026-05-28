@@ -52,6 +52,7 @@ void wifi_dashboard_update(const quadtree_map_t *map, const pose_t *pose);
 void wifi_dashboard_broadcast_state(const pose_t *pose,
                                      float frontier_cx, float frontier_cy,
                                      bool has_frontier,
+                                     bool done,
                                      uint16_t scan_idx);
 
 /**

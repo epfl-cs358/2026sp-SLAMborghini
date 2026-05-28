@@ -169,6 +169,27 @@ static bool is_frontier(const quadtree_map_t *m, int ix, int iy,
     return false;
 }
 
+/**
+ * Returns the number of 8-connected unknown neighbors for cell (ix, iy).
+ */
+static uint8_t count_unknown_neighbors8(const quadtree_map_t *m, int ix, int iy,
+                                         float res, int mw, int mh)
+{
+    uint8_t count = 0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = ix + dx;
+            int ny = iy + dy;
+            if (!in_bounds(nx, ny, mw, mh)) continue;
+            if (cell_is_unknown(m, cx_mm(nx, res), cy_mm(ny, res))) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
 /* ═══════════════════════ is_safe_cell ═════════════════════════════════════
  * Returns true if every cell within ROBOT_CLEAR_CELLS Chebyshev radius of
  * (ix, iy) is free — i.e., the full (2R+1)² box is obstacle-free.
@@ -423,6 +444,7 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
                     result.items[result.count].cx   = cx_mm(tix, res);
                     result.items[result.count].cy   = cy_mm(tiy, res);
                     result.items[result.count].size = (uint8_t)(clr > 255 ? 255 : clr);
+                    result.items[result.count].unknown_count = count_unknown_neighbors8(map, tix, tiy, res, mw, mh);
                     result.count++;
                 }
                 /* 8 forward frontiers is plenty for the selector — stop BFS
@@ -432,6 +454,7 @@ frontier_list_t frontier_detector_detect(const quadtree_map_t *map,
                 fallback_tix = tix;
                 fallback_tiy = tiy;
                 fallback_clr = clr;
+                /* Note: fallback unknown_count will be fetched if chosen below */
             }
         }
         next_bfs:;

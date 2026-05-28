@@ -100,7 +100,7 @@ static const char *TAG = "wifi_dash";
 #define TILES_ALL  ((uint32_t)((1u << (TILE_COLS * TILE_ROWS)) - 1u))
 
 static uint8_t s_map_buf[MAP_BUF_SIZE];                            /* full map or delta  */
-static uint8_t s_pose_buf[24u];                                    /* pose frame         */
+static uint8_t s_pose_buf[25u];                                    /* pose frame         */
 static uint8_t s_raw_pose_buf[13u];                                /* raw odometry frame */
 static uint8_t s_scan_buf[3u + SCAN_MAX_PTS * 4u];                /* scan frame         */
 static uint8_t s_path_buf[2u + MAX_SHARED_PATH_POINTS * 8u];      /* path frame         */
@@ -140,6 +140,7 @@ typedef struct {
             float    x, y, theta;
             float    fx, fy;
             bool     has_frontier;
+            bool     done;
             uint16_t scan_idx;
         } pose;
         char log[DASH_LOG_MAX];
@@ -420,9 +421,10 @@ static void _do_pose_send(const dash_msg_t *msg)
     memcpy(&s_pose_buf[13], &msg->pose.fx,     4);
     memcpy(&s_pose_buf[17], &msg->pose.fy,     4);
     s_pose_buf[21] = msg->pose.has_frontier ? 1u : 0u;
-    s_pose_buf[22] = (uint8_t)(msg->pose.scan_idx & 0xFFu);
-    s_pose_buf[23] = (uint8_t)(msg->pose.scan_idx >> 8u);
-    _ws_send_raw(s_pose_buf, 24u, HTTPD_WS_TYPE_BINARY);
+    s_pose_buf[22] = msg->pose.done ? 1u : 0u;
+    s_pose_buf[23] = (uint8_t)(msg->pose.scan_idx & 0xFFu);
+    s_pose_buf[24] = (uint8_t)(msg->pose.scan_idx >> 8u);
+    _ws_send_raw(s_pose_buf, 25u, HTTPD_WS_TYPE_BINARY);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -810,6 +812,7 @@ void wifi_dashboard_update(const quadtree_map_t *map, const pose_t *pose)
 void wifi_dashboard_broadcast_state(const pose_t *pose,
                                      float frontier_cx, float frontier_cy,
                                      bool has_frontier,
+                                     bool done,
                                      uint16_t scan_idx)
 {
     if (!pose || !s_dash_queue) return;
@@ -821,6 +824,7 @@ void wifi_dashboard_broadcast_state(const pose_t *pose,
     msg.pose.fx           = frontier_cx;
     msg.pose.fy           = frontier_cy;
     msg.pose.has_frontier = has_frontier;
+    msg.pose.done         = done;
     msg.pose.scan_idx     = scan_idx;
     xQueueSend(s_dash_queue, &msg, 0);
 }

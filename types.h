@@ -111,11 +111,14 @@ typedef struct {
 
 /** A single exploration frontier cell. */
 typedef struct {
-    float   cx;   /**< Centroid X in mm */
-    float   cy;   /**< Centroid Y in mm */
-    uint8_t size; /**< Open-space clearance score: free cells within
-                   *   CLEARANCE_RADIUS of the target (0-49 range).
-                   *   Higher = more navigable space around the target. */
+    float   cx;            /**< Centroid X in mm */
+    float   cy;            /**< Centroid Y in mm */
+    uint8_t size;          /**< Open-space clearance score: free cells within
+                            *   CLEARANCE_RADIUS of the target (0-49 range).
+                            *   Higher = more navigable space around the target. */
+    uint8_t unknown_count; /**< Number of unknown 8-connected neighbours at the
+                            *   target cell — higher means deeper into unexplored
+                            *   territory. */
 } frontier_t;
 
 /** List of detected exploration frontiers. */

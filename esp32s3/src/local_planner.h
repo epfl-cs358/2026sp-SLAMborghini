@@ -5,10 +5,10 @@
  *
  * Navigation stack:
  *   Hybrid A*  → global path (unchanged, external)
- *   Pure Pursuit (STUB) → default path tracking
- *   Reactive   → local obstacle avoidance
- *   ESCAPE     → reverse + rotate recovery
- *   RECOVER    → reduced-speed mode under high SLAM uncertainty
+ *   Pure Pursuit → default path tracking
+ *   REVERSING  → stall recovery: reverse 1 m
+ *   STALL_TURN → stall recovery: hard-steer forward arc
+ *   WAIT_CLEAR → stop and wait for fresh A* path
  */
 
 #ifndef LOCAL_PLANNER_H
@@ -21,12 +21,10 @@
 
 /** Operating mode of the local planner state machine. */
 typedef enum {
-    LP_MODE_PURE_PURSUIT = 0, /**< Default: tracking global Hybrid A* path (stub) */
-    LP_MODE_REACTIVE,         /**< Local obstacle cluster detected — candidate steering */
-    LP_MODE_ESCAPE,           /**< All reactive candidates blocked — reverse+rotate sequence */
-    LP_MODE_RECOVER,          /**< High SLAM uncertainty — reduced speed, wider heading filter */
-    LP_MODE_STOPPED,          /**< Obstacle cluster ahead — stop and wait (dynamic obstacle) */
-    LP_MODE_WAIT_CLEAR        /**< Post-stall: stopped, waiting for path to clear before replan */
+    LP_MODE_PURE_PURSUIT = 0, /**< Default: tracking global Hybrid A* path */
+    LP_MODE_REVERSING,        /**< Stall recovery: reverse 1 m */
+    LP_MODE_STALL_TURN,       /**< Stall recovery: hard-steer forward arc */
+    LP_MODE_WAIT_CLEAR        /**< Stopped, waiting for fresh A* path */
 } lp_mode_t;
 
 /**
@@ -36,21 +34,28 @@ typedef enum {
  */
 void local_planner_init(float robot_radius_mm);
 
+/** Enable the local planner. Must be called after local_planner_init(). */
+void local_planner_enable(void);
+
 /**
- * Run one 100 ms local planner cycle.
+ * Run one local planner cycle.
  *
- * @param map           Current quadtree map (read-only).
- * @param raw_pose      Raw SLAM pose for this cycle.
- * @param global_path   Hybrid A* path to follow; may be NULL or empty.
- * @param override_flag If true, an emergency layer has control — skip this cycle.
- * @param out_cmd       Output control frame; only valid when function returns true.
+ * @param map                  Current quadtree map (read-only).
+ * @param raw_pose             Raw SLAM pose for this cycle.
+ * @param global_path          Hybrid A* path to follow; may be NULL or empty.
+ * @param override_flag        If true, an emergency layer has control — skip this cycle.
+ * @param live_scan            Current LiDAR scan for obstacle detection.
+ * @param latest_odom_disp_mm  Odometry displacement (mm) accumulated since the last call.
+ * @param out_cmd              Output control frame; only valid when function returns true.
  * @return true  — out_cmd is valid, caller should transmit it.
- *         false — cycle skipped (override active); do NOT transmit.
+ *         false — cycle skipped (not enabled or override active); do NOT transmit.
  */
 bool local_planner_update(const quadtree_map_t *map,
                           const pose_t         *raw_pose,
                           const path_t         *global_path,
                           bool                  override_flag,
+                          const lidar_scan_t   *live_scan,
+                          float                 latest_odom_disp_mm,
                           control_frame_t      *out_cmd);
 
 /** Return the current operating mode. */
@@ -65,18 +70,6 @@ bool local_planner_replan_needed(void);
 
 /** Clear the replan request flag after replanning. */
 void local_planner_clear_replan(void);
-
-/**
- * Return true if the planner wants to inject a virtual obstacle into the map
- * (repeated stall against a sub-LiDAR object).  Fills *x and *y with the
- * world coordinates where the obstacle should be written.
- * Caller must hold s_map_mutex before calling qt_update(), then call
- * local_planner_clear_obstacle_inject() to reset the flag.
- */
-bool local_planner_obstacle_inject_needed(float *x, float *y);
-
-/** Clear the obstacle-inject request after the caller has written to the map. */
-void local_planner_clear_obstacle_inject(void);
 
 /**
  * Reset the waypoint cursor to 0.

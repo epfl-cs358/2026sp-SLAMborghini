@@ -174,6 +174,11 @@ static volatile float s_target_fx  = 0.0f;
 static volatile float s_target_fy  = 0.0f;
 static volatile bool  s_has_target = false;
 
+/* Total |linear_disp_mm| accumulated by task_odom since the last
+ * local_planner_update() call.  Written under s_pose_mutex; snapshotted and
+ * reset by task_lidar_slam (also under s_pose_mutex) before each LP cycle. */
+static float s_odom_disp_accum = 0.0f;
+
 
 /* ════════════════════════════════════════════════════════════════════════════
  * task_lidar_slam  —  Core 0, priority 7
@@ -231,10 +236,15 @@ static void task_lidar_slam(void *arg)
 
         /* ── 2. Snapshot raw odometry pose (after 100 ms scan window) ────── *
          * task_odom updates s_pose at 100 Hz. Snapshot here for the most   *
-         * current estimate before scan matching and map integration.        */
+         * current estimate before scan matching and map integration.        *
+         * Also drain the odom displacement accumulator for the LP stall     *
+         * detector; reset it so the next LP cycle sees only fresh motion.   */
         pose_t raw_pose;
+        float  odom_disp_since_lp;
         xSemaphoreTake(s_pose_mutex, portMAX_DELAY);
-        raw_pose = s_pose;
+        raw_pose           = s_pose;
+        odom_disp_since_lp = s_odom_disp_accum;
+        s_odom_disp_accum  = 0.0f;
         xSemaphoreGive(s_pose_mutex);
 
         /* ── 3. Scan matching — correct raw odometry with map correlation ── *
@@ -292,7 +302,7 @@ static void task_lidar_slam(void *arg)
          * s_map_mutex blocks concurrent planner reads (frontier + A*).      */
         lp_mode_t pre_lp_mode = local_planner_get_mode();
         map_dirty_rect_t dirty = { .valid = false };
-        if (sm_ok || pre_lp_mode != LP_MODE_ESCAPE)
+        if (sm_ok || pre_lp_mode != LP_MODE_REVERSING)
         {
             xSemaphoreTake(s_map_mutex, portMAX_DELAY);
             int64_t t0 = esp_timer_get_time();
@@ -358,9 +368,13 @@ static void task_lidar_slam(void *arg)
         }
 
         /* ── 4b. Run local planner ──────────────────────────────────────── *
-         * Reads the freshly-updated map and issues a control_frame_t to the *
-         * Wemos only when an obstacle is detected (REACTIVE / ESCAPE /       *
-         * STOPPED modes).  In PURE_PURSUIT mode PP runs uninterrupted.      */
+         * In PURE_PURSUIT mode: path_streamer drives the Wemos; LP watches  *
+         * for obstacles and stalls.                                          *
+         * In any other mode (REVERSING / STALL_TURN / WAIT_CLEAR): LP sends *
+         * a control_frame override AND clears path_streamer so the Wemos    *
+         * stops receiving waypoint chunks and can act on the override.       *
+         * path_streamer is restored by task_path_exec via                   *
+         * path_streamer_set_path() when the planner publishes a fresh path. */
         {
             static path_t s_lp_path;  /* local copy to avoid holding path_mutex */
             xSemaphoreTake(s_path_mutex, portMAX_DELAY);
@@ -369,13 +383,15 @@ static void task_lidar_slam(void *arg)
 
             control_frame_t lp_cmd;
             bool lp_valid = local_planner_update(&s_map, &matched_pose,
-                                                  &s_lp_path, false, &lp_cmd);
+                                                  &s_lp_path, false,
+                                                  &scan, odom_disp_since_lp,
+                                                  &lp_cmd);
 
             lp_mode_t lp_mode = local_planner_get_mode();
 
-            /* Send override only when actively avoiding — leave PP in control
-             * during normal PURE_PURSUIT mode. */
             if (lp_valid && lp_mode != LP_MODE_PURE_PURSUIT) {
+                /* Stop waypoint stream so Wemos acts on the control frame. */
+                path_streamer_clear();
                 uart_bridge_send_control(&lp_cmd);
                 printf("[LP] mode=%d  spd=%.0f  hdg=%.1f°\n",
                        (int)lp_mode,
@@ -388,22 +404,6 @@ static void task_lidar_slam(void *arg)
                 if (s_h_planner)
                     xTaskNotify(s_h_planner, 0u, eSetValueWithOverwrite);
                 printf("[LP] replan requested\n");
-            }
-
-            /* Sub-LiDAR obstacle injection: write two hits at the stall point so
-             * A* routes around it.  Two QT_HIT_INC writes (2×30) reach VALUE_MAX=40
-             * and the cell registers as wall on the very next A* run. */
-            {
-                float inj_x, inj_y;
-                if (local_planner_obstacle_inject_needed(&inj_x, &inj_y)) {
-                    xSemaphoreTake(s_map_mutex, portMAX_DELAY);
-                    qt_update(&s_map, inj_x, inj_y, QT_HIT_INC);
-                    qt_update(&s_map, inj_x, inj_y, QT_HIT_INC);
-                    xSemaphoreGive(s_map_mutex);
-                    local_planner_clear_obstacle_inject();
-                    printf("[LP] injected obstacle at (%.0f,%.0f)\n",
-                           (double)inj_x, (double)inj_y);
-                }
             }
         }
 
@@ -420,7 +420,7 @@ static void task_lidar_slam(void *arg)
         }
 
         wifi_dashboard_broadcast_raw_pose(&raw_pose);
-        wifi_dashboard_broadcast_state(&matched_pose, s_target_fx, s_target_fy, s_has_target, 0);
+        wifi_dashboard_broadcast_state(&matched_pose, s_target_fx, s_target_fy, s_has_target, false, 0);
 
         /* ── 5. Yield — 20 ms lets httpd flush TCP ACKs on Core 0.
          * The UART-blocking scan read already yields ~100 ms per cycle;
@@ -606,6 +606,7 @@ static void task_odom(void *arg)
             s_pose.x        += ds * cosf(theta_mid);
             s_pose.y        += ds * sinf(theta_mid);
             s_pose.theta     = _wrap_angle(s_pose.theta + dtheta);
+            s_odom_disp_accum += fabsf(ds);
             xSemaphoreGive(s_pose_mutex);
 
             /* Feed consumed-waypoint progress back to the path streamer so it
@@ -1042,6 +1043,7 @@ void app_main(void)
     uart_bridge_init();
     path_streamer_init();
     local_planner_init(246.0f); /* half-diagonal: sqrt((295/2)^2 + (394/2)^2) */
+    local_planner_enable();
 
     xTaskCreatePinnedToCore(task_lidar_slam, "lscan",     6144, NULL, 7, &s_h_lidar,   0);
     xTaskCreatePinnedToCore(task_odom,      "odom",      3072, NULL, 6, &s_h_odom,    0);
