@@ -45,7 +45,6 @@ void local_planner_enable(void);
  * @param global_path          Hybrid A* path to follow; may be NULL or empty.
  * @param override_flag        If true, an emergency layer has control — skip this cycle.
  * @param live_scan            Current LiDAR scan for obstacle detection.
- * @param latest_odom_disp_mm  Odometry displacement (mm) accumulated since the last call.
  * @param out_cmd              Output control frame; only valid when function returns true.
  * @return true  — out_cmd is valid, caller should transmit it.
  *         false — cycle skipped (not enabled or override active); do NOT transmit.
@@ -55,8 +54,15 @@ bool local_planner_update(const quadtree_map_t *map,
                           const path_t         *global_path,
                           bool                  override_flag,
                           const lidar_scan_t   *live_scan,
-                          float                 latest_odom_disp_mm,
                           control_frame_t      *out_cmd);
+
+/**
+ * Feed one odometry packet into the local planner (call at ~100 Hz from task_odom).
+ * Handles stall detection and recovery distance accumulation so those run on
+ * live encoder data rather than the slower LiDAR scan rate.
+ * @param linear_disp_mm  odom_t.linear_disp_mm from the latest packet.
+ */
+void local_planner_odom_tick(float linear_disp_mm);
 
 /** Return the current operating mode. */
 lp_mode_t local_planner_get_mode(void);

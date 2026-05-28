@@ -84,8 +84,10 @@
  */
 
 /* ── Wi-Fi credentials — fill in before flashing ───────────────────────── */
-#define WIFI_SSID      "SPOT-iot"
-#define WIFI_PASSWORD  "RacailleSalutaireMigration8052"
+// #define WIFI_SSID      "SPOT-iot"
+// #define WIFI_PASSWORD  "RacailleSalutaireMigration8052"
+#define WIFI_SSID      "iPhone de Sara"
+#define WIFI_PASSWORD  "motdepasse2025"
 
 #include "../hardware_pins.h"
 #include "src/lidar_driver.h"
@@ -174,10 +176,11 @@ static volatile float s_target_fx  = 0.0f;
 static volatile float s_target_fy  = 0.0f;
 static volatile bool  s_has_target = false;
 
-/* Total |linear_disp_mm| accumulated by task_odom since the last
- * local_planner_update() call.  Written under s_pose_mutex; snapshotted and
- * reset by task_lidar_slam (also under s_pose_mutex) before each LP cycle. */
-static float s_odom_disp_accum = 0.0f;
+/* Set by task_lidar_slam when the LP forces an obstacle replan.
+ * Read-and-cleared by task_planner to blacklist the frontier that caused it,
+ * preventing the planner from immediately re-routing into the same wall. */
+static volatile bool s_lp_triggered_replan = false;
+
 
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -234,17 +237,10 @@ static void task_lidar_slam(void *arg)
         s_read_us_tot += read_us;
         if (read_us > s_read_us_max) s_read_us_max = read_us;
 
-        /* ── 2. Snapshot raw odometry pose (after 100 ms scan window) ────── *
-         * task_odom updates s_pose at 100 Hz. Snapshot here for the most   *
-         * current estimate before scan matching and map integration.        *
-         * Also drain the odom displacement accumulator for the LP stall     *
-         * detector; reset it so the next LP cycle sees only fresh motion.   */
+        /* ── 2. Snapshot raw odometry pose (after 100 ms scan window) ────── */
         pose_t raw_pose;
-        float  odom_disp_since_lp;
         xSemaphoreTake(s_pose_mutex, portMAX_DELAY);
-        raw_pose           = s_pose;
-        odom_disp_since_lp = s_odom_disp_accum;
-        s_odom_disp_accum  = 0.0f;
+        raw_pose = s_pose;
         xSemaphoreGive(s_pose_mutex);
 
         /* ── 3. Scan matching — correct raw odometry with map correlation ── *
@@ -384,8 +380,7 @@ static void task_lidar_slam(void *arg)
             control_frame_t lp_cmd;
             bool lp_valid = local_planner_update(&s_map, &matched_pose,
                                                   &s_lp_path, false,
-                                                  &scan, odom_disp_since_lp,
-                                                  &lp_cmd);
+                                                  &scan, &lp_cmd);
 
             lp_mode_t lp_mode = local_planner_get_mode();
 
@@ -393,14 +388,14 @@ static void task_lidar_slam(void *arg)
                 /* Stop waypoint stream so Wemos acts on the control frame. */
                 path_streamer_clear();
                 uart_bridge_send_control(&lp_cmd);
-                printf("[LP] mode=%d  spd=%.0f  hdg=%.1f°\n",
-                       (int)lp_mode,
+                printf("[LP] override  spd=%.0f  hdg=%.1f°\n",
                        (double)lp_cmd.t_speed,
                        (double)(lp_cmd.t_heading * 180.0f / (float)M_PI));
             }
 
             if (local_planner_replan_needed()) {
                 local_planner_clear_replan();
+                s_lp_triggered_replan = true;
                 if (s_h_planner)
                     xTaskNotify(s_h_planner, 0u, eSetValueWithOverwrite);
                 printf("[LP] replan requested\n");
@@ -606,8 +601,15 @@ static void task_odom(void *arg)
             s_pose.x        += ds * cosf(theta_mid);
             s_pose.y        += ds * sinf(theta_mid);
             s_pose.theta     = _wrap_angle(s_pose.theta + dtheta);
-            s_odom_disp_accum += fabsf(ds);
             xSemaphoreGive(s_pose_mutex);
+
+            /* Feed live encoder displacement into the local planner at 100 Hz.
+             * Stall detection and recovery accumulation run here, not in the
+             * slower lidar task.  If the LP takes over, kill the waypoint stream
+             * immediately so the Wemos acts on the control frame override. */
+            local_planner_odom_tick(ds);
+            if (local_planner_get_mode() != LP_MODE_PURE_PURSUIT)
+                path_streamer_clear();
 
             /* Feed consumed-waypoint progress back to the path streamer so it
              * can top up the Wemos ring buffer proactively. */
@@ -857,6 +859,19 @@ static void task_planner(void *arg)
                     s_has_target = false;
                     vTaskDelete(NULL);
                     return;
+                }
+                /* If the local planner forced this replan due to an obstacle,
+                 * blacklist the frontier we just tried so we don't immediately
+                 * route back into the same wall. */
+                if (s_lp_triggered_replan) {
+                    s_lp_triggered_replan = false;
+                    if (bl_n < (int)(sizeof(bl)/sizeof(bl[0])) && s_has_target) {
+                        bl[bl_n].cx = s_target_fx;
+                        bl[bl_n].cy = s_target_fy;
+                        bl_n++;
+                        printf("[PLAN] LP replan — blacklisted frontier (%.0f,%.0f) (%d total)\n",
+                               (double)s_target_fx, (double)s_target_fy, bl_n);
+                    }
                 }
                 wifi_dashboard_log("[PLAN] path done — replanning");
                 printf("[PLAN] path done — replanning\n");
