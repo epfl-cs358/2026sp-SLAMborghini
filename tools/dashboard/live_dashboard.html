@@ -162,6 +162,49 @@ input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
 .log .ok { color: var(--green); }
 .log .w  { color: var(--orange); }
 .log .e  { color: var(--red); }
+
+#doneOverlay {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0,0,0,.72);
+  z-index: 20;
+}
+#doneOverlay.open { display: flex; }
+#doneDialog {
+  width: min(760px, 96vw);
+  max-height: 92vh;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 18px 60px rgba(0,0,0,.45);
+}
+#doneTitle {
+  color: var(--green);
+  font-size: 16px;
+  letter-spacing: 1px;
+  margin-bottom: 10px;
+}
+#doneImg {
+  width: 100%;
+  max-height: 68vh;
+  object-fit: contain;
+  image-rendering: pixelated;
+  background: #0a0a0a;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+#doneActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
 </style>
 </head>
 <body>
@@ -240,6 +283,17 @@ input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
   </div>
 </div>
 
+<div id="doneOverlay" role="dialog" aria-modal="true" aria-labelledby="doneTitle">
+  <div id="doneDialog">
+    <div id="doneTitle">Exploration Done</div>
+    <img id="doneImg" alt="Final occupancy map snapshot">
+    <div id="doneActions">
+      <button onclick="downloadDoneSnapshot()">Download PNG</button>
+      <button onclick="closeDonePopup()">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 'use strict';
 
@@ -281,6 +335,8 @@ let drag = null;
 
 let ws = null, wsRetryTimer = null;
 let pingTs = 0, latency = null;
+let explorationDoneShown = false;
+let lastDoneSnapshotUrl = '';
 
 let nMap = 0, nScan = 0, nPose = 0;
 let fpsCnt = 0, fpsLast = 0, fpsVal = 0;
@@ -919,6 +975,94 @@ function log(txt, cls) {
 
 function clearLog() { document.getElementById('logBox').innerHTML = ''; }
 
+function mapToSnapshotCanvas() {
+  if (!mapState?.bitmap) return null;
+
+  const { gw, gh, cellMm, xMin, yMin, bitmap } = mapState;
+  const scale = Math.max(4, Math.floor(Math.min(900 / gw, 700 / gh)));
+  const out = document.createElement('canvas');
+  out.width = gw * scale;
+  out.height = gh * scale;
+  const octx = out.getContext('2d');
+  octx.imageSmoothingEnabled = false;
+  octx.fillStyle = '#0a0a0a';
+  octx.fillRect(0, 0, out.width, out.height);
+  octx.drawImage(bitmap, 0, 0, out.width, out.height);
+
+  const toSnap = (wx, wy) => [
+    ((wx - xMin) / cellMm) * scale,
+    (gh - (wy - yMin) / cellMm) * scale,
+  ];
+
+  if (trailPts.length > 1) {
+    octx.strokeStyle = '#00ffffcc';
+    octx.lineWidth = Math.max(2, scale * 0.25);
+    octx.beginPath();
+    let [x, y] = toSnap(trailPts[0].x, trailPts[0].y);
+    octx.moveTo(x, y);
+    for (let i = 1; i < trailPts.length; i++) {
+      [x, y] = toSnap(trailPts[i].x, trailPts[i].y);
+      octx.lineTo(x, y);
+    }
+    octx.stroke();
+  }
+
+  if (astarPath.length > 1) {
+    octx.strokeStyle = '#52b788cc';
+    octx.lineWidth = Math.max(2, scale * 0.25);
+    octx.setLineDash([8, 5]);
+    octx.beginPath();
+    let [x, y] = toSnap(astarPath[0].x, astarPath[0].y);
+    octx.moveTo(x, y);
+    for (let i = 1; i < astarPath.length; i++) {
+      [x, y] = toSnap(astarPath[i].x, astarPath[i].y);
+      octx.lineTo(x, y);
+    }
+    octx.stroke();
+    octx.setLineDash([]);
+  }
+
+  if (lastPose) {
+    const [x, y] = toSnap(lastPose.x, lastPose.y);
+    octx.fillStyle = '#4361ee';
+    octx.strokeStyle = '#ffffffaa';
+    octx.lineWidth = 2;
+    octx.beginPath();
+    octx.arc(x, y, Math.max(5, scale * 0.55), 0, Math.PI * 2);
+    octx.fill();
+    octx.stroke();
+  }
+
+  return out;
+}
+
+function showExplorationDonePopup() {
+  const snap = mapToSnapshotCanvas() || canvas;
+  lastDoneSnapshotUrl = snap.toDataURL('image/png');
+  document.getElementById('doneImg').src = lastDoneSnapshotUrl;
+  document.getElementById('doneOverlay').classList.add('open');
+}
+
+function closeDonePopup() {
+  document.getElementById('doneOverlay').classList.remove('open');
+}
+
+function downloadDoneSnapshot() {
+  if (!lastDoneSnapshotUrl) return;
+  const a = document.createElement('a');
+  a.href = lastDoneSnapshotUrl;
+  a.download = 'slamborghini-exploration-map.png';
+  a.click();
+}
+
+function maybeShowExplorationDone(txt) {
+  const s = txt.toLowerCase();
+  if (explorationDoneShown) return;
+  if (!s.includes('exploration done') && !s.includes('exploration complete')) return;
+  explorationDoneShown = true;
+  requestAnimationFrame(showExplorationDonePopup);
+}
+
 function wsConnect() {
   clearTimeout(wsRetryTimer);
   /* Close any in-progress or open connection before creating a new one.
@@ -968,6 +1112,7 @@ function wsConnect() {
         return;
       }
       log(evt.data, 'ok');   // firmware log line
+      maybeShowExplorationDone(evt.data);
       return;
     }
 
@@ -997,6 +1142,8 @@ function sendCmd(cmd) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ cmd }));
   if (cmd === 'start') {
+    explorationDoneShown = false;
+    closeDonePopup();
     document.getElementById('btnStart').disabled = true;
     document.getElementById('btnStop').disabled  = false;
     log('Exploration started', 'ok');
