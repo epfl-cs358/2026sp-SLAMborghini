@@ -97,8 +97,8 @@ static float   s_grid_ox, s_grid_oy;
 #define BEAM_STRIDE     5
 #define MIN_RANGE_MM  200.0f
 
-static float s_bx[MAX_BEAMS];
-static float s_by[MAX_BEAMS];
+static int16_t s_bx[MAX_BEAMS]; /* robot-frame beam endpoints, mm */
+static int16_t s_by[MAX_BEAMS];
 static int   s_nb = 0;
 
 /* Likelihood sharpness: w ∝ exp(k × hits).  k=0.1 → ~20× weight ratio
@@ -129,8 +129,10 @@ static int _score_pose(float cx, float cy, float cos_t, float sin_t)
 {
     int hits = 0;
     for (int j = 0; j < s_nb; j++) {
-        float wx = cx + s_bx[j] * cos_t - s_by[j] * sin_t;
-        float wy = cy + s_bx[j] * sin_t + s_by[j] * cos_t;
+        float bx = (float)s_bx[j];
+        float by = (float)s_by[j];
+        float wx = cx + bx * cos_t - by * sin_t;
+        float wy = cy + bx * sin_t + by * cos_t;
         int gi = (int)((wx - s_grid_ox) / GRID_CELL + 0.5f);
         int gj = (int)((wy - s_grid_oy) / GRID_CELL + 0.5f);
         if ((unsigned)gi < (unsigned)GRID_N &&
@@ -225,11 +227,11 @@ void rbpf_update(rbpf_state_t      *state,
     /* 1. Pre-compute beam endpoints in robot frame (stride-sampled, capped). */
     s_nb = 0;
     for (uint16_t i = 0; i < scan->count && s_nb < MAX_BEAMS; i += BEAM_STRIDE) {
-        float r = scan->points[i].r_mm;
+        float r = lidar_point_range_mm(&scan->points[i]);
         if (r < MIN_RANGE_MM || r > LIDAR_MAP_RADIUS_MM) continue;
-        float rad = -scan->points[i].theta_deg * d2r + LIDAR_OFFSET_THETA_RAD;
-        s_bx[s_nb] = r * cosf(rad);
-        s_by[s_nb] = r * sinf(rad);
+        float rad = -lidar_point_theta_deg(&scan->points[i]) * d2r + LIDAR_OFFSET_THETA_RAD;
+        s_bx[s_nb] = (int16_t)lrintf(r * cosf(rad));
+        s_by[s_nb] = (int16_t)lrintf(r * sinf(rad));
         s_nb++;
     }
     if (s_nb < 3) return;

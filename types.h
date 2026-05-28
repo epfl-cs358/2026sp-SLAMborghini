@@ -13,12 +13,24 @@
 
 /** A single point from the RPLiDAR C1 scan in polar coordinates. */
 typedef struct {
-    float    r_mm;          /**< Range in millimetres */
-    float    theta_deg;     /**< Angle in degrees (0-360) */
+    uint16_t r_mm;          /**< Range in millimetres. 0 = no return / clear ray */
+    uint16_t theta_cdeg;    /**< Angle in centidegrees (degrees x100, 0..35999) */
     uint8_t  intensity;     /**< Return signal intensity (0-255) */
     uint8_t  _pad[3];
     uint32_t timestamp_us;  /**< Beam capture time (µs, esp_timer epoch); set by lidar_driver */
 } lidar_scan_point_t;
+_Static_assert(sizeof(lidar_scan_point_t) == 12u,
+               "lidar_scan_point_t should stay compact: range mm + angle cdeg");
+
+static inline float lidar_point_range_mm(const lidar_scan_point_t *p)
+{
+    return p ? (float)p->r_mm : 0.0f;
+}
+
+static inline float lidar_point_theta_deg(const lidar_scan_point_t *p)
+{
+    return p ? (float)p->theta_cdeg * 0.01f : 0.0f;
+}
 
 /** One full 360-degree LiDAR scan. */
 typedef struct {
@@ -49,10 +61,12 @@ typedef struct {
 
 /** 2-D Cartesian point with intensity (output of polar-to-Cartesian conversion). */
 typedef struct {
-    float   x;         /**< X coordinate in mm */
-    float   y;         /**< Y coordinate in mm */
+    int16_t x;         /**< X coordinate in millimetres */
+    int16_t y;         /**< Y coordinate in millimetres */
     uint8_t intensity; /**< Scan intensity (0-255) */
 } point2f_t;
+_Static_assert(sizeof(point2f_t) == 6u,
+               "point2f_t should stay compact: int16 mm coordinates");
 
 /** Relative pose correction returned by scan matcher. */
 typedef struct {
@@ -64,11 +78,13 @@ typedef struct {
 
 /** A single navigation waypoint on a planned path. */
 typedef struct {
-    float x;        /**< X position in mm */
-    float y;        /**< Y position in mm */
-    float theta;    /**< Desired heading at waypoint (radians) */
-    float v_target; /**< Target speed at waypoint (mm/s) */
+    int16_t  x;        /**< X position in millimetres */
+    int16_t  y;        /**< Y position in millimetres */
+    float    theta;    /**< Desired heading at waypoint (radians) */
+    uint16_t v_target; /**< Target speed in mm/s */
 } waypoint_t;
+_Static_assert(sizeof(waypoint_t) == 12u,
+               "waypoint_t should stay compact: int16 mm coords + float heading");
 
 /** Maximum number of waypoints sent over UART in one path frame. */
 #define MAX_SHARED_PATH_POINTS 15
@@ -97,8 +113,8 @@ typedef struct {
     uint8_t    _pad[2];
     waypoint_t wp[PATH_CHUNK_WP_COUNT];     /**< Waypoint data */
 } path_chunk_t;
-/* path_chunk_t: 2+2+1+1+2 header + 8×16 waypoints = 136 bytes (no packing). */
-_Static_assert(sizeof(path_chunk_t) == 136u,
+/* path_chunk_t: 2+2+1+1+2 header + 8 x 12-byte waypoints = 104 bytes. */
+_Static_assert(sizeof(path_chunk_t) == 104u,
                "path_chunk_t size mismatch — check waypoint_t and padding");
 
 /** Control command transmitted from ESP32-S3 to Wemos D1 R32. */
@@ -108,6 +124,13 @@ typedef struct {
     float t_heading; /**< Target heading in radians */
     float t_speed;   /**< Target speed in mm/s */
 } control_frame_t;
+
+/** Front ultrasonic emergency-brake event from Wemos to ESP32-S3. */
+typedef struct {
+    uint16_t distance_mm; /**< Latest front HC-SR04 distance; 0 if invalid */
+    uint8_t  active;      /**< 1 = brake latched, 0 = cleared */
+    uint8_t  seq;         /**< Low-rate sequence counter */
+} front_hazard_t;
 
 /** A single exploration frontier cell. */
 typedef struct {
@@ -139,9 +162,11 @@ typedef enum {
 
 /** A Cartesian point annotated with a semantic class. */
 typedef struct {
-    float           x;   /**< X coordinate in mm */
-    float           y;   /**< Y coordinate in mm */
-    semantic_class_t cls; /**< Semantic classification */
+    int16_t x;   /**< X coordinate in millimetres */
+    int16_t y;   /**< Y coordinate in millimetres */
+    uint8_t cls; /**< semantic_class_t stored as uint8_t */
 } classified_point_t;
+_Static_assert(sizeof(classified_point_t) == 6u,
+               "classified_point_t should stay compact: int16 mm coordinates");
 
 #endif /* TYPES_H */

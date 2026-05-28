@@ -16,7 +16,7 @@ typedef struct {
     int width;
     int height;
     float cell_size_mm;
-    planner_cell_t *cells;
+    uint8_t *cells; /* planner_cell_t values stored as one byte per cell */
 } planning_grid_t;
 
 bool planning_grid_init(planning_grid_t *grid, int width, int height, float cell_size_mm);

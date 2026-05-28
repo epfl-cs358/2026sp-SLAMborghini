@@ -77,8 +77,8 @@ static uint8_t s_grid[GRID_CELLS][GRID_CELLS];  /* 1296 B in BSS */
 static float   s_grid_ox, s_grid_oy;            /* world coord of grid[0][0] centre */
 
 /* ── Beam endpoint buffers (BSS, not re-entrant) ────────────────────────── */
-static float s_bx[SM_MAX_SAMPLES];
-static float s_by[SM_MAX_SAMPLES];
+static int16_t s_bx[SM_MAX_SAMPLES]; /* robot-frame beam endpoints, mm */
+static int16_t s_by[SM_MAX_SAMPLES];
 static int   s_nb = 0;
 
 /* Build the local occupancy grid centred at (cx, cy). */
@@ -100,8 +100,10 @@ static int _score(float cx, float cy, float cos_t, float sin_t)
 {
     int hits = 0;
     for (int j = 0; j < s_nb; j++) {
-        float wx = cx + s_bx[j] * cos_t - s_by[j] * sin_t;
-        float wy = cy + s_bx[j] * sin_t + s_by[j] * cos_t;
+        float bx = (float)s_bx[j];
+        float by = (float)s_by[j];
+        float wx = cx + bx * cos_t - by * sin_t;
+        float wy = cy + bx * sin_t + by * cos_t;
         /* Nearest-grid-cell lookup; out-of-bounds cast to large uint → skip. */
         int gi = (int)((wx - s_grid_ox) / GRID_CELL_MM + 0.5f);
         int gj = (int)((wy - s_grid_oy) / GRID_CELL_MM + 0.5f);
@@ -127,14 +129,14 @@ bool scan_match(const QuadTreeMap   *map,
     const float    d2r = (float)M_PI / 180.0f;
 
     /* ── 1. Precompute beam endpoints in robot frame ─────────────────────
-     * Negate theta_deg: LiDAR angles are clockwise; trig expects CCW.     */
+     * Negate LiDAR angle: LiDAR scans clockwise; trig expects CCW.        */
     s_nb = 0;
     for (uint16_t i = 0; i < scan->count && s_nb < SM_MAX_SAMPLES; i += SM_BEAM_STRIDE) {
-        float r = scan->points[i].r_mm;
+        float r = lidar_point_range_mm(&scan->points[i]);
         if (r < SM_MIN_RANGE_MM || r > LIDAR_MAP_RADIUS_MM) continue;
-        float rad = -scan->points[i].theta_deg * d2r + LIDAR_OFFSET_THETA_RAD;
-        s_bx[s_nb] = r * cosf(rad);
-        s_by[s_nb] = r * sinf(rad);
+        float rad = -lidar_point_theta_deg(&scan->points[i]) * d2r + LIDAR_OFFSET_THETA_RAD;
+        s_bx[s_nb] = (int16_t)lrintf(r * cosf(rad));
+        s_by[s_nb] = (int16_t)lrintf(r * sinf(rad));
         s_nb++;
     }
 

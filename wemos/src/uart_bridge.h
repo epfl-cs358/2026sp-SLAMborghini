@@ -17,6 +17,9 @@ bool uart_bridge_recv_path_chunk(path_chunk_t *out);
 /* Notify ESP32-S3 that the current path has been fully executed. */
 bool uart_bridge_send_path_done(void);
 
+/* Notify ESP32-S3 that the local front ultrasonic brake latched/cleared. */
+bool uart_bridge_send_front_hazard(const front_hazard_t *hazard);
+
 /* Send a NACK back to ESP32-S3 when a chunk arrives out of order.
  * path_id identifies the active plan; expected_start is the next
  * global index we need so ESP32-S3 can rewind and resend. */

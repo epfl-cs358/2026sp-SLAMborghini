@@ -59,8 +59,8 @@ lidar_scan_t lidar_stub_room_scan(void)
             if (t < r) r = t;
         }
 
-        scan.points[i].r_mm      = r;
-        scan.points[i].theta_deg = theta_deg;
+        scan.points[i].r_mm       = (uint16_t)lrintf(r);
+        scan.points[i].theta_cdeg = (uint16_t)lrintf(theta_deg * 100.0f);
         scan.points[i].intensity = 200; /* Strong wall return */
     }
 
@@ -78,8 +78,8 @@ lidar_scan_t lidar_stub_room_scan_perturbed(void)
 
     for (int i = 0; i < scan.count; i++) {
         /* Add a tiny, deterministic offset */
-        scan.points[i].r_mm      += 2.0f;
-        scan.points[i].theta_deg += 0.01f;
+        scan.points[i].r_mm       += 2u;
+        scan.points[i].theta_cdeg += 1u;
     }
 
     return scan;

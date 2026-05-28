@@ -17,6 +17,7 @@ idf_component_register(
         "${WEMOS_ROOT}/src/imu_encoder_driver.c"
         "${WEMOS_ROOT}/src/encoder_ackermann_odometry.c"
         "${WEMOS_ROOT}/src/task_odometry.c"
+        "${WEMOS_ROOT}/src/hcsr04_driver.c"
         "${WEMOS_ROOT}/imu_gyro.c"
         "${S3_SRC}/quadtree_map.c"
         "${S3_SRC}/quadtree_map_compat.c"

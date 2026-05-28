@@ -19,12 +19,14 @@
 
 #define MAX_PTS             460u   /* RPLiDAR C1 max points per scan */
 #define MAX_CLUSTERS        64u
-#define GAP_THRESH_RAD      0.0873f  /* 5° — new cluster if angular gap exceeds this */
+#define GAP_THRESH_MRAD     87       /* 5 deg, stored as radians x1000 */
 #define MIN_WALL_POINTS     5u
 #define MIN_WALL_SPREAD_MM  150.0f
 #define WALL_LINEAR_RATIO   0.15f    /* max(deviation)/spread below this → wall */
 
-typedef struct { float angle; uint16_t idx; } sorted_pt_t;
+typedef struct { int16_t angle_mrad; uint16_t idx; } sorted_pt_t;
+_Static_assert(sizeof(sorted_pt_t) == 4u,
+               "sorted_pt_t should stay compact: angle mrad + index");
 typedef struct { uint16_t start; uint16_t count; } cluster_t;
 
 /* Static BSS — avoids placing 2.7 KB on the 6 KB task stack. */
@@ -53,15 +55,16 @@ void obstacle_classifier_classify(const point2f_t *pts, uint16_t count,
 
     /* Step 1: build sorted index by angle */
     for (uint16_t i = 0; i < n; i++) {
-        s_sorted[i].angle = atan2f(pts[i].y, pts[i].x);
-        s_sorted[i].idx   = i;
+        s_sorted[i].angle_mrad = (int16_t)lrintf(atan2f((float)pts[i].y,
+                                                        (float)pts[i].x) * 1000.0f);
+        s_sorted[i].idx        = i;
     }
 
     /* Insertion sort — clusters are examined in angular order; n <= 460. */
     for (uint16_t i = 1; i < n; i++) {
         sorted_pt_t key = s_sorted[i];
         int16_t j = (int16_t)(i - 1);
-        while (j >= 0 && s_sorted[j].angle > key.angle) {
+        while (j >= 0 && s_sorted[j].angle_mrad > key.angle_mrad) {
             s_sorted[j + 1] = s_sorted[j];
             j--;
         }
@@ -77,8 +80,8 @@ void obstacle_classifier_classify(const point2f_t *pts, uint16_t count,
     nc = 1;
 
     for (uint16_t i = 1; i < n; i++) {
-        float gap = s_sorted[i].angle - s_sorted[i - 1].angle;
-        if (gap > GAP_THRESH_RAD && nc < MAX_CLUSTERS) {
+        int16_t gap = (int16_t)(s_sorted[i].angle_mrad - s_sorted[i - 1].angle_mrad);
+        if (gap > GAP_THRESH_MRAD && nc < MAX_CLUSTERS) {
             clusters[nc].start = i;
             clusters[nc].count = 1;
             nc++;
@@ -99,8 +102,8 @@ void obstacle_classifier_classify(const point2f_t *pts, uint16_t count,
         if (ccount >= MIN_WALL_POINTS) {
             uint16_t ia = s_sorted[cstart].idx;
             uint16_t ib = s_sorted[cstart + ccount - 1u].idx;
-            float ax = pts[ia].x, ay = pts[ia].y;
-            float bx = pts[ib].x, by = pts[ib].y;
+            float ax = (float)pts[ia].x, ay = (float)pts[ia].y;
+            float bx = (float)pts[ib].x, by = (float)pts[ib].y;
             float spread = sqrtf((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
 
             if (spread >= MIN_WALL_SPREAD_MM) {
@@ -126,7 +129,7 @@ void obstacle_classifier_classify(const point2f_t *pts, uint16_t count,
             uint16_t ik = s_sorted[k].idx;
             out[out_n].x   = pts[ik].x;
             out[out_n].y   = pts[ik].y;
-            out[out_n].cls = cls;
+            out[out_n].cls = (uint8_t)cls;
             out_n++;
         }
     }

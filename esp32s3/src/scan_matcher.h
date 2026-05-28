@@ -45,7 +45,7 @@ typedef struct {
  * Refine odom_pose by correlating the scan against the existing quadtree map.
  *
  * @param map        Quadtree occupancy map (read-only, already integrated).
- * @param scan       Current LiDAR scan (r_mm + theta_deg per point).
+ * @param scan       Current LiDAR scan (r_mm + theta_cdeg per point).
  * @param odom_pose  Raw odometry pose — starting estimate (x,y mm, theta rad).
  * @param corrected  Output: scan-matched corrected pose.  Set to *odom_pose on failure.
  * @param result     Output: diagnostics (score, deltas, timing).  Always filled.

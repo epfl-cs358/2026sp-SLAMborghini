@@ -142,6 +142,22 @@ static volatile uint32_t s_read_us_max = 0;
 static volatile uint32_t s_l2m_calls  = 0;
 static volatile uint32_t s_l2m_us_tot = 0;
 static volatile uint32_t s_l2m_us_max = 0;
+static volatile bool s_sonar_brake_active = false;
+
+static dash_control_layer_t ctrl_layer_from_lp(lp_mode_t mode)
+{
+    switch (mode) {
+    case LP_MODE_REACTIVE: return DASH_CTRL_REACTIVE;
+    case LP_MODE_ESCAPE:   return DASH_CTRL_STALL_REVERSE;
+    case LP_MODE_RECOVER:  return DASH_CTRL_RECOVER;
+    case LP_MODE_STOPPED:
+    case LP_MODE_WAIT_CLEAR:
+        return DASH_CTRL_STOPPED;
+    case LP_MODE_PURE_PURSUIT:
+    default:
+        return DASH_CTRL_ASTAR;
+    }
+}
 
 /* Scan-matcher diagnostics */
 static volatile uint32_t s_sm_calls   = 0;   /* total scan_match() invocations */
@@ -345,11 +361,11 @@ static void task_lidar_slam(void *arg)
             uint16_t cart_n = 0, class_n = 0;
 
             for (uint16_t i = 0; i < scan.count && i < 460u; i++) {
-                float r = scan.points[i].r_mm;
+                float r = lidar_point_range_mm(&scan.points[i]);
                 if (r < 50.0f || r > LIDAR_PROCESS_RANGE_MM) continue;
-                float a = -scan.points[i].theta_deg * ((float)M_PI / 180.0f);
-                s_cart[cart_n].x         = r * cosf(a);
-                s_cart[cart_n].y         = r * sinf(a);
+                float a = -lidar_point_theta_deg(&scan.points[i]) * ((float)M_PI / 180.0f);
+                s_cart[cart_n].x         = (int16_t)lrintf(r * cosf(a));
+                s_cart[cart_n].y         = (int16_t)lrintf(r * sinf(a));
                 s_cart[cart_n].intensity = scan.points[i].intensity;
                 cart_n++;
             }
@@ -369,9 +385,14 @@ static void task_lidar_slam(void *arg)
 
             control_frame_t lp_cmd;
             bool lp_valid = local_planner_update(&s_map, &matched_pose,
-                                                  &s_lp_path, false, &lp_cmd);
+                                                  &s_lp_path,
+                                                  s_sonar_brake_active,
+                                                  &lp_cmd);
 
             lp_mode_t lp_mode = local_planner_get_mode();
+            wifi_dashboard_set_control_layer(s_sonar_brake_active
+                                             ? DASH_CTRL_SONAR_EMERGENCY
+                                             : ctrl_layer_from_lp(lp_mode));
 
             /* Send override only when actively avoiding — leave PP in control
              * during normal PURE_PURSUIT mode. */
@@ -619,6 +640,51 @@ static void task_odom(void *arg)
             uint16_t nack_pid, nack_exp;
             if (uart_bridge_recv_chunk_nack(&nack_pid, &nack_exp)) {
                 path_streamer_handle_nack(nack_pid, nack_exp);
+            }
+            {
+                static bool sonar_brake_active = false;
+                front_hazard_t hazard;
+                if (uart_bridge_recv_front_hazard(&hazard)) {
+                    if (hazard.active && !sonar_brake_active) {
+                        sonar_brake_active = true;
+                        s_sonar_brake_active = true;
+
+                        pose_t pose;
+                        xSemaphoreTake(s_pose_mutex, portMAX_DELAY);
+                        pose = s_pose;
+                        xSemaphoreGive(s_pose_mutex);
+
+                        float dist = (hazard.distance_mm > 0u)
+                                   ? (float)hazard.distance_mm
+                                   : 220.0f;
+                        if (dist < 80.0f)  dist = 80.0f;
+                        if (dist > 600.0f) dist = 600.0f;
+
+                        float obs_r = 260.0f + dist;
+                        float obs_x = pose.x + obs_r * cosf(pose.theta);
+                        float obs_y = pose.y + obs_r * sinf(pose.theta);
+
+                        xSemaphoreTake(s_map_mutex, portMAX_DELAY);
+                        qt_update(&s_map, obs_x, obs_y, QT_HIT_INC);
+                        qt_update(&s_map, obs_x, obs_y, QT_HIT_INC);
+                        xSemaphoreGive(s_map_mutex);
+
+                        wifi_dashboard_log("[SONAR] front brake -> injected obstacle + replan");
+                        wifi_dashboard_set_control_layer(DASH_CTRL_SONAR_EMERGENCY);
+                        if (s_h_planner)
+                            xTaskNotify(s_h_planner, 0u, eSetValueWithOverwrite);
+                        printf("[SONAR] front brake dist=%u seq=%u inject=(%.0f,%.0f)\n",
+                               (unsigned)hazard.distance_mm, (unsigned)hazard.seq,
+                               (double)obs_x, (double)obs_y);
+                    } else if (!hazard.active && sonar_brake_active) {
+                        sonar_brake_active = false;
+                        s_sonar_brake_active = false;
+                        wifi_dashboard_log("[SONAR] front brake cleared");
+                        wifi_dashboard_set_control_layer(DASH_CTRL_ASTAR);
+                        printf("[SONAR] front brake cleared seq=%u dist=%u\n",
+                               (unsigned)hazard.seq, (unsigned)hazard.distance_mm);
+                    }
+                }
             }
         }
 

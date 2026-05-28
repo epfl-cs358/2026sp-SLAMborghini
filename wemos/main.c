@@ -28,6 +28,7 @@
 #include "src/task_odometry.h"
 #include "src/imu_encoder_driver.h"
 #include "src/encoder_ackermann_odometry.h"
+#include "src/hcsr04_driver.h"
 
 #include "driver/ledc.h"
 #include "driver/uart.h"
@@ -61,6 +62,12 @@ static const char *TAG = "wemos_main";
 
 /* ── PP loop rate ─────────────────────────────────────────────────────────── */
 #define PP_PERIOD_MS    50u   /* 20 Hz */
+
+#define SONAR_STOP_MM          100u
+#define SONAR_CLEAR_MM         180u
+#define SONAR_HIT_STREAK         2u
+#define SONAR_CLEAR_STREAK       5u
+#define SONAR_REPORT_PERIOD_US 200000LL
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Actuator helpers
@@ -119,8 +126,8 @@ static void apply_transform_to_chunk(path_chunk_t *chunk)
     for (uint8_t i = 0; i < chunk->count; i++) {
         float rx = chunk->wp[i].x - s_tf_base_x;
         float ry = chunk->wp[i].y - s_tf_base_y;
-        chunk->wp[i].x     = s_tf_wx + (s_tf_c * rx - s_tf_sv * ry);
-        chunk->wp[i].y     = s_tf_wy + (s_tf_sv * rx + s_tf_c  * ry);
+        chunk->wp[i].x     = (int16_t)lrintf(s_tf_wx + (s_tf_c * rx - s_tf_sv * ry));
+        chunk->wp[i].y     = (int16_t)lrintf(s_tf_wy + (s_tf_sv * rx + s_tf_c  * ry));
         chunk->wp[i].theta = wrap_rad(chunk->wp[i].theta - s_tf_base_th + s_tf_wth);
     }
 }
@@ -139,6 +146,13 @@ static void task_pure_pursuit(void *pvParameters)
     bool     path_active     = false;
     int64_t  override_last_us = 0;   /* timestamp of last valid LP override */
     control_frame_t last_override = {0};
+    bool     front_hazard = false;
+    bool     front_hazard_last_sent = false;
+    uint8_t  front_hazard_hits = 0;
+    uint8_t  front_hazard_clears = 0;
+    uint8_t  front_hazard_seq = 0;
+    int64_t  front_hazard_last_us = 0;
+    uint16_t front_hazard_old_path_id = 0xFFFFu;
 #define OVERRIDE_TIMEOUT_US 300000LL /* revert to PP if no override for 300 ms */
 
     for (;;) {
@@ -151,7 +165,10 @@ static void task_pure_pursuit(void *pvParameters)
         /* ── 1. Accept streaming chunk from ESP32-S3 ────────────────────── */
         path_chunk_t chunk;
         if (uart_bridge_recv_path_chunk(&chunk)) {
-
+            if (front_hazard && chunk.path_id == front_hazard_old_path_id) {
+                ESP_LOGW(TAG, "discard stale path id=%u during sonar brake",
+                         (unsigned)chunk.path_id);
+            } else {
             /* First chunk of a new plan: capture SE(2) transform so that all
              * subsequent chunks of this plan are expressed in Wemos local frame.
              * The transform aligns wp[0] (S3's estimate of robot position) with
@@ -193,6 +210,7 @@ static void task_pure_pursuit(void *pvParameters)
                  * start_index != 0 arrived first) — NACK to force resend from 0. */
                 uart_bridge_send_chunk_nack(chunk.path_id, 0u);
             }
+            }
         }
 
         /* ── 2. Current fused pose (metres → mm) ───────────────────────── */
@@ -204,12 +222,55 @@ static void task_pure_pursuit(void *pvParameters)
             .theta = op.theta,
         };
 
-        /* Shift reference forward to the front axle (260 mm ahead). */
-        pose_t front_pose = {
-            .x     = pose.x + cosf(pose.theta) * 260.0f,
-            .y     = pose.y + sinf(pose.theta) * 260.0f,
-            .theta = pose.theta,
-        };
+        uint16_t sonar_mm = 0u;
+        bool sonar_valid = hcsr04_read_u16_mm(&sonar_mm);
+        bool was_front_hazard = front_hazard;
+
+        if (sonar_valid && sonar_mm < SONAR_STOP_MM) {
+            if (front_hazard_hits < 255u) front_hazard_hits++;
+            front_hazard_clears = 0;
+            if (front_hazard_hits >= SONAR_HIT_STREAK)
+                front_hazard = true;
+        } else if (!sonar_valid || sonar_mm > SONAR_CLEAR_MM) {
+            if (front_hazard_clears < 255u) front_hazard_clears++;
+            front_hazard_hits = 0;
+            if (front_hazard_clears >= SONAR_CLEAR_STREAK)
+                front_hazard = false;
+        }
+
+        if (!was_front_hazard && front_hazard) {
+            motor_set(0.0f);
+            servo_set_deg(90.0f);
+            task_odometry_set_steering_rad(0.0f);
+            front_hazard_old_path_id = s_tf_path_id;
+            path_active = false;
+            pp_init(&pp);
+            override_last_us = 0;
+            ESP_LOGW(TAG, "front sonar brake latched at %u mm; old path discarded",
+                     (unsigned)sonar_mm);
+        } else if (was_front_hazard && !front_hazard) {
+            if (s_tf_path_id == front_hazard_old_path_id) {
+                path_active = false;
+                pp_init(&pp);
+                s_tf_path_id = 0xFFFFu;
+            }
+            ESP_LOGI(TAG, "front sonar brake cleared at %u mm",
+                     (unsigned)sonar_mm);
+        }
+
+        bool send_front_hazard =
+            (front_hazard != front_hazard_last_sent) ||
+            (front_hazard && now_us - front_hazard_last_us >= SONAR_REPORT_PERIOD_US);
+        if (send_front_hazard) {
+            front_hazard_t hazard = {
+                .distance_mm = sonar_valid ? sonar_mm : 0u,
+                .active      = front_hazard ? 1u : 0u,
+                .seq         = front_hazard_seq++,
+            };
+            uart_bridge_send_front_hazard(&hazard);
+            front_hazard_last_sent = front_hazard;
+            front_hazard_last_us   = now_us;
+        }
 
         /* ── 3 & 4. Override check, then PP command ──────────────────────── *
          * IMPORTANT: pp_compute_command() must NOT be called during an       *
@@ -229,10 +290,22 @@ static void task_pure_pursuit(void *pvParameters)
             override_last_us = now_us;
         }
 
+        if (front_hazard) {
+            memset(&last_override, 0, sizeof(last_override));
+            override_last_us = 0;
+        }
+
         bool override_active = have_override ||
                                (now_us - override_last_us < OVERRIDE_TIMEOUT_US);
 
-        if (override_active) {
+        if (front_hazard) {
+            /* HC-SR04 owns the car only as a hard emergency brake. While it is
+             * latched, ignore local-planner drive/reverse overrides entirely. */
+            motor_set(0.0f);
+            servo_set_deg(90.0f);
+            task_odometry_set_steering_rad(0.0f);
+            applied_steer_deg = 90.0f;
+        } else if (override_active) {
             lp_override = last_override;
             /* Apply local-planner command.
              * t_speed == 0 → full stop (LP_MODE_STOPPED / footprint occupied).
@@ -277,7 +350,7 @@ static void task_pure_pursuit(void *pvParameters)
             }
         } else if (path_active) {
             /* Only advance pursuit_idx when PP is actually in control */
-            pp_motion_command_t cmd = pp_compute_command(&pp, &front_pose);
+            pp_motion_command_t cmd = pp_compute_command(&pp, &pose);
             if (cmd.stop) {
                 motor_set(0.0f);
                 servo_set_deg(90.0f);
@@ -397,6 +470,7 @@ void app_main(void)
 
     motor_ledc_init();
     servo_ledc_init();
+    hcsr04_init(SONAR_B_TRIG_PIN, SONAR_B_ECHO_PIN);
     servo_set_deg(90.0f);
 
     xTaskCreate(task_odometry,     "odom", 4096, NULL, 5, NULL);

@@ -59,11 +59,10 @@ static const char *TAG = "hybrid_astar";
 #endif
 
 #ifndef PLANNER_ROBOT_RADIUS_MM
-/* Half-width of car (295/2 = 147.5 mm) rounded up — the relevant lateral
- * clearance for forward-moving paths.  The full half-diagonal (246 mm) is
- * only needed for pure rotation and would make A* reject the start position
- * when the car is within 246 mm of any mapped wall. */
-#define PLANNER_ROBOT_RADIUS_MM         150.0f
+/* Lateral half-width = 147.5 mm.  175 mm adds ~27 mm safety buffer per side
+ * without blocking typical 400+ mm corridors.  The full half-diagonal (246 mm)
+ * is too restrictive near walls at the start position. */
+#define PLANNER_ROBOT_RADIUS_MM         175.0f
 #endif
 
 #ifndef HYBRID_XY_RESOLUTION_MM
@@ -105,10 +104,11 @@ static const char *TAG = "hybrid_astar";
 /* -------------------------------------------------------------------------- */
 
 typedef struct {
-    float   x_min, x_max, y_min, y_max;
-    float   cx, cy;
+    int16_t cx_mm, cy_mm;
     int8_t  value;
 } qt_free_leaf_t;
+_Static_assert(sizeof(qt_free_leaf_t) == 6u,
+               "qt_free_leaf_t should stay compact: int16 centre + int8 value");
 
 typedef struct {
     float   x, y, theta;
@@ -339,10 +339,8 @@ static void collect_free_leaves_recursive(const quadtree_map_t *map,
         if (n->value < 0) {
             if (result->count < MAX_QT_FREE_LEAVES) {
                 qt_free_leaf_t *out = &leaves[result->count++];
-                out->x_min = xmn; out->x_max = xmx;
-                out->y_min = ymn; out->y_max = ymx;
-                out->cx    = 0.5f * (xmn + xmx);
-                out->cy    = 0.5f * (ymn + ymx);
+                out->cx_mm = (int16_t)lrintf(0.5f * (xmn + xmx));
+                out->cy_mm = (int16_t)lrintf(0.5f * (ymn + ymx));
                 out->value = n->value;
             } else {
                 result->truncated = true;
@@ -377,7 +375,8 @@ static int find_nearest_free_leaf(const qt_free_leaf_t *leaves, int count,
     int best = -1;
     float best_d2 = FLT_MAX;
     for (int i = 0; i < count; ++i) {
-        const float d2 = dist2_xy(leaves[i].cx, leaves[i].cy, x, y);
+        const float d2 = dist2_xy((float)leaves[i].cx_mm,
+                                  (float)leaves[i].cy_mm, x, y);
         if (d2 < best_d2) { best_d2 = d2; best = i; }
     }
     return best;
@@ -534,10 +533,10 @@ static bool reconstruct_path(int goal_idx, path_t *out_path)
             const int   rev_pos = (int)lroundf((1.0f - alpha) * (float)(raw_count - 1));
             raw_index = reverse_buf[rev_pos];
         }
-        out_path->waypoints[i].x        = g_nodes[raw_index].x;
-        out_path->waypoints[i].y        = g_nodes[raw_index].y;
+        out_path->waypoints[i].x        = (int16_t)lrintf(g_nodes[raw_index].x);
+        out_path->waypoints[i].y        = (int16_t)lrintf(g_nodes[raw_index].y);
         out_path->waypoints[i].theta    = g_nodes[raw_index].theta;
-        out_path->waypoints[i].v_target = DEFAULT_TARGET_SPEED_MM_S;
+        out_path->waypoints[i].v_target = (uint16_t)DEFAULT_TARGET_SPEED_MM_S;
     }
     return true;
 }
@@ -695,8 +694,8 @@ static bool choose_goal_approach_pose(const quadtree_map_t *map,
                                            goal->cx, goal->cy);
     if (idx < 0) return false;
 
-    *goal_x = g_free_leaves[idx].cx;
-    *goal_y = g_free_leaves[idx].cy;
+    *goal_x = (float)g_free_leaves[idx].cx_mm;
+    *goal_y = (float)g_free_leaves[idx].cy_mm;
     return true;
 }
 
@@ -711,21 +710,25 @@ static bool append_frontier_if_safe(const quadtree_map_t *map,
     const float d = dist_xy(last->x, last->y, goal->cx, goal->cy);
     if (d <= 1.0f) return true;
 
+    /* The endpoint must be safe for the full robot body, not just non-occupied.
+     * qt_query_const returns 0 for unknown cells, which would pass the old
+     * "> 0" guard even when there is a wall within PLANNER_ROBOT_RADIUS_MM. */
+    if (!point_robot_collision_free(map, goal->cx, goal->cy)) return true;
+
     const bool free_seg =
         line_is_collision_free_quadtree(map, last->x, last->y,
                                         goal->cx, goal->cy);
     if (!free_seg) {
         if (d > MAX_FRONTIER_APPEND_MM)                    return true;
         if (!is_pose_inside_map(map, goal->cx, goal->cy))  return true;
-        if (qt_query_const(map, goal->cx, goal->cy) > 0)   return true;
     }
 
     const float heading = atan2f(goal->cy - last->y, goal->cx - last->x);
     last->theta = heading;
-    path->waypoints[path->length].x        = goal->cx;
-    path->waypoints[path->length].y        = goal->cy;
+    path->waypoints[path->length].x        = (int16_t)lrintf(goal->cx);
+    path->waypoints[path->length].y        = (int16_t)lrintf(goal->cy);
     path->waypoints[path->length].theta    = heading;
-    path->waypoints[path->length].v_target = DEFAULT_TARGET_SPEED_MM_S;
+    path->waypoints[path->length].v_target = (uint16_t)DEFAULT_TARGET_SPEED_MM_S;
     path->length++;
     return true;
 }

@@ -62,7 +62,7 @@ typedef struct {
  * Extrinsic offsets (LIDAR_OFFSET_*) are applied automatically.
  *
  * @param map          Quadtree occupancy map to update.
- * @param scan         Raw scan from lidar_driver_read_scan() — r_mm + theta_deg.
+ * @param scan         Raw scan from lidar_driver_read_scan() — r_mm + theta_cdeg.
  * @param pose         Robot pose at scan time (x,y in mm, theta in rad).
  * @param max_range_mm Skip beams beyond this distance (mm).
  * @param step_mm      Ray-march step size (mm); match to leaf-cell size for efficiency.

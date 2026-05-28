@@ -70,7 +70,7 @@ IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
             if (_now_us() - t_start > LIDAR_TO_MAP_WATCHDOG_US) break;
         }
 
-        float r = scan->points[i].r_mm;
+        float r = lidar_point_range_mm(&scan->points[i]);
         /* Self-hit: driver filters these, but be defensive */
         if (r > 0.0f && r < 100.0f) continue;
         /* No return (reflective/absorbing surface) — skip all map updates.
@@ -78,7 +78,7 @@ IRAM_ATTR void lidar_to_map(quadtree_map_t     *map,
          * that have not been mapped yet and corrupts cells behind them. */
         if (r == 0.0f) continue;
 
-        float theta_deg = scan->points[i].theta_deg;
+        float theta_deg = lidar_point_theta_deg(&scan->points[i]);
         if (!_valid(theta_deg)) continue;
 
         float rad     = -theta_deg * ((float)M_PI / 180.0f) + LIDAR_OFFSET_THETA_RAD;
@@ -162,11 +162,11 @@ void lidar_deskew_and_map(quadtree_map_t     *map,
             if (_now_us() - t_start > LIDAR_TO_MAP_WATCHDOG_US) break;
         }
 
-        float r = scan->points[i].r_mm;
+        float r = lidar_point_range_mm(&scan->points[i]);
         if (r > 0.0f && r < 100.0f) continue;
         if (r == 0.0f) continue;  /* no return — skip, same reason as lidar_to_map */
 
-        float theta_deg = scan->points[i].theta_deg;
+        float theta_deg = lidar_point_theta_deg(&scan->points[i]);
         if (!_valid(theta_deg)) continue;
 
         /* Interpolate robot pose at this beam's capture time */

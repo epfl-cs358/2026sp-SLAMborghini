@@ -9,6 +9,7 @@
 #ifndef HCSR04_DRIVER_H
 #define HCSR04_DRIVER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /**
@@ -26,5 +27,7 @@ void hcsr04_init(uint8_t trig_pin, uint8_t echo_pin);
  * @return Distance in millimetres, or 0.0f on timeout (no echo received).
  */
 float hcsr04_read_mm(void);
+
+bool hcsr04_read_u16_mm(uint16_t *out_mm);
 
 #endif /* HCSR04_DRIVER_H */

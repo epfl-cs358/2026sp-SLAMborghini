@@ -19,17 +19,17 @@ void polar_to_cart_convert(const lidar_scan_t *scan,
 
     uint16_t n = 0;
     for (uint16_t i = 0; i < scan->count; i++) {
-        float r = scan->points[i].r_mm;
+        float r = lidar_point_range_mm(&scan->points[i]);
         if (r <= 0.0f) continue;
 
         /* Polar → local Cartesian — LiDAR scans clockwise, trig expects CCW */
-        float rad = -scan->points[i].theta_deg * ((float)M_PI / 180.0f);
+        float rad = -lidar_point_theta_deg(&scan->points[i]) * ((float)M_PI / 180.0f);
         float lx  = r * cosf(rad);
         float ly  = r * sinf(rad);
 
         /* Local → global using robot pose */
-        out_pts[n].x         = pose->x + lx * cos_t - ly * sin_t;
-        out_pts[n].y         = pose->y + lx * sin_t + ly * cos_t;
+        out_pts[n].x         = (int16_t)lrintf(pose->x + lx * cos_t - ly * sin_t);
+        out_pts[n].y         = (int16_t)lrintf(pose->y + lx * sin_t + ly * cos_t);
         out_pts[n].intensity = scan->points[i].intensity;
         n++;
     }

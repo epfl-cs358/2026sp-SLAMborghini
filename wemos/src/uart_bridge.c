@@ -6,6 +6,7 @@
  *   Wemos → ESP32-S3 : MSG_ODOM (0x02)       — 10-byte odom_wire_t v2
  *                      MSG_PATH_DONE (0x04)   — path complete
  *                      MSG_CHUNK_NACK (0x07)  — out-of-order chunk
+ *                      MSG_FRONT_HAZARD (0x08)— ultrasonic emergency brake
  */
 
 #include "uart_bridge.h"
@@ -32,6 +33,7 @@
 #define MSG_PATH_DONE      0x04u
 #define MSG_PATH_CHUNK     0x06u
 #define MSG_CHUNK_NACK     0x07u
+#define MSG_FRONT_HAZARD   0x08u
 
 #define HEADER_LEN         4u
 #define MAX_PAYLOAD_LEN    255u
@@ -197,6 +199,12 @@ bool uart_bridge_send_path_done(void)
 {
     uint8_t done = 1u;
     return send_packet(MSG_PATH_DONE, &done, 1u);
+}
+
+bool uart_bridge_send_front_hazard(const front_hazard_t *hazard)
+{
+    if (!hazard) return false;
+    return send_packet(MSG_FRONT_HAZARD, hazard, sizeof(front_hazard_t));
 }
 
 bool uart_bridge_send_chunk_nack(uint16_t path_id, uint16_t expected_start)

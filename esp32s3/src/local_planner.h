@@ -7,7 +7,7 @@
  *   Hybrid A*  → global path (unchanged, external)
  *   Pure Pursuit (STUB) → default path tracking
  *   Reactive   → local obstacle avoidance
- *   ESCAPE     → reverse + rotate recovery
+ *   ESCAPE     → short measured reverse recovery after proven stall
  *   RECOVER    → reduced-speed mode under high SLAM uncertainty
  */
 
@@ -23,7 +23,7 @@
 typedef enum {
     LP_MODE_PURE_PURSUIT = 0, /**< Default: tracking global Hybrid A* path (stub) */
     LP_MODE_REACTIVE,         /**< Local obstacle cluster detected — candidate steering */
-    LP_MODE_ESCAPE,           /**< All reactive candidates blocked — reverse+rotate sequence */
+    LP_MODE_ESCAPE,           /**< Proven stall — short measured reverse recovery */
     LP_MODE_RECOVER,          /**< High SLAM uncertainty — reduced speed, wider heading filter */
     LP_MODE_STOPPED,          /**< Obstacle cluster ahead — stop and wait (dynamic obstacle) */
     LP_MODE_WAIT_CLEAR        /**< Post-stall: stopped, waiting for path to clear before replan */
@@ -42,7 +42,8 @@ void local_planner_init(float robot_radius_mm);
  * @param map           Current quadtree map (read-only).
  * @param raw_pose      Raw SLAM pose for this cycle.
  * @param global_path   Hybrid A* path to follow; may be NULL or empty.
- * @param override_flag If true, an emergency layer has control — skip this cycle.
+ * @param override_flag If true, an emergency layer has control; skip this cycle
+ *                      and reset stall detection for the hard-brake interval.
  * @param out_cmd       Output control frame; only valid when function returns true.
  * @return true  — out_cmd is valid, caller should transmit it.
  *         false — cycle skipped (override active); do NOT transmit.

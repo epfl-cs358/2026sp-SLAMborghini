@@ -70,6 +70,8 @@ bool pp_append_chunk(pure_pursuit_controller_t *pp, const path_chunk_t *chunk) {
         pp->path_id        = chunk->path_id;
         pp->pursuit_idx    = 0;
         pp->final_received = false;
+        pp->goal_x_mm      = 0.0f;
+        pp->goal_y_mm      = 0.0f;
     }
 
     uint16_t expected = ring_tail(pp);  /* ring_head + ring_count */
@@ -91,6 +93,8 @@ bool pp_append_chunk(pure_pursuit_controller_t *pp, const path_chunk_t *chunk) {
 
     if (chunk->final_chunk) {
         pp->final_received = true;
+        pp->goal_x_mm      = chunk->wp[chunk->count - 1u].x;
+        pp->goal_y_mm      = chunk->wp[chunk->count - 1u].y;
     }
 
     return true;
@@ -156,7 +160,7 @@ static waypoint_t find_lookahead_point(pure_pursuit_controller_t *pp,
 
     /* ── Step 2: lookahead circle intersection ───────────────────────────── */
     waypoint_t target = *ring_at(pp, pp->pursuit_idx);
-    target.v_target = pp->fixed_speed_mm_s;
+    target.v_target = (uint16_t)lrintf(pp->fixed_speed_mm_s);
 
     for (uint16_t gi = pp->pursuit_idx; gi < tail - 1u; gi++) {
         waypoint_t *s = ring_at(pp, gi);
@@ -181,8 +185,9 @@ static waypoint_t find_lookahead_point(pure_pursuit_controller_t *pp,
         if (t < 0.0f) continue;
 
         waypoint_t cand;
-        cand.x = s->x + t*dx; cand.y = s->y + t*dy;
-        cand.theta = 0.0f; cand.v_target = pp->fixed_speed_mm_s;
+        cand.x = (int16_t)lrintf(s->x + t * dx);
+        cand.y = (int16_t)lrintf(s->y + t * dy);
+        cand.theta = 0.0f; cand.v_target = (uint16_t)lrintf(pp->fixed_speed_mm_s);
 
         /* Reject targets that are far behind the robot. */
         if (to_robot_frame(pose, cand).y <= -300.0f) continue;
@@ -229,13 +234,16 @@ pp_motion_command_t pp_compute_command(pure_pursuit_controller_t *pp,
      * Also stop if the car has overshot (last wp is now behind the robot) —
      * prevents the car from driving straight forever past the goal. */
     if (pp->final_received && pp->ring_count <= 2) {
-        waypoint_t *last = ring_at(pp, tail - 1u);
-        float dsq = dist_sq_2d(pose->x, pose->y, last->x, last->y);
+        waypoint_t last_goal = *ring_at(pp, tail - 1u);
+        last_goal.x = (int16_t)lrintf(pp->goal_x_mm);
+        last_goal.y = (int16_t)lrintf(pp->goal_y_mm);
+        float dsq = dist_sq_2d(pose->x, pose->y, pp->goal_x_mm, pp->goal_y_mm);
         if (dsq < pp->goal_tolerance_mm * pp->goal_tolerance_mm) {
             return stop;
         }
-        waypoint_t last_r = to_robot_frame(pose, *last);
-        if (last_r.y < 0.0f) {
+        waypoint_t last_r = to_robot_frame(pose, last_goal);
+        float overshot_tol_mm = pp->goal_tolerance_mm * 2.0f;
+        if (last_r.y < 0.0f && dsq < overshot_tol_mm * overshot_tol_mm) {
             return stop;  /* overshot: last waypoint is behind the robot */
         }
     }

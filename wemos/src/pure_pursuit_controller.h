@@ -21,6 +21,8 @@ typedef struct {
     uint16_t    path_id;        /* path_id from the last accepted chunk          */
     bool        final_received; /* true after a chunk with final_chunk=true      */
     uint16_t    pursuit_idx;    /* global segment-start index (consumed progress)*/
+    float       goal_x_mm;
+    float       goal_y_mm;
 
     float wheelbase_mm;
     float lookahead_mm;

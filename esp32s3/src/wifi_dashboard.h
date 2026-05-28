@@ -20,6 +20,15 @@
 #include "quadtree_map.h"
 #include "lidar_to_map.h"
 
+typedef enum {
+    DASH_CTRL_ASTAR = 0,
+    DASH_CTRL_REACTIVE,
+    DASH_CTRL_STOPPED,
+    DASH_CTRL_STALL_REVERSE,
+    DASH_CTRL_SONAR_EMERGENCY,
+    DASH_CTRL_RECOVER
+} dash_control_layer_t;
+
 /**
  * Connect to Wi-Fi and start the HTTP + WebSocket server.
  * Blocks until connected or until a 10-second timeout.
@@ -53,6 +62,8 @@ void wifi_dashboard_broadcast_state(const pose_t *pose,
                                      float frontier_cx, float frontier_cy,
                                      bool has_frontier,
                                      uint16_t scan_idx);
+
+void wifi_dashboard_set_control_layer(dash_control_layer_t layer);
 
 /**
  * Returns true (and clears the flag) if the browser sent a {"cmd":"start"}

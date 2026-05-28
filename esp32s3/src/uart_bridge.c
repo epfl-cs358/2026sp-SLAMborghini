@@ -22,6 +22,7 @@
 #define MSG_PATH_DONE      0x04u
 #define MSG_PATH_CHUNK     0x06u  /* ESP32-S3 → Wemos: streaming chunk       */
 #define MSG_CHUNK_NACK     0x07u  /* Wemos → ESP32-S3: out-of-order signal   */
+#define MSG_FRONT_HAZARD   0x08u  /* Wemos → ESP32-S3: ultrasonic brake      */
 
 #define HEADER_LEN         4u
 #define MAX_PAYLOAD_LEN    255u
@@ -124,6 +125,8 @@ static bool     s_path_done       = false;
 static bool     s_nack_pending    = false;
 static uint16_t s_nack_path_id    = 0;
 static uint16_t s_nack_exp_start  = 0;
+static bool     s_front_hazard_pending = false;
+static front_hazard_t s_front_hazard;
 
 bool uart_bridge_recv_odom(odom_t *out)
 {
@@ -158,7 +161,8 @@ bool uart_bridge_recv_odom(odom_t *out)
 
         if (msg_type != MSG_ODOM &&
             msg_type != MSG_PATH_DONE &&
-            msg_type != MSG_CHUNK_NACK) {
+            msg_type != MSG_CHUNK_NACK &&
+            msg_type != MSG_FRONT_HAZARD) {
             uint8_t skip[MAX_PAYLOAD_LEN + 1u];
             size_t skip_len = (size_t)payload_len + 1u;
             if (skip_len > 0u)
@@ -203,6 +207,15 @@ bool uart_bridge_recv_odom(odom_t *out)
             continue;
         }
 
+        if (msg_type == MSG_FRONT_HAZARD) {
+            if (payload_len == sizeof(front_hazard_t)) {
+                memcpy(&s_front_hazard, payload, sizeof(front_hazard_t));
+                s_front_hazard_pending = true;
+            }
+            uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
+            continue;
+        }
+
         /* MSG_ODOM */
         if (payload_len != sizeof(odom_wire_t)) {
             uart_get_buffered_data_len(BRIDGE_UART_PORT, &available);
@@ -239,6 +252,16 @@ bool uart_bridge_recv_chunk_nack(uint16_t *out_path_id, uint16_t *out_expected_s
         if (out_path_id)       *out_path_id       = s_nack_path_id;
         if (out_expected_start) *out_expected_start = s_nack_exp_start;
         s_nack_pending = false;
+        return true;
+    }
+    return false;
+}
+
+bool uart_bridge_recv_front_hazard(front_hazard_t *out)
+{
+    if (s_front_hazard_pending) {
+        if (out) *out = s_front_hazard;
+        s_front_hazard_pending = false;
         return true;
     }
     return false;

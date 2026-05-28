@@ -44,7 +44,7 @@ planner_cell_t planning_grid_get(const planning_grid_t *grid, int x, int y)
         return CELL_OCCUPIED; /* out of bounds = blocked */
     }
 
-    return grid->cells[planning_grid_index(grid, x, y)];
+    return (planner_cell_t)grid->cells[planning_grid_index(grid, x, y)];
 }
 
 void planning_grid_set(planning_grid_t *grid, int x, int y, planner_cell_t value)
@@ -53,7 +53,7 @@ void planning_grid_set(planning_grid_t *grid, int x, int y, planner_cell_t value
         return;
     }
 
-    grid->cells[planning_grid_index(grid, x, y)] = value;
+    grid->cells[planning_grid_index(grid, x, y)] = (uint8_t)value;
 }
 
 bool planning_grid_init(planning_grid_t *grid, int width, int height, float cell_size_mm)
@@ -69,7 +69,7 @@ bool planning_grid_init(planning_grid_t *grid, int width, int height, float cell
     grid->width = width;
     grid->height = height;
     grid->cell_size_mm = cell_size_mm;
-    grid->cells = (planner_cell_t *)malloc((size_t)total_cells * sizeof(planner_cell_t));
+    grid->cells = (uint8_t *)malloc((size_t)total_cells);
 
     if (grid->cells == NULL) {
         grid->width = 0;
@@ -80,7 +80,7 @@ bool planning_grid_init(planning_grid_t *grid, int width, int height, float cell
 
     /* Initialize conservatively as unknown */
     for (int i = 0; i < total_cells; ++i) {
-        grid->cells[i] = CELL_UNKNOWN;
+        grid->cells[i] = (uint8_t)CELL_UNKNOWN;
     }
 
     return true;
@@ -149,7 +149,7 @@ bool planning_grid_build_from_quadtree(
 
 void planning_grid_inflate(planning_grid_t *grid, int radius_cells)
 {
-    planner_cell_t *original;
+    uint8_t *original;
     int total_cells;
 
     if (grid == NULL || grid->cells == NULL || radius_cells <= 0) {
@@ -158,16 +158,17 @@ void planning_grid_inflate(planning_grid_t *grid, int radius_cells)
 
     total_cells = grid->width * grid->height;
 
-    original = (planner_cell_t *)malloc((size_t)total_cells * sizeof(planner_cell_t));
+    original = (uint8_t *)malloc((size_t)total_cells);
     if (original == NULL) {
         return;
     }
 
-    memcpy(original, grid->cells, (size_t)total_cells * sizeof(planner_cell_t));
+    memcpy(original, grid->cells, (size_t)total_cells);
 
     for (int y = 0; y < grid->height; ++y) {
         for (int x = 0; x < grid->width; ++x) {
-            planner_cell_t current = original[planning_grid_index(grid, x, y)];
+            planner_cell_t current =
+                (planner_cell_t)original[planning_grid_index(grid, x, y)];
 
             /* Inflate around both occupied and unknown cells for safety */
             if (current == CELL_OCCUPIED || current == CELL_UNKNOWN) {
@@ -185,11 +186,12 @@ void planning_grid_inflate(planning_grid_t *grid, int radius_cells)
                             continue;
                         }
 
-                        planner_cell_t neighbor = grid->cells[planning_grid_index(grid, nx, ny)];
+                        planner_cell_t neighbor =
+                            (planner_cell_t)grid->cells[planning_grid_index(grid, nx, ny)];
 
                         /* Do not overwrite hard occupied or unknown cells */
                         if (neighbor == CELL_FREE) {
-                            grid->cells[planning_grid_index(grid, nx, ny)] = CELL_INFLATED;
+                            grid->cells[planning_grid_index(grid, nx, ny)] = (uint8_t)CELL_INFLATED;
                         }
                     }
                 }

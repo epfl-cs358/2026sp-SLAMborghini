@@ -31,7 +31,7 @@
  * When the LiDAR gets no echo (open space, absorptive surface, beyond ~8 m)
  * it outputs a packet with quality = 0 and dist = 0.  Previously these were
  * silently dropped, leaving the map UNKNOWN in open directions.
- * Now they are stored with r_mm = 0.0f so lidar_to_map can mark free space
+ * Now they are stored with r_mm = 0 so lidar_to_map can mark free space
  * along the ray up to max_range_mm — the ray is clear, just very long.
  *
  * ── Seed-packet carry ───────────────────────────────────────────────────────
@@ -63,7 +63,7 @@ static const uint8_t CMD_STOP[] = { 0xA5, 0x25 };
 #define PKT_LEN       5
 
 /* ── Self-hit filter (ignore returns closer than this) ───────────────────── */
-#define MIN_RANGE_MM 100.0f
+#define MIN_RANGE_MM 100u
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Bulk read buffer — persistent across calls.
@@ -177,7 +177,7 @@ void lidar_driver_init(void)
  * immediately without a re-sync search.
  *
  * Point classification:
- *   quality == 0                → no-return; stored with r_mm = 0.0f.
+ *   quality == 0                → no-return; stored with r_mm = 0.
  *                                 lidar_to_map treats r=0 as "mark free to
  *                                 max_range_mm" (no obstacle endpoint).
  *   0 < dist < MIN_RANGE_MM     → self-hit; dropped.
@@ -255,9 +255,12 @@ bool lidar_driver_read_scan(lidar_scan_t *out)
 
         wlen = 0;  /* consume the packet */
 
-        float   angle = (float)((uint16_t)((win[2] << 8) | win[1]) >> 1) / 64.0f;
-        float   dist  = (float)((uint16_t)((win[4] << 8) | win[3])) / 4.0f;
-        uint8_t q     = (win[0] >> 2) & 0x3F;
+        uint16_t angle_q6   = (uint16_t)(((uint16_t)(win[2] << 8) | win[1]) >> 1);
+        uint16_t dist_q2    = (uint16_t)((win[4] << 8) | win[3]);
+        uint16_t angle_cdeg = (uint16_t)(((uint32_t)angle_q6 * 100u + 32u) / 64u);
+        uint16_t dist_mm    = (uint16_t)(((uint32_t)dist_q2 + 2u) / 4u);
+        uint8_t  q          = (win[0] >> 2) & 0x3F;
+        if (angle_cdeg >= 36000u) angle_cdeg = (uint16_t)(angle_cdeg - 36000u);
 
         if (s) {
             collecting    = true;
@@ -269,16 +272,16 @@ bool lidar_driver_read_scan(lidar_scan_t *out)
         if (q == 0) {
             /* No-return beam — r=0 signals "free along ray" to lidar_to_map */
             out->points[out->count++] = (lidar_scan_point_t){
-                .r_mm         = 0.0f,
-                .theta_deg    = angle,
+                .r_mm         = 0u,
+                .theta_cdeg   = angle_cdeg,
                 .intensity    = 0,
                 .timestamp_us = 0,
             };
-        } else if (dist >= MIN_RANGE_MM) {
+        } else if (dist_mm >= MIN_RANGE_MM) {
             /* Valid return — upper range limit applied by lidar_to_map */
             out->points[out->count++] = (lidar_scan_point_t){
-                .r_mm         = dist,
-                .theta_deg    = angle,
+                .r_mm         = dist_mm,
+                .theta_cdeg   = angle_cdeg,
                 .intensity    = q,
                 .timestamp_us = 0,
             };
@@ -295,12 +298,12 @@ bool lidar_driver_read_scan(lidar_scan_t *out)
     /* Back-compute per-point timestamps from angular position within rotation.
      * Includes no-return beams (intensity=0) — their angles are valid. */
     if (out->count > 0 && out->rotation_period_us > 0) {
-        float theta_start = out->points[0].theta_deg;
+        uint16_t theta_start = out->points[0].theta_cdeg;
         for (uint16_t i = 0; i < out->count; i++) {
-            float off = out->points[i].theta_deg - theta_start;
-            if (off < 0.0f) off += 360.0f;
+            int32_t off = (int32_t)out->points[i].theta_cdeg - (int32_t)theta_start;
+            if (off < 0) off += 36000;
             out->points[i].timestamp_us = out->scan_start_us
-                + (uint32_t)(off / 360.0f * (float)out->rotation_period_us);
+                + (uint32_t)(((uint64_t)(uint32_t)off * out->rotation_period_us) / 36000u);
         }
     }
 

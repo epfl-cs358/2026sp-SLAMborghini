@@ -196,6 +196,7 @@ input[type=checkbox] { accent-color: var(--accent); cursor: pointer; }
       <div class="row">X <span id="tX">—</span></div>
       <div class="row">Y <span id="tY">—</span></div>
       <div class="row">θ <span id="tTheta">—</span></div>
+      <div class="row">Control <span id="tCtrl">—</span></div>
       <div class="row">Frontier <span id="tHF">—</span></div>
       <div class="row">Target X <span class="hi" id="tFX">—</span></div>
       <div class="row">Target Y <span class="hi" id="tFY">—</span></div>
@@ -253,6 +254,14 @@ const MSG_MAP_DELTA = 0x04;
 const MSG_QUADTREE  = 0x05;
 const MSG_PATH      = 0x06;
 const MSG_RAW_POSE  = 0x07;   // raw odometry pose (pre-scan-match) → orange ghost
+const CTRL_NAMES = [
+  'A* path',
+  'Reactive',
+  'Stopped',
+  'Stall reverse',
+  'Sonar emergency',
+  'Recover'
+];
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Rendering constants
@@ -414,6 +423,7 @@ function handlePose(buf) {
   const fx    = v.getFloat32(13, true);
   const fy    = v.getFloat32(17, true);
   const hf    = v.getUint8(21) !== 0;
+  const ctrl  = (v.byteLength > 24) ? v.getUint8(24) : 0;
   const ts    = performance.now();
 
   lastPose = { x, y, theta, ts };
@@ -433,6 +443,7 @@ function handlePose(buf) {
   document.getElementById('tX').textContent     = x.toFixed(0) + ' mm';
   document.getElementById('tY').textContent     = y.toFixed(0) + ' mm';
   document.getElementById('tTheta').textContent = (theta * 180 / Math.PI).toFixed(1) + '°';
+  document.getElementById('tCtrl').textContent  = CTRL_NAMES[ctrl] || 'Unknown';
   if (hf) {
     document.getElementById('tHF').textContent  = 'YES';
     document.getElementById('tHF').style.color  = 'var(--green)';
@@ -485,7 +496,7 @@ function handleQuadtree(buf) {
 
 /* ════════════════════════════════════════════════════════════════════════════
  * handlePath — parse type-0x06 frame into astarPath[]
- * Frame: [type:u8][count:u8][{x:f32,y:f32}×count]  (world coords, mm)
+ * Frame: [type:u8][count:u8][{x_mm:i16,y_mm:i16}xcount]  (world coords, mm)
  * count=0 clears the overlay (A* failed or no frontier this cycle).
  * ════════════════════════════════════════════════════════════════════════════ */
 function handlePath(buf) {
@@ -494,8 +505,8 @@ function handlePath(buf) {
   const pts   = [];
   for (let i = 0; i < count; i++) {
     pts.push({
-      x: v.getFloat32(2 + i * 8,     true),
-      y: v.getFloat32(2 + i * 8 + 4, true),
+      x: v.getInt16(2 + i * 4,     true),
+      y: v.getInt16(2 + i * 4 + 2, true),
     });
   }
   astarPath = pts;

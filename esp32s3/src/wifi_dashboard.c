@@ -24,11 +24,12 @@
  *   • Scan: all 460 points forwarded (no downsample).
  *   • Static RAM: ~88 KB → ~12 KB.
  *
- * Binary message protocol (browser-compatible, unchanged):
+ * Binary message protocol:
  *   0x01  Map full  [type(1) gw(2) gh(2) cellMm(4) xMin(4) yMin(4) cells(GW*GH)]
  *   0x02  Scan      [type(1) count(2) {angle_cdeg(2) range_mm(2)}×count]
- *   0x03  Pose      [type(1) x(4) y(4) theta(4) fx(4) fy(4) has_frontier(1) scan_idx(2)]
+ *   0x03  Pose      [type(1) x(4) y(4) theta(4) fx(4) fy(4) has_frontier(1) scan_idx(2) control(1)]
  *   0x04  Map delta [type(1) count(2) {cell_idx(2) val(1)}×count]
+ *   0x06  A* path   [type(1) count(1) {x_mm(2) y_mm(2)}×count]
  *   0xFE  Keepalive [type(1)] — browser ignores unknown types silently.
  */
 
@@ -63,7 +64,7 @@ static const char *TAG = "wifi_dash";
 #define MSG_SCAN      0x02u
 #define MSG_POSE      0x03u
 #define MSG_MAP_DELTA 0x04u
-#define MSG_PATH      0x06u   /* A* planned path: [type(1)][count(1)][{x(4)y(4)}×count] */
+#define MSG_PATH      0x06u   /* A* planned path: [type(1)][count(1)][{x_mm(2)y_mm(2)}xcount] */
 #define MSG_RAW_POSE  0x07u   /* Raw odometry pose (pre-scan-match): [type(1)][x(4)][y(4)][theta(4)] */
 #define MSG_KEEPALIVE 0xFEu   /* 1-byte heartbeat; browser ignores unknown types */
 
@@ -107,10 +108,10 @@ static const char *TAG = "wifi_dash";
 #define DASH_SAMPLE_FRAC  0.30f
 
 static uint8_t s_map_buf[MAP_BUF_SIZE];                            /* full map or delta  */
-static uint8_t s_pose_buf[24u];                                    /* pose frame         */
+static uint8_t s_pose_buf[25u];                                    /* pose frame         */
 static uint8_t s_raw_pose_buf[13u];                                /* raw odometry frame */
 static uint8_t s_scan_buf[3u + SCAN_MAX_PTS * 4u];                /* scan frame         */
-static uint8_t s_path_buf[2u + MAX_SHARED_PATH_POINTS * 8u];      /* path frame         */
+static uint8_t s_path_buf[2u + MAX_SHARED_PATH_POINTS * 4u];      /* path frame         */
 static uint8_t s_log_bufs[5][80u];                                 /* 5-slot log ring    */
 static uint8_t s_log_slot = 0u;
 
@@ -148,19 +149,21 @@ typedef struct {
             float    fx, fy;
             bool     has_frontier;
             uint16_t scan_idx;
+            uint8_t  control_layer;
         } pose;
         char log[DASH_LOG_MAX];
         struct {
             uint8_t count;
-            uint8_t _pad[3];
-            float   pts_x[MAX_SHARED_PATH_POINTS];
-            float   pts_y[MAX_SHARED_PATH_POINTS];
+            uint8_t _pad;
+            int16_t pts_x[MAX_SHARED_PATH_POINTS];
+            int16_t pts_y[MAX_SHARED_PATH_POINTS];
         } path;
         struct { float x, y, theta; } raw_pose;   /* DASH_RAW_POSE_MSG */
     };
 } dash_msg_t;
 
 static QueueHandle_t s_dash_queue = NULL;
+static volatile uint8_t s_control_layer = (uint8_t)DASH_CTRL_ASTAR;
 
 /* ── Wi-Fi ──────────────────────────────────────────────────────────────── */
 #define WIFI_CONNECTED_BIT BIT0
@@ -469,7 +472,8 @@ static void _do_pose_send(const dash_msg_t *msg)
     s_pose_buf[21] = msg->pose.has_frontier ? 1u : 0u;
     s_pose_buf[22] = (uint8_t)(msg->pose.scan_idx & 0xFFu);
     s_pose_buf[23] = (uint8_t)(msg->pose.scan_idx >> 8u);
-    _ws_send_raw(s_pose_buf, 24u, HTTPD_WS_TYPE_BINARY);
+    s_pose_buf[24] = msg->pose.control_layer;
+    _ws_send_raw(s_pose_buf, 25u, HTTPD_WS_TYPE_BINARY);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -554,10 +558,10 @@ static void _do_path_send(const dash_msg_t *msg)
     s_path_buf[0] = MSG_PATH;
     s_path_buf[1] = n;
     for (uint8_t i = 0; i < n; i++) {
-        memcpy(&s_path_buf[2u + (size_t)i * 8u],      &msg->path.pts_x[i], 4u);
-        memcpy(&s_path_buf[2u + (size_t)i * 8u + 4u], &msg->path.pts_y[i], 4u);
+        memcpy(&s_path_buf[2u + (size_t)i * 4u],      &msg->path.pts_x[i], 2u);
+        memcpy(&s_path_buf[2u + (size_t)i * 4u + 2u], &msg->path.pts_y[i], 2u);
     }
-    _ws_send_raw(s_path_buf, 2u + (size_t)n * 8u, HTTPD_WS_TYPE_BINARY);
+    _ws_send_raw(s_path_buf, 2u + (size_t)n * 4u, HTTPD_WS_TYPE_BINARY);
 }
 
 
@@ -869,7 +873,13 @@ void wifi_dashboard_broadcast_state(const pose_t *pose,
     msg.pose.fy           = frontier_cy;
     msg.pose.has_frontier = has_frontier;
     msg.pose.scan_idx     = scan_idx;
+    msg.pose.control_layer = s_control_layer;
     xQueueSend(s_dash_queue, &msg, 0);
+}
+
+void wifi_dashboard_set_control_layer(dash_control_layer_t layer)
+{
+    s_control_layer = (uint8_t)layer;
 }
 
 
@@ -887,10 +897,10 @@ void wifi_dashboard_broadcast_scan(const lidar_scan_t *scan, const pose_t *pose)
 
     xSemaphoreTake(s_scan_mtx, portMAX_DELAY);
     for (uint16_t i = 0; i < scan->count && out < SCAN_MAX_PTS; i += step) {
-        float r = scan->points[i].r_mm;
-        if (r < 100.0f || r > 6000.0f) continue;
-        s_scan_pts[out].acd = (uint16_t)(scan->points[i].theta_deg * 100.0f);
-        s_scan_pts[out].rmm = (uint16_t)r;
+        uint16_t r = scan->points[i].r_mm;
+        if (r < 100u || r > 6000u) continue;
+        s_scan_pts[out].acd = scan->points[i].theta_cdeg;
+        s_scan_pts[out].rmm = r;
         out++;
     }
     s_scan_count = out;

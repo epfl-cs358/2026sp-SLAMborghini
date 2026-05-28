@@ -32,7 +32,7 @@
 #define LP_WHEELBASE_MM             260.0f
 #define LP_MAX_STEER_RAD            1.134f   /* 65° — physical steering limit */
 #define LP_BASE_SPEED_MM_S          150.0f
-#define LP_REVERSE_SPEED_MM_S        80.0f
+#define LP_REVERSE_SPEED_MM_S        60.0f
 
 /* Pose filter */
 #define LP_THETA_ALPHA               0.3f    /* weight on new raw sample (EMA) */
@@ -47,13 +47,12 @@
 #define LP_FWD_TOTAL                 15      /* 5 × 3 forward cells */
 #define LP_FOOT_CELLS                 4
 #define LP_FWD_NEAR_MM              150.0f
-#define LP_FWD_MID_MM               200.0f
-#define LP_FWD_FAR_MM               300.0f  /* 30 cm — max detection distance */
+#define LP_FWD_MID_MM               300.0f
+#define LP_FWD_FAR_MM               500.0f
 #define LP_CLUSTER_THRESH             3      /* 3 occupied cells in the forward arc
-                                             * triggers STOPPED; a flat wall at 300 mm
-                                             * hits 3+ beams (0°, ±22.5°) → triggers.
-                                             * Corridor side-walls at ±45° give ≤2
-                                             * occupied cells → no false trigger. */
+                                             * trigger reactive steering.  Corridor
+                                             * side walls at +/-45 deg usually give
+                                             * <=2 cells, avoiding false triggers. */
 
 /* Reactive */
 #define LP_CANDS                      5
@@ -65,9 +64,9 @@
 #define LP_ROLLOUT_NEAR_STEP_MM      20.0f   /* 2 cm */
 #define LP_ROLLOUT_FAR_STEP_MM       80.0f   /* 8 cm */
 #define LP_ROLLOUT_MAX_STEPS         20
-#define LP_OCCUPIED_HARD_THRESH       0      /* any positive log-odds → hard collision */
-#define LP_DIFFICULT_CELL_COST        0.45f  /* (unused with threshold=0, kept for reference) */
-#define LP_UNKNOWN_CELL_COST          0.35f  /* log-odds == 0: penalise unknown near walls */
+#define LP_OCCUPIED_HARD_THRESH      10      /* require stable evidence before hard collision */
+#define LP_DIFFICULT_CELL_COST        0.45f  /* log-odds in (0, 10] */
+#define LP_UNKNOWN_CELL_COST          0.15f  /* log-odds == 0 */
 #define LP_MAX_DIFFICULT_PENALTY      1.50f  /* cumulative rollout penalty → reject */
 #define LP_PATH_CTE_NORM_MM         500.0f
 #define LP_HEADING_ERR_NORM_RAD       1.571f /* π/2 */
@@ -81,27 +80,19 @@
 
 /* Stall detection */
 #define LP_STALL_DISP_MM              5.0f  /* <5 mm per 100 ms cycle = stalled */
-#define LP_STALL_CYCLES               8     /* 8 consecutive stall cycles (~800 ms) → force ESCAPE */
+#define LP_STALL_CYCLES              10     /* 10 consecutive stall cycles (~1 s) -> short reverse */
 
 /* Blockage & ESCAPE */
 #define LP_BLOCKED_THRESH            10
-#define LP_ESCAPE_TIMEOUT_CYCLES     30      /* 3 s @ 100 ms */
-#define LP_ESCAPE_ROT_STEP_RAD        0.262f /* 15° per cycle */
-#define LP_ESCAPE_FULL_ROT_RAD        6.283f /* 360° — full rotation = failure */
 #define LP_ESCAPE_REVERSE_MM         60.0f   /* target point behind robot for reverse command */
-#define LP_ESCAPE_FP_BACKUP_MM      180.0f   /* actual odometry distance for footprint escape */
-#define LP_ESCAPE_STALL_BACKUP_MM   320.0f   /* actual odometry distance for stall escape */
-#define LP_ESCAPE_FP_REV_TIMEOUT     25      /* 2.5 s max reverse attempt */
-#define LP_ESCAPE_STALL_REV_TIMEOUT  55      /* 5.5 s max reverse attempt */
-#define LP_ESCAPE_MIN_ROT_RAD         1.571f /* must rotate 90° before testing reactive */
+#define LP_ESCAPE_STALL_BACKUP_MM   150.0f   /* short odometry-measured stall backup */
+#define LP_ESCAPE_STALL_REV_TIMEOUT  15      /* 1.5 s max stall reverse attempt */
 
 /* STOPPED: stop and wait when obstacle cluster detected (dynamic obstacle assumed) */
 #define LP_WAIT_CLEAR_MAX_CYCLES     30      /* 3 s in STOPPED before treating as static → replan */
 #define LP_WAIT_CLEAR_CLEAR_STREAK    2      /* consecutive clear cycles to resume from STOPPED */
 /* WAIT_CLEAR: stop after stall escape, wait for path, then replan */
 #define LP_WAIT_CLEAR_TIMEOUT_CYCLES 50      /* 5 s max wait before forced replan */
-/* Stall escape: measured reverse then 50° reorient */
-#define LP_ESCAPE_STEER_MAX_RAD       0.873f /* 50° cap on stall-escape rotation */
 
 /* Speed scaling */
 #define LP_SPEED_SCALE_UNKNOWN        0.60f
@@ -189,10 +180,11 @@ typedef struct {
     /* STOPPED / WAIT_CLEAR */
     uint8_t   wait_clear_cycles;    /* cycles spent in STOPPED or WAIT_CLEAR */
     uint8_t   stopped_clear_streak; /* consecutive clear cycles in STOPPED (hysteresis) */
-    bool      escape_is_stall;      /* true = stall escape (1 m back + 50°); false = FP escape */
+    bool      escape_is_stall;      /* true only for the short stall reverse recovery */
 
     /* Stall-loop obstacle injection */
     uint8_t   stall_escape_count;        /* incremented each time a stall triggers ESCAPE */
+    bool      stall_reverse_lockout;     /* blocks repeat reverse until normal driving resumes */
     bool      inject_obstacle_requested;
     float     inject_x, inject_y;       /* world coords for virtual obstacle */
 } lp_state_t;
@@ -598,7 +590,7 @@ static bool lp_reactive(const quadtree_map_t *map,
 
 
 /* ════════════════════════════════════════════════════════════════════════════
- * Step 6 — ESCAPE mode (reverse then rotate)
+ * Step 6 — ESCAPE mode (short stall reverse only)
  * Returns true while recovery is in progress, false on unrecoverable failure.
  * ════════════════════════════════════════════════════════════════════════════ */
 
@@ -608,24 +600,9 @@ static bool lp_escape(const quadtree_map_t *map,
                       const path_t *path,
                       control_frame_t *out_cmd)
 {
-    uint32_t reverse_timeout = s.escape_is_stall
-                             ? (uint32_t)LP_ESCAPE_STALL_REV_TIMEOUT
-                             : (uint32_t)LP_ESCAPE_FP_REV_TIMEOUT;
-    uint32_t timeout = reverse_timeout + LP_ESCAPE_TIMEOUT_CYCLES;
-    if (s.cycle_count - s.escape_start_cyc >= timeout) {
-        if (!s.escape_is_stall) s.replan_requested = true;
-        return false; /* caller decides next mode */
-    }
+    (void)path;
 
-    /* Full rotation exhausted — only applies to FP escape (stall caps at 50°) */
-    if (!s.escape_is_stall && s.escape_rot_acc >= LP_ESCAPE_FULL_ROT_RAD) {
-        s.replan_requested = true;
-        return false;
-    }
-
-    /* Phase 0: reverse until odometry confirms real backward travel.
-     * Counting command cycles is unreliable when the car slips or is stuck. */
-    if (s.escape_phase == 0) {
+    if (s.escape_is_stall) {
         float dx = rx - s.escape_start_x;
         float dy = ry - s.escape_start_y;
         float forward_x = cosf(s.escape_heading);
@@ -633,83 +610,36 @@ static bool lp_escape(const quadtree_map_t *map,
         float backed_up_mm = -(dx * forward_x + dy * forward_y);
         if (backed_up_mm < 0.0f) backed_up_mm = 0.0f;
 
-        float backup_target = s.escape_is_stall ? LP_ESCAPE_STALL_BACKUP_MM
-                                                : LP_ESCAPE_FP_BACKUP_MM;
-        if (backed_up_mm >= backup_target) {
-            printf("[LP] escape reverse done: backed %.0f/%.0f mm\n",
-                   (double)backed_up_mm, (double)backup_target);
-            s.escape_phase = 1;
-        } else if (s.escape_rev_cycles >= reverse_timeout) {
-            printf("[LP] escape reverse timeout: backed %.0f/%.0f mm\n",
-                   (double)backed_up_mm, (double)backup_target);
-            s.escape_phase = 1;
+        if (backed_up_mm >= LP_ESCAPE_STALL_BACKUP_MM ||
+                s.escape_rev_cycles >= LP_ESCAPE_STALL_REV_TIMEOUT) {
+            s.replan_requested = true;
+            printf("[LP] stall reverse done: backed %.0f/%.0f mm cycles=%u -> WAIT_CLEAR + replan\n",
+                   (double)backed_up_mm, (double)LP_ESCAPE_STALL_BACKUP_MM,
+                   (unsigned)s.escape_rev_cycles);
+            return false;
         }
-    }
 
-    if (s.escape_phase == 0) {
-        float rear_a = rtheta + LP_PI; /* cosf/sinf are periodic, no wrap needed */
+        float rear_a = rtheta + LP_PI;
         float rear_r = inflate_r * 0.65f;
         bool rear_blocked = lp_occupied(map, rx + rear_r * cosf(rear_a),
                                              ry + rear_r * sinf(rear_a));
-        if (!rear_blocked) {
-            out_cmd->tx        = LP_ESCAPE_REVERSE_MM * cosf(rear_a);
-            out_cmd->ty        = LP_ESCAPE_REVERSE_MM * sinf(rear_a);
-            out_cmd->t_heading = rear_a;
-            out_cmd->t_speed   = LP_REVERSE_SPEED_MM_S;
-            s.escape_rev_cycles++;
-            return true;
+        if (rear_blocked) {
+            s.replan_requested = true;
+            printf("[LP] stall reverse skipped: rear blocked -> WAIT_CLEAR + replan\n");
+            return false;
         }
-        /* rear wall detected — skip reversal, go straight to rotation */
-        s.escape_phase = 1;
-        /* fall through to Phase 1 */
+
+        out_cmd->tx        = LP_ESCAPE_REVERSE_MM * cosf(rear_a);
+        out_cmd->ty        = LP_ESCAPE_REVERSE_MM * sinf(rear_a);
+        out_cmd->t_heading = rear_a;
+        out_cmd->t_speed   = LP_REVERSE_SPEED_MM_S;
+        s.escape_rev_cycles++;
+        return true;
     }
 
-    /* Phase 1: arc forward toward the escape target heading, 15°/cycle.
-     * Stall escape: cap at 50° then stop (go to WAIT_CLEAR).
-     * FP escape:    keep arcing up to 360° until a clear direction is found. */
-    s.escape_rot_acc += LP_ESCAPE_ROT_STEP_RAD;
-    float test_heading = lp_norm(s.escape_heading + s.escape_rot_acc);
-
-    float steer_arc = lp_norm(test_heading - rtheta);
-    if (steer_arc >  LP_MAX_STEER_RAD) steer_arc =  LP_MAX_STEER_RAD;
-    if (steer_arc < -LP_MAX_STEER_RAD) steer_arc = -LP_MAX_STEER_RAD;
-    float arc_hdg      = lp_norm(rtheta + steer_arc);
-    out_cmd->tx        = LP_REACTIVE_FWD_MM * cosf(arc_hdg);
-    out_cmd->ty        = LP_REACTIVE_FWD_MM * sinf(arc_hdg);
-    out_cmd->t_heading = arc_hdg;
-    out_cmd->t_speed   = LP_BASE_SPEED_MM_S * 0.5f;
-
-    /* Stall escape: stop after rotating 50° toward safe area → WAIT_CLEAR */
-    if (s.escape_is_stall && s.escape_rot_acc >= LP_ESCAPE_STEER_MAX_RAD) {
-        printf("[LP] stall escape: 50° reorient done — entering WAIT_CLEAR\n");
-        return false; /* caller sets mode = WAIT_CLEAR */
-    }
-
-    /* Test whether the test direction is clear yet */
-    lp_window_t test_w;
-    lp_query_window(map, rx, ry, test_heading, inflate_r, &test_w);
-
-    if (!test_w.footprint_occupied && test_w.occ_count < LP_CLUSTER_THRESH &&
-            s.escape_rot_acc >= LP_ESCAPE_MIN_ROT_RAD) {
-        if (s.escape_is_stall) {
-            /* Stall: found safe direction before 50° — stop and wait for replan */
-            printf("[LP] stall escape: clear direction found — entering WAIT_CLEAR\n");
-            return false; /* caller sets mode = WAIT_CLEAR */
-        }
-        /* FP escape: exit with a reactive command from current heading */
-        lp_window_t cur_w;
-        lp_query_window(map, rx, ry, rtheta, inflate_r, &cur_w);
-        control_frame_t test_cmd;
-        if (!cur_w.footprint_occupied &&
-            lp_reactive(map, rx, ry, rtheta, inflate_r, &cur_w, path, &test_cmd)) {
-            *out_cmd       = test_cmd;
-            s.mode         = LP_MODE_PURE_PURSUIT;
-            s.blend_cycles = 3;
-            return true;
-        }
-    }
-
-    return true; /* keep arcing */
+    s.replan_requested = true;
+    printf("[LP] ESCAPE ignored: only stall reverse is allowed -> STOPPED + replan\n");
+    return false;
 }
 
 
@@ -883,6 +813,14 @@ void local_planner_clear_obstacle_inject(void)
     s.inject_obstacle_requested = false;
 }
 
+static void lp_make_stop_cmd(float theta_f, control_frame_t *out_cmd)
+{
+    out_cmd->tx        = 0.0f;
+    out_cmd->ty        = 0.0f;
+    out_cmd->t_heading = theta_f;
+    out_cmd->t_speed   = 0.0f;
+}
+
 
 bool local_planner_update(const quadtree_map_t *map,
                           const pose_t         *raw_pose,
@@ -892,15 +830,24 @@ bool local_planner_update(const quadtree_map_t *map,
 {
     if (!map || !raw_pose || !out_cmd) return false;
 
-    /* Step 2: Override — emergency layer has control, skip entirely */
-    if (override_flag) return false;
+    /* Step 2: Emergency layer has control. Do not let a hard brake look like a
+     * motion stall, otherwise the planner can create a fake reverse recovery. */
+    if (override_flag) {
+        s.mode           = LP_MODE_STOPPED;
+        s.stall_cycles   = 0;
+        s.prev_cmd_speed = 0.0f;
+        s.prev_x         = raw_pose->x;
+        s.prev_y         = raw_pose->y;
+        s.escape_is_stall = false;
+        s.wait_clear_cycles = 0;
+        s.stopped_clear_streak = 0;
+        return false;
+    }
 
-    /* Stall detection — triggers ESCAPE when a path is active but the car has
-     * not moved for LP_STALL_CYCLES consecutive cycles.  Catches two failure
-     * modes: (1) LP stays in PURE_PURSUIT while physically jammed against a
-     * wall whose close-range beams were filtered from the map; (2) lp_reactive
-     * keeps returning a "valid" steering direction whose command the stuck car
-     * cannot execute, preventing blocked_cycles from ever reaching LP_BLOCKED_THRESH. */
+    bool stall_recovery_requested = false;
+
+    /* Stall detection: if the path is active and the car is commanded forward
+     * but odometry shows no movement, prepare one short measured reverse. */
     {
         float dx   = raw_pose->x - s.prev_x;
         float dy   = raw_pose->y - s.prev_y;
@@ -917,31 +864,22 @@ bool local_planner_update(const quadtree_map_t *map,
         }
 
         if (s.stall_cycles >= LP_STALL_CYCLES) {
-            s.mode              = LP_MODE_ESCAPE;
-            s.escape_is_stall   = true;
             s.stall_escape_count++;
-            s.committed_side    = 0;
-            s.pp_stable_count   = 0;
-            s.escape_phase      = 0;
-            s.escape_rev_cycles = 0;
-            s.escape_start_x    = raw_pose->x;
-            s.escape_start_y    = raw_pose->y;
-            s.escape_heading    = raw_pose->theta;
-            s.escape_rot_acc    = 0.0f;
-            s.escape_start_cyc  = s.cycle_count;
-            s.stall_cycles      = 0;
-            /* On the 2nd consecutive stall the obstacle is below LiDAR height —
-             * inject a virtual obstacle so A* routes around it next replan. */
-            if (s.stall_escape_count >= 2) {
+            if (s.stall_reverse_lockout) {
+                s.mode                 = LP_MODE_STOPPED;
+                s.wait_clear_cycles    = 0;
+                s.stopped_clear_streak = 0;
+                s.replan_requested     = true;
                 s.inject_x = raw_pose->x + s.robot_radius * cosf(raw_pose->theta);
                 s.inject_y = raw_pose->y + s.robot_radius * sinf(raw_pose->theta);
                 s.inject_obstacle_requested = true;
-                printf("[LP] stall #%u — injecting obstacle at (%.0f,%.0f)\n",
-                       (unsigned)s.stall_escape_count,
-                       (double)s.inject_x, (double)s.inject_y);
+                printf("[LP] repeated stall #%u -> STOPPED + replan + inject (reverse locked out)\n",
+                       (unsigned)s.stall_escape_count);
+            } else {
+                stall_recovery_requested = true;
+                s.stall_reverse_lockout = true;
             }
-            printf("[LP] stall detected (%u cycles) — ESCAPE: %.0f mm reverse + 50° reorient\n",
-                   (unsigned)LP_STALL_CYCLES, (double)LP_ESCAPE_STALL_BACKUP_MM);
+            s.stall_cycles = 0;
         }
     }
 
@@ -963,45 +901,46 @@ bool local_planner_update(const quadtree_map_t *map,
     bool has_cluster = (w.occ_count >= LP_CLUSTER_THRESH);
     bool cmd_valid   = false;
 
-    /* A. Footprint occupied → ESCAPE (wall is inside car body, must back up).
-     * Require 2 consecutive fp_occ=1 cycles (hysteresis) to avoid triggering
-     * ESCAPE on single-cell map noise from pose drift.
-     * Do NOT use STOPPED here — it has no exit and the car freezes forever. */
+    if (stall_recovery_requested) {
+        s.inject_x = raw_pose->x + s.robot_radius * cosf(theta_f);
+        s.inject_y = raw_pose->y + s.robot_radius * sinf(theta_f);
+        s.inject_obstacle_requested = true;
+        s.committed_side       = 0;
+        s.pp_stable_count      = 0;
+        s.mode                 = LP_MODE_ESCAPE;
+        s.escape_is_stall      = true;
+        s.escape_phase         = 0;
+        s.escape_rev_cycles    = 0;
+        s.escape_start_x       = raw_pose->x;
+        s.escape_start_y       = raw_pose->y;
+        s.escape_heading       = theta_f;
+        s.escape_rot_acc       = 0.0f;
+        s.escape_start_cyc     = s.cycle_count;
+        printf("[LP] stall #%u (%u cycles) -> short reverse %.0f mm + inject at (%.0f,%.0f)\n",
+               (unsigned)s.stall_escape_count, (unsigned)LP_STALL_CYCLES,
+               (double)LP_ESCAPE_STALL_BACKUP_MM,
+               (double)s.inject_x, (double)s.inject_y);
+    }
+
+    /* A. Footprint occupied: stop, replan, and reinforce the map.  This keeps
+     * the good inchallah map behavior without using reverse escape as the first
+     * reaction when the car is already next to a wall. */
     if (w.footprint_occupied) s.fp_occ_streak++;
     else                      s.fp_occ_streak = 0;
 
-    if (w.footprint_occupied && s.fp_occ_streak >= 2) {
-        if (s.mode != LP_MODE_ESCAPE) {
-            s.mode              = LP_MODE_ESCAPE;
-            s.escape_is_stall   = false;
-            s.committed_side    = 0;
-            s.pp_stable_count   = 0;
-            s.escape_phase      = 0;
-            s.escape_rev_cycles = 0;
-            s.escape_start_x    = raw_pose->x;
-            s.escape_start_y    = raw_pose->y;
-            s.escape_heading    = theta_f;
-            s.escape_rot_acc    = 0.0f;
-            s.escape_start_cyc  = s.cycle_count;
-        }
-        cmd_valid = lp_escape(map, raw_pose->x, raw_pose->y, theta_f,
-                              inflate_r, global_path, out_cmd);
-        if (!cmd_valid) {
-            /* FP escape (escape_is_stall = false here): replan already set in lp_escape */
-            s.mode             = LP_MODE_PURE_PURSUIT;
-            s.replan_requested = true;
-            out_cmd->tx        = 0.0f;
-            out_cmd->ty        = 0.0f;
-            out_cmd->t_heading = theta_f;
-            out_cmd->t_speed   = 0.0f;
-            cmd_valid          = true;
-        }
-        printf("[LP] mode=%d phase=%d rtheta=%.0f° cmd_hdg=%.0f° spd=%.0f sigma=%.3f fp_occ=1 streak=%u occ=%u\n",
-               (int)s.mode, (int)s.escape_phase,
-               (double)(theta_f * 180.0f / LP_PI),
-               (double)(out_cmd->t_heading * 180.0f / LP_PI),
-               (double)out_cmd->t_speed,
-               (double)s.sigma, (unsigned)s.fp_occ_streak, (unsigned)w.occ_count);
+    if (!stall_recovery_requested && w.footprint_occupied && s.fp_occ_streak >= 2) {
+        s.mode                 = LP_MODE_STOPPED;
+        s.replan_requested     = true;
+        s.wait_clear_cycles    = 0;
+        s.stopped_clear_streak = 0;
+        s.committed_side       = 0;
+        s.pp_stable_count      = 0;
+        s.inject_x             = raw_pose->x + inflate_r * cosf(theta_f);
+        s.inject_y             = raw_pose->y + inflate_r * sinf(theta_f);
+        s.inject_obstacle_requested = true;
+        lp_make_stop_cmd(theta_f, out_cmd);
+        printf("[LP] footprint occupied streak=%u occ=%u -> STOPPED + replan + inject\n",
+               (unsigned)s.fp_occ_streak, (unsigned)w.occ_count);
         s.prev_cmd_speed = out_cmd->t_speed;
         s.cycle_count++;
         return true;
@@ -1010,7 +949,7 @@ bool local_planner_update(const quadtree_map_t *map,
     /* ── State machine ──────────────────────────────────────────────────── */
 
     if (s.mode == LP_MODE_ESCAPE) {
-        /* Continue ongoing ESCAPE (stall or FP — distinguised by escape_is_stall) */
+        /* Continue the only allowed ESCAPE: a short measured stall reverse. */
         cmd_valid = lp_escape(map, raw_pose->x, raw_pose->y, theta_f,
                               inflate_r, global_path, out_cmd);
         if (!cmd_valid) {
@@ -1019,7 +958,6 @@ bool local_planner_update(const quadtree_map_t *map,
                 s.mode              = LP_MODE_WAIT_CLEAR;
                 s.wait_clear_cycles = 0;
             } else {
-                /* FP escape failed: replan already requested in lp_escape */
                 s.mode = LP_MODE_PURE_PURSUIT;
             }
             out_cmd->tx        = 0.0f;
@@ -1046,22 +984,42 @@ bool local_planner_update(const quadtree_map_t *map,
             s.committed_side = 0;
         if (s.pp_stable_count >= 20)
             s.stall_escape_count = 0;
+        if (s.pp_stable_count >= 20)
+            s.stall_reverse_lockout = false;
+        s.blocked_cycles = 0;
         *out_cmd  = lp_pure_pursuit_stub(global_path, raw_pose);
         cmd_valid = true;
 
     } else {
-        /* Obstacle cluster in forward arc — stop and wait (assume dynamic object) */
-        if (s.mode != LP_MODE_STOPPED) {
+        /* lherba behavior: obstacle cluster in the forward arc tries reactive
+         * steering first.  If no safe steering candidate exists, stop and ask
+         * the global planner for a new path instead of backing up blindly. */
+        if (s.mode != LP_MODE_RECOVER)
+            s.mode = LP_MODE_REACTIVE;
+
+        s.pp_stable_count = 0;
+        s.blocked_cycles++;
+
+        cmd_valid = lp_reactive(map, raw_pose->x, raw_pose->y, theta_f,
+                                inflate_r, &w, global_path, out_cmd);
+
+        if (!cmd_valid) {
             s.mode                 = LP_MODE_STOPPED;
+            s.replan_requested     = true;
             s.wait_clear_cycles    = 0;
             s.stopped_clear_streak = 0;
             s.committed_side       = 0;
-            s.pp_stable_count      = 0;
-            printf("[LP] obstacle cluster occ=%u — entering STOPPED\n",
+            lp_make_stop_cmd(theta_f, out_cmd);
+            cmd_valid = true;
+            printf("[LP] reactive blocked occ=%u -> STOPPED + replan\n",
                    (unsigned)w.occ_count);
+        } else {
+            s.blocked_cycles = 0;
         }
-        cmd_valid = lp_handle_stopped(&w, theta_f, out_cmd);
     }
+
+    if (s.blocked_cycles >= LP_BLOCKED_THRESH)
+        s.replan_requested = true;
 
     /* Step 10: Speed scaling */
     if (cmd_valid && out_cmd->t_speed > 0.0f)

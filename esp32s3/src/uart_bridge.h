@@ -25,4 +25,7 @@ bool uart_bridge_recv_path_done(void);
 bool uart_bridge_recv_chunk_nack(uint16_t *out_path_id,
                                   uint16_t *out_expected_start);
 
+/* Returns true (once) when Wemos reports the front ultrasonic brake state. */
+bool uart_bridge_recv_front_hazard(front_hazard_t *out);
+
 #endif /* UART_BRIDGE_H */

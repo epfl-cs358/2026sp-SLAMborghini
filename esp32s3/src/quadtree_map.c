@@ -8,6 +8,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #if defined(ESP_PLATFORM)
 #include "esp_log.h"
@@ -266,7 +267,9 @@ size_t qt_memory_bytes(const QuadTreeMap *map)
 #define QT_COMPACT_MAX       (QT_COMPACT_WALL_MAX + QT_COMPACT_FREE_MAX)
 #define QT_COMPACT_FREE_KEEP (-2)   /* preserve free cells at or below this (1× QT_MISS_DEC) */
 
-typedef struct { float cx, cy; int8_t value; } _compact_cell_t;
+typedef struct { int16_t cx_mm, cy_mm; int8_t value; } _compact_cell_t;
+_Static_assert(sizeof(_compact_cell_t) == 6u,
+               "_compact_cell_t should stay compact: int16 mm coordinates");
 
 /* Wall cells occupy indices [0, wall_n).
  * Free cells occupy indices [QT_COMPACT_WALL_MAX, QT_COMPACT_WALL_MAX+free_n). */
@@ -302,15 +305,15 @@ static void _compact_cb(float cx, float cy, int8_t value, void *ud)
     (void)ud;
     if (value >= _s_compact_min) {
         if (_s_compact_wall_n >= QT_COMPACT_WALL_MAX) return;
-        _s_compact_buf[_s_compact_wall_n].cx    = cx;
-        _s_compact_buf[_s_compact_wall_n].cy    = cy;
+        _s_compact_buf[_s_compact_wall_n].cx_mm = (int16_t)lrintf(cx);
+        _s_compact_buf[_s_compact_wall_n].cy_mm = (int16_t)lrintf(cy);
         _s_compact_buf[_s_compact_wall_n].value = value;
         _s_compact_wall_n++;
     } else if (value <= QT_COMPACT_FREE_KEEP) {
         if (_s_compact_free_n >= QT_COMPACT_FREE_MAX) return;
         int idx = QT_COMPACT_WALL_MAX + _s_compact_free_n;
-        _s_compact_buf[idx].cx    = cx;
-        _s_compact_buf[idx].cy    = cy;
+        _s_compact_buf[idx].cx_mm = (int16_t)lrintf(cx);
+        _s_compact_buf[idx].cy_mm = (int16_t)lrintf(cy);
         _s_compact_buf[idx].value = value;
         _s_compact_free_n++;
     }
@@ -338,16 +341,16 @@ void qt_compact(QuadTreeMap *map, int8_t min_value)
 
     /* 3. Re-insert walls — leaf starts at 0, so delta = saved value */
     for (int i = 0; i < _s_compact_wall_n; i++) {
-        qt_update(map, _s_compact_buf[i].cx,
-                       _s_compact_buf[i].cy,
+        qt_update(map, (float)_s_compact_buf[i].cx_mm,
+                       (float)_s_compact_buf[i].cy_mm,
                        _s_compact_buf[i].value);
     }
 
     /* 4. Re-insert free cells — same trick, delta = saved negative value */
     for (int i = 0; i < _s_compact_free_n; i++) {
         int idx = QT_COMPACT_WALL_MAX + i;
-        qt_update(map, _s_compact_buf[idx].cx,
-                       _s_compact_buf[idx].cy,
+        qt_update(map, (float)_s_compact_buf[idx].cx_mm,
+                       (float)_s_compact_buf[idx].cy_mm,
                        _s_compact_buf[idx].value);
     }
 
